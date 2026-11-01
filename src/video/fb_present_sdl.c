@@ -128,6 +128,7 @@
 #include <SDL_vulkan.h>
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
+#include "mkb_input.h"        /* src/input: the mouse lock (RECOMP_MKB) */
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
 #include "overlay.h"          /* src/overlay: the settings overlay */
 #endif
@@ -2150,6 +2151,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         ov_note = s_layer && xbox_OverlayNotice();
 #endif
 
+        /* The mouse lock of the mouse + keyboard layer, on this thread as
+         * SDL_SetRelativeMouseMode wants (no-op while the layer is off). */
+        mkb_sdl_pump();
+
         /* One event loop for the window and the controllers: SDL_PumpEvents
          * (inside the wait) also updates the game controllers, which
          * xinput_device.c then only reads. No frame wakes this loop (the
@@ -2184,6 +2189,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * has the pad and keys neutral at the source,
                  * xbox_InputSetBlocked, so the key table keeps its state.) */
                 xbox_InputSdlEvent(&ev);
+                /* The mouse + keyboard layer's keys, buttons, motion and
+                 * focus (RECOMP_MKB; off: nothing). */
+                mkb_sdl_event(&ev);
                 /* Controllers come and go, and take a port, here. */
                 xbox_InputPadEvent(&ev);
                 cursor_event(&cur, &ev);

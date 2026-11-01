@@ -585,7 +585,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     /* The keyboard answers for port 0 with or without a pad there, and is
      * merged on top of one: a real pad keeps working, the keys only add. */
-    if (dwPort == 0 && g_be->keyboard && g_be->keyboard(&kb)) {
+    /* -1: the mouse + keyboard layer is off (or the backend has none). */
+    int mkb_on = dwPort == 0 && g_be->mkb && g_be->mkb(dwPort, NULL) >= 0;
+    if (dwPort == 0 && !mkb_on && g_be->keyboard && g_be->keyboard(&kb)) {
         if (any_held(&kb.Gamepad) || kb.Gamepad.sThumbLX || kb.Gamepad.sThumbLY
                 || kb.Gamepad.sThumbRX || kb.Gamepad.sThumbRY)
             src |= XBOX_INPUT_SRC_KEYS;
@@ -635,6 +637,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
              * counters, both of which only go up. */
             pState->dwPacketNumber += tp.dwPacketNumber;
         }
+    }
+    /* Mouse + keyboard (RECOMP_MKB, mkb_input.c), in place of the fixed key
+     * map above: merged on top of a pad, and port 0 is connected while the
+     * layer is on, pad or not -- the title must not see a controller come
+     * and go with each key. */
+    if (mkb_on) {
+        if (rc != ERROR_SUCCESS) {
+            memset(pState, 0, sizeof *pState);
+            rc = ERROR_SUCCESS;
+        }
+        if (g_be->mkb(dwPort, pState) > 0)
+            src |= XBOX_INPUT_SRC_KEYS;
     }
     g_sources[dwPort] = src;
     if (rc == ERROR_SUCCESS && (g_blocked || (g_latched & (1u << dwPort)))) {

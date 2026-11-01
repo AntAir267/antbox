@@ -132,6 +132,7 @@ const xbox_input_backend xbox_input_host_backend = {
 
 #include <SDL.h>
 #include "pad_glyphs.h"
+#include "mkb_input.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
@@ -412,6 +413,17 @@ void xbox_InputPadEvent(const SDL_Event *ev)
                 fprintf(stderr, "[INPUT] controller removed (it had no port)\n");
             g_open[k].c = NULL;
         }
+        break;
+    /* A stick pushed well over or a trigger pulled is the pad in use too:
+     * a player who only steers after typing must get the pad's prompts back.
+     * Only while the keyboard is the device in use, so motion noise does
+     * not keep resetting it. */
+    case SDL_CONTROLLERAXISMOTION:
+        if (xbox_InputActivePadFamily() == XBOX_PAD_FAMILY_KEYBOARD
+                && (ev->caxis.value > 16000 || ev->caxis.value < -16000))
+            for (int k = 0; k < PAD_OPEN_MAX; k++)
+                if (g_open[k].c && g_open[k].id == ev->caxis.which)
+                    pad_active(g_open[k].c);
         break;
     case SDL_CONTROLLERBUTTONDOWN:
         pad_reassign();
@@ -772,9 +784,17 @@ static uint64_t sdl_now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+/* The mouse + keyboard layer, an SDL host's only (mkb_input.c). */
+static int sdl_mkb(DWORD port, XBOX_INPUT_STATE *inout)
+{
+    if (!mkb_enabled())
+        return -1;
+    return mkb_merge(port, inout);
+}
+
 const xbox_input_backend xbox_input_host_backend = {
     sdl_init, sdl_get_state, sdl_set_state, xbox_InputKeyboardPoll, sdl_now_ms,
-    sdl_shutdown
+    sdl_shutdown, sdl_mkb
 };
 
 #endif /* _WIN32 */

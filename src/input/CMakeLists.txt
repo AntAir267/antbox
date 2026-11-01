@@ -25,7 +25,7 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_VULKAN)
     target_link_libraries(xbox_input PUBLIC platform xinput)
 else()
     find_package(SDL2 REQUIRED)
-    target_sources(xbox_input PRIVATE keyboard_sdl.c touch_pad_sdl.c)
+    target_sources(xbox_input PRIVATE keyboard_sdl.c touch_pad_sdl.c mkb_input.c)
     if(ANDROID)
         # The title's rumble on the device's own vibrator (JNI).
         target_sources(xbox_input PRIVATE android_vibration.c)

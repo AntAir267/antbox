@@ -36,6 +36,11 @@ typedef struct xbox_input_backend {
      * the stop written out to the devices and the pads closed. No call
      * reaches the backend's pads after it. May be NULL. */
     void  (*shutdown)(void);
+    /* Mouse + keyboard (RECOMP_MKB, mkb_input.c): merges the layer onto
+     * *inout for a port. -1 while the layer is off (then the fixed key map
+     * above answers instead), 0 on but contributing nothing, 1 contributed.
+     * NULL when the backend has none (tests, the Win32 host). */
+    int   (*mkb)(DWORD port, XBOX_INPUT_STATE *inout);
 } xbox_input_backend;
 
 /* A motor is never given a level for longer than this: the host's rumble

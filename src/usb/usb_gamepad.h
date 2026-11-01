@@ -36,6 +36,13 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
 /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(int pad, uint8_t *out, int max);
 
+/* The last 20-byte report pad `pad` sent the title: everything it saw (a
+ * host pad, the keyboard, a pad script), read without polling anything, for
+ * a title's own hooks that watch a button the game does not use there.
+ * Byte 2-3 the digital buttons, 4-11 the analog ones (A B X Y Black White
+ * LT RT). 0 before the first report. */
+int usb_gamepad_last_report(int pad, uint8_t out[20]);
+
 /* The 6-byte XID output report (rumble) the title sent to pad `pad`, from the
  * OUT endpoint or a SET_REPORT data stage. Forwarded to the host pad. */
 void usb_gamepad_output(int pad, const uint8_t *data, int len);

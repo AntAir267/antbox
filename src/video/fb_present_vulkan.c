@@ -2796,12 +2796,15 @@ fail:
     return 0;
 }
 
+static void ss_free(void);
+
 static void post_free_targets(int luts_too)
 {
     int i;
     queue_idle();
     for (i = 0; i < TG_COUNT; i++)
         nvk_image_free(&P.img[i]);
+    ss_free();
     if (luts_too) {
         for (i = 0; i < 2; i++) {
             nvk_image_free(&P.lut[i]);
@@ -3429,6 +3432,136 @@ static void hdr_pattern(VkCommandBuffer cb, struct nvk_image *sw)
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 }
 
+/* Supersampling: a frame larger than its place in the window (render
+ * scale above the window's size) shrunk so each window pixel averages all
+ * the pixels behind it. One linear blit reads 2x2 of them whatever the
+ * ratio, so at 4x into a window of 2x most of the picture was skipped and
+ * edges shimmered as at 1x. Here the frame is first resized to the window's
+ * size times the power of two at or above the ratio (a copy-free start when
+ * that is the frame's own size), then halved by linear blits -- an exact 2:1
+ * linear blit is the mean of 2x2 -- the last one into the swapchain. A
+ * ratio of 1.33 (4x shown at 1920x1440) is resized up to 2x the window and
+ * halved once: a tent over the footprint. Below 1.1:1, and for nearest or
+ * integer scaling, the one blit as before. */
+#define SS_LEVELS 4
+static struct nvk_image s_ss[SS_LEVELS];
+
+static void ss_free(void)
+{
+    int i;
+    for (i = 0; i < SS_LEVELS; i++)
+        nvk_image_free(&s_ss[i]);
+}
+
+static struct nvk_image *ss_level(int i, VkFormat f, uint32_t w, uint32_t h)
+{
+    struct nvk_image *im = &s_ss[i];
+    if (im->img && (im->w != w || im->h != h || im->format != f)) {
+        queue_idle();                   /* a present may still read it: rare */
+        nvk_image_free(im);
+    }
+    if (!im->img && !nvk_image_new(im, f, w, h, 1,
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT))
+        return NULL;
+    return im;
+}
+
+static void ss_blit(VkCommandBuffer cb, VkImage src, VkImageLayout sl, int sx, int sy, int sw, int sh,
+                    VkImage dst, VkImageLayout dl, int dx, int dy, int dw, int dh, VkFilter f)
+{
+    VkImageBlit b;
+    memset(&b, 0, sizeof b);
+    b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.srcSubresource.layerCount = 1;
+    b.dstSubresource = b.srcSubresource;
+    b.srcOffsets[0].x = sx;
+    b.srcOffsets[0].y = sy;
+    b.srcOffsets[1].x = sx + sw;
+    b.srcOffsets[1].y = sy + sh;
+    b.srcOffsets[1].z = 1;
+    b.dstOffsets[0].x = dx;
+    b.dstOffsets[0].y = dy;
+    b.dstOffsets[1].x = dx + dw;
+    b.dstOffsets[1].y = dy + dh;
+    b.dstOffsets[1].z = 1;
+    vkCmdBlitImage(cb, src, sl, dst, dl, 1, &b, f);
+}
+
+/* 1 when it drew src's rectangle sr into dst's r2 (dst in TRANSFER_DST);
+ * 0 to leave it to the one blit. */
+static int ss_present(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkFormat fmt,
+                      const struct nv2a_rect *sr, VkImage dst, const struct nv2a_rect *r2)
+{
+    static int on = -1;
+    uint32_t m = 1, w, h;
+    int n = 0, i;
+    VkImage cur = src;
+    VkImageLayout cl = sl;
+    int cx = sr->x, cy = sr->y, cw = sr->w, ch = sr->h;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SUPERSAMPLE_FILTER");
+        on = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+    }
+    if (!on || r2->w <= 0 || r2->h <= 0
+            || ((uint64_t)sr->w * 10 < (uint64_t)r2->w * 11 && (uint64_t)sr->h * 10 < (uint64_t)r2->h * 11))
+        return 0;
+    while ((uint64_t)r2->w * m < (uint64_t)sr->w || (uint64_t)r2->h * m < (uint64_t)sr->h)
+        m *= 2;
+    for (w = m; w > 1; w /= 2)
+        n++;                            /* halvings: log2(m) */
+    if (n < 1 || n > SS_LEVELS || (uint64_t)r2->w * m > 8192 || (uint64_t)r2->h * m > 8192)
+        return 0;
+    w = (uint32_t)r2->w * m;
+    h = (uint32_t)r2->h * m;
+    /* Level 0: the frame at the window's size times m, unless it is that. */
+    if ((uint32_t)cw != w || (uint32_t)ch != h) {
+        struct nvk_image *l0 = ss_level(0, fmt, w, h);
+        if (!l0)
+            return 0;
+        nvk_image_to(cb, l0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        ss_blit(cb, cur, cl, cx, cy, cw, ch, l0->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, 0, (int)w, (int)h, VK_FILTER_LINEAR);
+        nvk_image_to(cb, l0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        cur = l0->img;
+        cl = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        cx = cy = 0;
+        cw = (int)w;
+        ch = (int)h;
+    }
+    /* Halvings into levels 1.., the last into the swapchain. */
+    for (i = 1; i <= n; i++) {
+        int hw = cw / 2, hh = ch / 2;
+        if (i == n) {
+            ss_blit(cb, cur, cl, cx, cy, cw, ch, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    r2->x, r2->y, r2->w, r2->h, VK_FILTER_LINEAR);
+            break;
+        }
+        {
+            struct nvk_image *li = ss_level(i, fmt, (uint32_t)hw, (uint32_t)hh);
+            if (!li)
+                return 0;               /* nothing drawn into dst yet */
+            nvk_image_to(cb, li, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            ss_blit(cb, cur, cl, cx, cy, cw, ch, li->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, 0, hw, hh, VK_FILTER_LINEAR);
+            nvk_image_to(cb, li, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            cur = li->img;
+            cl = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            cx = cy = 0;
+            cw = hw;
+            ch = hh;
+        }
+    }
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "supersampling: %dx%d frame to %dx%d through %ux%u, %d halving(s)\n",
+                    sr->w, sr->h, r2->w, r2->h, w, h, n);
+    }
+    return 1;
+}
+
 int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 const char *shot_path, uint32_t flip)
 {
@@ -3672,9 +3805,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             b.dstOffsets[1].x = r2.x + r2.w;
             b.dstOffsets[1].y = r2.y + r2.h;
             b.dstOffsets[1].z = 1;
-            vkCmdBlitImage(cb, bsrc, bsrc_layout, dimg,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
-                           lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+            if (!lin || !ss_present(cb, bsrc, bsrc_layout, s_slot[k].format, &sr, dimg, &r2))
+                vkCmdBlitImage(cb, bsrc, bsrc_layout, dimg,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                               lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
         }
     }
 #if defined(XBOXRECOMP_HAVE_OVERLAY)

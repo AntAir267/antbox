@@ -918,6 +918,26 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* The last report each pad sent the title (usb_gamepad_last_report). */
+static uint8_t s_last_rep[USB_GAMEPAD_MAX][20];
+static volatile int s_last_ok[USB_GAMEPAD_MAX];
+
+static void last_report(int pad, const uint8_t *out)
+{
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    memcpy(s_last_rep[pad], out, 20);
+    s_last_ok[pad] = 1;
+}
+
+int usb_gamepad_last_report(int pad, uint8_t out[20])
+{
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX || !s_last_ok[pad])
+        return 0;
+    memcpy(out, s_last_rep[pad], 20);
+    return 1;
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -983,6 +1003,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
             || xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        last_report(pad, out);
         xbox_LatPadReport(pad, out, 20);
         return 20;
     }
@@ -1002,6 +1023,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    last_report(pad, out);
     xbox_LatPadReport(pad, out, 20);
     return 20;
 }
