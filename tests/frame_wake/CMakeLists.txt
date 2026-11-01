@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(frame_wake_test C)
+# The main loop takes each published frame with SDL's wake lost (BO-210).
+set(CMAKE_C_STANDARD 11)
+find_package(Threads REQUIRED)
+add_executable(frame_wake_test test_main.c)
+target_include_directories(frame_wake_test PRIVATE ../../src/video)
+target_link_libraries(frame_wake_test PRIVATE Threads::Threads)
+enable_testing()
+add_test(NAME frame_wake_test COMMAND frame_wake_test)

@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+project(present_cadence_test C)
+# Pure arithmetic (src/kernel/present_cadence.c): no runtime to link.
+set(CMAKE_C_STANDARD 11)
+add_executable(present_cadence_test test_main.c ../../src/kernel/present_cadence.c)
+target_include_directories(present_cadence_test PRIVATE ../../src/kernel)
+if(NOT MSVC)
+    target_link_libraries(present_cadence_test PRIVATE m)
+endif()
+enable_testing()
+add_test(NAME present_cadence_test COMMAND present_cadence_test)

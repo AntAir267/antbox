@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(xr_log_test C)
+# The print gate (src/platform/xr_log.h), force-included as the toolkit's
+# CMakeLists does for every source.
+set(CMAKE_C_STANDARD 11)
+set(XR_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+add_executable(xr_log_test test_main.c ${XR_SRC}/platform/xr_log.c)
+target_include_directories(xr_log_test PRIVATE ${XR_SRC}/platform)
+if(MSVC)
+    target_compile_options(xr_log_test PRIVATE "/FI${XR_SRC}/platform/xr_log.h")
+else()
+    target_compile_options(xr_log_test PRIVATE "SHELL:-include \"${XR_SRC}/platform/xr_log.h\"")
+endif()
+enable_testing()
+add_test(NAME xr_log_test COMMAND xr_log_test)

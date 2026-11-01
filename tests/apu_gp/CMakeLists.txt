@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_gp_test C)
+set(CMAKE_C_STANDARD 11)
+# apu_gp.c is pure (no APU state); nothing of the runtime is built.
+add_executable(apu_gp_test test_main.c ../../src/apu/apu_gp.c ../../src/apu/apu_dsp56k.c)
+target_include_directories(apu_gp_test PRIVATE ../../src/apu)
+if(NOT WIN32)
+    target_link_libraries(apu_gp_test PRIVATE m)
+endif()
+enable_testing()
+add_test(NAME apu_gp COMMAND apu_gp_test)

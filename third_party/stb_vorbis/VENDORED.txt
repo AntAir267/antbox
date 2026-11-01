@@ -1,0 +1,8 @@
+stb_vorbis v1.22 (Sean Barrett): Ogg Vorbis decoder
+https://github.com/nothings/stb, commit 2c980bb59875b0d32144a71867fbdebb2f77cd20
+MIT or public domain (Unlicense), at the user's choice (LICENSE.txt; this
+project takes the public-domain alternative, which asks for no notice).
+
+Vendored unmodified: stb_vorbis.c, LICENSE.txt. Compiled into
+src/soundtrack/xst_decode.c. To update: copy the file from the new commit
+and change this file.

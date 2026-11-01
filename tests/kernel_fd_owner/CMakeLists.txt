@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(kernel_fd_owner_test C)
+# POSIX only: the descriptor-ownership check of the file handles (BO-221).
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../../src/platform platform)
+add_executable(kernel_fd_owner_test test_main.c)
+target_include_directories(kernel_fd_owner_test PRIVATE ../../src/platform)
+target_link_libraries(kernel_fd_owner_test PRIVATE platform)
+enable_testing()
+add_test(NAME kernel_fd_owner COMMAND kernel_fd_owner_test)

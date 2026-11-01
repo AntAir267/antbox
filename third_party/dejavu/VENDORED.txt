@@ -1,0 +1,16 @@
+DejaVu Sans Mono 2.37, a subset
+https://github.com/dejavu-fonts/dejavu-fonts, release version_2_37
+(dejavu-fonts-ttf-2.37.tar.bz2, ttf/DejaVuSansMono.ttf)
+
+Licence: LICENSE.txt (the Bitstream Vera licence and the Arev one, both of
+the MIT kind; the DejaVu changes are in the public domain). The copyright
+and permission notices must go with every copy of the font, which a program
+that embeds it is: a binary distribution carries LICENSE.txt (NOTICE says so).
+A modified font must not be named Bitstream or Vera: the subset has no name
+table.
+
+The font file itself is not kept here. src/overlay/overlay_font_ext.h is the
+subset the overlay embeds (Latin Extended-A and -B, Greek, Cyrillic, some
+punctuation, U+25A1; about 42 KB), made by make_subset.py from the release's
+file, whose SHA-256 the script checks. To change the ranges: edit the script,
+run it again.

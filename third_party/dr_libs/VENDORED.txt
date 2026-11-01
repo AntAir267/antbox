@@ -1,0 +1,10 @@
+dr_libs (David Reid): dr_mp3 v0.7.4, dr_flac v0.13.4, dr_wav v0.14.6
+https://github.com/mackron/dr_libs, commit dfe8377631000664666519fdb83da193fd8037f4
+Public domain (Unlicense) or MIT No Attribution, at the user's choice
+(LICENSE.txt: neither asks for a notice in source or binary form).
+dr_mp3 contains minimp3 (https://github.com/lieff/minimp3, CC0).
+
+Vendored unmodified: dr_mp3.h, dr_flac.h, dr_wav.h, LICENSE.txt. Single-file
+decoders, compiled into src/soundtrack/xst_decode.c (the user's music folder
+as Xbox custom soundtracks). To update: copy the same files from the new
+commit and change this file.

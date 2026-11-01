@@ -1,0 +1,13 @@
+SMAA (Enhanced Subpixel Morphological Antialiasing), reference implementation
+https://github.com/iryoku/smaa, commit 71c806a838bdd7d517df19192a20f0c61b3ca29d
+MIT (LICENSE.txt: the copyright notice and permission notice must stay with
+copies of the source; binaries need not carry them).
+
+Vendored unmodified: SMAA.hlsl, Textures/AreaTex.h (160x560, RG8) and
+Textures/SearchTex.h (64x16, R8) as AreaTex.h and SearchTex.h, LICENSE.txt.
+
+src/video/smaa_hlsl.inc is SMAA.hlsl with its comments taken out, as a C
+string, made by make_inc.py from the file here (the licence notice is kept at
+its head); run it again to update. src/video/smaa.c adapts that one source to
+Metal's shading language by exact text substitutions and uses it as it is for
+GLSL.

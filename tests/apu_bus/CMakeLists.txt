@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(apu_bus_test C)
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+# The whole runtime: the DSP stage is the real one (mcpx_apu_dsp_frame).
+add_executable(apu_bus_test test_main.c)
+target_include_directories(apu_bus_test PRIVATE ../../src ../../src/apu ../../src/platform)
+target_link_libraries(apu_bus_test PRIVATE xboxrecomp)
+# replay <file>: a recording of a title's mix loop (RECOMP_MIX_TRACE_REC)
+# through the old sum, the mixer off and the mixer on and neutral.
+add_executable(apu_bus_replay replay.c)
+target_include_directories(apu_bus_replay PRIVATE ../../src ../../src/apu ../../src/platform)
+target_link_libraries(apu_bus_replay PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME apu_bus COMMAND apu_bus_test)

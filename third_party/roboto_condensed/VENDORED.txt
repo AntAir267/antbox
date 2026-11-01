@@ -1,0 +1,16 @@
+Roboto Condensed (Medium), a subset
+https://github.com/google/fonts, ofl/robotocondensed, commit
+69d0549e8fc7ad72e1531734c81237be401ec4fd (RobotoCondensed[wght].ttf,
+sha256 dace262afcee68a5276f200d8026c57221735c0118ab5fda8c2c0d3dc409a8d0)
+
+Licence: OFL.txt (SIL Open Font License 1.1, as published with the font;
+Copyright 2011 The Roboto Project Authors). The font carries no Reserved
+Font Name. The licence text must go with every copy of the font, which a
+program that embeds it is: a binary distribution carries OFL.txt (NOTICE
+says so). The subset has no name table.
+
+The font file itself is not kept here. src/overlay/overlay_font_ui.h is the
+subset the overlay embeds (about 51 KB), made by make_subset.py from that
+file (pinned to wght 500: Medium), whose SHA-256 the script checks. To
+change the ranges or the weight: edit the script, run it again (needs
+fontTools).

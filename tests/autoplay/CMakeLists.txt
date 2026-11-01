@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(autoplay_test C)
+# Cross-platform: the scene driver's waits, with a stand-in for the title.
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(autoplay_test test_main.c)
+target_include_directories(autoplay_test PRIVATE ../../src/kernel ../../src)
+target_link_libraries(autoplay_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME autoplay_test COMMAND autoplay_test)
