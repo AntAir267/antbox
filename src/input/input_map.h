@@ -148,6 +148,21 @@ void xbox_InputSetFirstPadPort(int port);
 int  xbox_InputFirstPadPort(void);
 unsigned xbox_InputFirstPadGeneration(void);
 
+/* Every controller is player 1's (GAME-GOALS, "Every controller works"): with
+ * one player, whatever is connected, in any order, feeds the first port,
+ * merged. A title's local multiplayer game says so with xbox_InputSetPlayers(2);
+ * ports then go to controllers one each, at their next press, and back in its
+ * menus xbox_InputSetPlayers(1) merges them again. A title that never says
+ * follows RECOMP_USB_PADS: more than one emulated pad keeps a port per
+ * controller. Any thread. */
+void xbox_InputSetPlayers(int players);
+int  xbox_InputPadsMerged(void);
+
+/* One host pad into another: a button held on either, each stick axis and
+ * trigger from whichever is pushed furthest. */
+void xbox_InputMergeXInput(XBOX_HOST_XINPUT_GAMEPAD *into, const XBOX_HOST_XINPUT_GAMEPAD *from);
+void xbox_InputMergeSdl(XBOX_HOST_SDL_GAMEPAD *into, const XBOX_HOST_SDL_GAMEPAD *from);
+
 void xbox_InputMapXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, XBOX_GAMEPAD *out);
 void xbox_InputMapSdl(const XBOX_HOST_SDL_GAMEPAD *in, XBOX_GAMEPAD *out);
 

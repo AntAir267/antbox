@@ -35,6 +35,34 @@ _Static_assert(sizeof(XINPUT_GAMEPAD) == sizeof(XBOX_HOST_XINPUT_GAMEPAD)
                && offsetof(XINPUT_GAMEPAD, sThumbRY) == offsetof(XBOX_HOST_XINPUT_GAMEPAD, sThumbRY),
                "XBOX_HOST_XINPUT_GAMEPAD must match XINPUT_GAMEPAD");
 
+/* One player: every host pad, merged. XInputGetState on an empty user index is
+ * slow, so an empty one is asked once a second. */
+static DWORD xi_read_merged(XBOX_HOST_XINPUT_GAMEPAD *pad, DWORD *packet)
+{
+    static ULONGLONG last[XUSER_MAX_COUNT];
+    static BYTE empty[XUSER_MAX_COUNT];
+    ULONGLONG now = GetTickCount64();
+    DWORD rc = ERROR_DEVICE_NOT_CONNECTED, sum = 0;
+
+    memset(pad, 0, sizeof *pad);
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
+        XINPUT_STATE xi;
+        XBOX_HOST_XINPUT_GAMEPAD one;
+        if (empty[i] && now - last[i] < 1000)
+            continue;
+        last[i] = now;
+        empty[i] = XInputGetState(i, &xi) != ERROR_SUCCESS;
+        if (empty[i])
+            continue;
+        memcpy(&one, &xi.Gamepad, sizeof one);
+        xbox_InputMergeXInput(pad, &one);
+        sum += xi.dwPacketNumber;
+        rc = ERROR_SUCCESS;
+    }
+    *packet = sum;
+    return rc;
+}
+
 static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
 {
     XINPUT_STATE xi;
@@ -44,12 +72,19 @@ static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
     /* Input > First controller: player 2 leaves port 0 to the keyboard. */
     if (port < (DWORD)xbox_InputFirstPadPort())
         return ERROR_DEVICE_NOT_CONNECTED;
-    rc = XInputGetState(port - xbox_InputFirstPadPort(), &xi);
-
-    if (rc != ERROR_SUCCESS)
-        return rc;
-    memcpy(&pad, &xi.Gamepad, sizeof pad);
-    out->dwPacketNumber = xi.dwPacketNumber;
+    if (xbox_InputPadsMerged()) {
+        if (port != (DWORD)xbox_InputFirstPadPort())
+            return ERROR_DEVICE_NOT_CONNECTED;
+        rc = xi_read_merged(&pad, &out->dwPacketNumber);
+        if (rc != ERROR_SUCCESS)
+            return rc;
+    } else {
+        rc = XInputGetState(port - xbox_InputFirstPadPort(), &xi);
+        if (rc != ERROR_SUCCESS)
+            return rc;
+        memcpy(&pad, &xi.Gamepad, sizeof pad);
+        out->dwPacketNumber = xi.dwPacketNumber;
+    }
     if (xbox_InputFaceLayoutNintendo())
         xbox_InputMirrorFaceXInput(&pad);
     xbox_InputMapXInput(&pad, &out->Gamepad);
@@ -69,6 +104,15 @@ static DWORD xi_set_state(DWORD port, const XBOX_VIBRATION *v)
     xv.wRightMotorSpeed = v->wRightMotorSpeed;
     if (port < (DWORD)xbox_InputFirstPadPort())
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (xbox_InputPadsMerged()) {
+        DWORD rc = ERROR_DEVICE_NOT_CONNECTED;
+        if (port != (DWORD)xbox_InputFirstPadPort())
+            return rc;
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; i++)     /* rumble on all */
+            if (XInputSetState(i, &xv) == ERROR_SUCCESS)
+                rc = ERROR_SUCCESS;
+        return rc;
+    }
     return XInputSetState(port - xbox_InputFirstPadPort(), &xv);
 }
 
@@ -92,6 +136,13 @@ const xbox_input_backend xbox_input_host_backend = {
 #include <stdio.h>
 #include <time.h>
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
+
+#define PAD_OPEN_MAX 8
+static struct {
+    SDL_GameController *c;
+    SDL_JoystickID id;
+    int port;                         /* -1: no input yet */
+} g_open[PAD_OPEN_MAX];
 
 /* Port -> controller. Read by the pad thread (OHCI) under g_pads_lock;
  * changed only by the thread that pumps SDL events (or, headless, by the
@@ -133,6 +184,9 @@ int xbox_InputAnyOpen(void)
     for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
         if (g_pads[i])
             any = 1;
+    for (int k = 0; k < PAD_OPEN_MAX; k++)
+        if (g_open[k].c)
+            any = 1;
     pthread_mutex_unlock(&g_pads_lock);
     return any;
 }
@@ -162,14 +216,14 @@ _Static_assert(SDL_CONTROLLER_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
  * while the title reads player 1. Hotplug: a controller added is opened,
  * one removed frees its port.
  *
+ * That is for a title with players to tell apart. With one player
+ * (xbox_InputPadsMerged) no port is claimed: every controller open feeds the
+ * first port, whichever pressed first and whatever came and went, so a silent
+ * device a handheld also lists costs nothing.
+ *
  * Without a window (headless, nothing pumps) the pad thread opens the
  * controllers present at its first read, in device order, as before. */
-#define PAD_OPEN_MAX 8
-static struct {
-    SDL_GameController *c;
-    SDL_JoystickID id;
-    int port;                         /* -1: no input yet */
-} g_open[PAD_OPEN_MAX];
+static void pad_rest_forget(SDL_GameController *c);
 
 static void pad_describe(SDL_GameController *c, char *out, size_t n)
 {
@@ -339,6 +393,7 @@ void xbox_InputPadEvent(const SDL_Event *ev)
     switch (ev->type) {
     case SDL_CONTROLLERDEVICEADDED:
         pad_open_index(ev->cdevice.which);
+        xbox_InputProbeSoon();
         break;
     case SDL_CONTROLLERDEVICEREMOVED:
         for (int k = 0; k < PAD_OPEN_MAX; k++) {
@@ -347,6 +402,7 @@ void xbox_InputPadEvent(const SDL_Event *ev)
             pthread_mutex_lock(&g_pads_lock);
             if (g_open[k].port >= 0)
                 g_pads[g_open[k].port] = NULL;
+            pad_rest_forget(g_open[k].c);
             SDL_GameControllerClose(g_open[k].c);
             pthread_mutex_unlock(&g_pads_lock);
             if (g_open[k].port >= 0)
@@ -359,7 +415,8 @@ void xbox_InputPadEvent(const SDL_Event *ev)
         break;
     case SDL_CONTROLLERBUTTONDOWN:
         pad_reassign();
-        pad_claim(ev->cbutton.which);
+        if (!xbox_InputPadsMerged())
+            pad_claim(ev->cbutton.which);
         for (int k = 0; k < PAD_OPEN_MAX; k++)
             if (g_open[k].c && g_open[k].id == ev->cbutton.which)
                 pad_active(g_open[k].c);
@@ -445,6 +502,92 @@ static void sdl_init(void)
     pthread_mutex_unlock(&g_pads_lock);
 }
 
+static void pad_read(SDL_GameController *c, XBOX_HOST_SDL_GAMEPAD *pad)
+{
+    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
+        pad->button[b] = SDL_GameControllerGetButton(c, (SDL_GameControllerButton)b) ? 1 : 0;
+    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
+        pad->axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
+}
+
+/* What a merge must not take from a device doing nothing: a button down since
+ * it opened, an axis resting off centre (a trigger that rests at full, a
+ * mapping off by a sign). Each counts from its first real move. */
+#define PAD_AXIS_MOVED 4000
+static struct {
+    SDL_GameController *c;
+    int16_t rest[XBOX_SDL_AXIS_COUNT];
+    uint8_t moved[XBOX_SDL_AXIS_COUNT];
+    uint8_t up[XBOX_SDL_BUTTON_COUNT];
+} g_rest[PAD_OPEN_MAX + XBOX_MAX_CONTROLLERS];
+
+static void pad_rest_forget(SDL_GameController *c)
+{
+    for (int k = 0; k < (int)(sizeof g_rest / sizeof g_rest[0]); k++)
+        if (g_rest[k].c == c)
+            g_rest[k].c = NULL;
+}
+
+static void pad_rest_filter(SDL_GameController *c, XBOX_HOST_SDL_GAMEPAD *pad)
+{
+    int k, slot = -1;
+
+    for (k = 0; k < (int)(sizeof g_rest / sizeof g_rest[0]); k++) {
+        if (g_rest[k].c == c) {
+            slot = k;
+            break;
+        }
+        if (slot < 0 && !g_rest[k].c)
+            slot = k;
+    }
+    if (slot < 0)
+        return;
+    if (g_rest[slot].c != c) {
+        memset(&g_rest[slot], 0, sizeof g_rest[slot]);
+        g_rest[slot].c = c;
+        memcpy(g_rest[slot].rest, pad->axis, sizeof pad->axis);
+    }
+    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++) {
+        if (!pad->button[b])
+            g_rest[slot].up[b] = 1;
+        else if (!g_rest[slot].up[b])
+            pad->button[b] = 0;
+    }
+    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++) {
+        int rest = g_rest[slot].rest[a], d = abs((int)pad->axis[a] - rest);
+        if (d >= PAD_AXIS_MOVED)
+            g_rest[slot].moved[a] = 1;
+        if (abs(rest) >= PAD_AXIS_MOVED && !g_rest[slot].moved[a])
+            pad->axis[a] = 0;
+    }
+}
+
+/* One player: every controller open, merged. Under g_pads_lock. */
+static int pads_read_merged(XBOX_HOST_SDL_GAMEPAD *pad)
+{
+    int n = 0;
+
+    memset(pad, 0, sizeof *pad);
+    for (int k = 0; k < PAD_OPEN_MAX + XBOX_MAX_CONTROLLERS; k++) {
+        SDL_GameController *c = k < PAD_OPEN_MAX ? g_open[k].c : g_pads[k - PAD_OPEN_MAX];
+        XBOX_HOST_SDL_GAMEPAD one;
+        int seen = 0;
+        if (!c || !SDL_GameControllerGetAttached(c))
+            continue;
+        for (int j = 0; j < PAD_OPEN_MAX && k >= PAD_OPEN_MAX; j++)
+            seen |= g_open[j].c == c;
+        if (seen)
+            continue;
+        pad_read(c, &one);
+        pad_rest_filter(c, &one);
+        if (xbox_InputFaceLayoutNintendo())
+            xbox_InputMirrorFaceSdl(&one);
+        xbox_InputMergeSdl(pad, &one);
+        n++;
+    }
+    return n;
+}
+
 static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
 {
     SDL_GameController *c;
@@ -453,6 +596,20 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
     /* Held across the reads: the window's thread closes a removed
      * controller only under the lock. */
     pthread_mutex_lock(&g_pads_lock);
+    if (xbox_InputPadsMerged()) {
+        int n = 0;
+        if (port == (DWORD)xbox_InputFirstPadPort() && !g_pads_closed) {
+            if (!g_main_pump)
+                SDL_GameControllerUpdate();
+            n = pads_read_merged(&pad);
+        }
+        pthread_mutex_unlock(&g_pads_lock);
+        if (!n)
+            return ERROR_DEVICE_NOT_CONNECTED;
+        out->dwPacketNumber = ++g_packet[port];
+        xbox_InputMapSdl(&pad, &out->Gamepad);
+        return ERROR_SUCCESS;
+    }
     c = g_pads[port];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         pthread_mutex_unlock(&g_pads_lock);
@@ -461,10 +618,7 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
     if (!g_main_pump)
         SDL_GameControllerUpdate();
 
-    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
-        pad.button[b] = SDL_GameControllerGetButton(c, (SDL_GameControllerButton)b) ? 1 : 0;
-    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
-        pad.axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
+    pad_read(c, &pad);
     pthread_mutex_unlock(&g_pads_lock);
     out->dwPacketNumber = ++g_packet[port];
     if (xbox_InputFaceLayoutNintendo())
@@ -475,16 +629,47 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
 
 /* The motors' levels, after the rumble curve (input_core.c): given to the
  * pad as they are. */
+static void pad_rumble(SDL_GameController *c, DWORD port, const XBOX_VIBRATION *v);
+
 static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
     SDL_GameController *c;
 
     pthread_mutex_lock(&g_pads_lock);
-    c = g_pads[port];
-    if (!c || !SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
         pthread_mutex_unlock(&g_pads_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
+    if (xbox_InputPadsMerged()) {
+        int n = 0;
+        if (port == (DWORD)xbox_InputFirstPadPort())
+            for (int k = 0; k < PAD_OPEN_MAX + XBOX_MAX_CONTROLLERS; k++) {
+                int seen = 0;
+                c = k < PAD_OPEN_MAX ? g_open[k].c : g_pads[k - PAD_OPEN_MAX];
+                for (int j = 0; j < PAD_OPEN_MAX && k >= PAD_OPEN_MAX; j++)
+                    seen |= g_open[j].c == c;
+                if (c && !seen) {
+                    pad_rumble(c, 0, v);    /* rumble on all */
+                    n++;
+                }
+            }
+        pthread_mutex_unlock(&g_pads_lock);
+        return n ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+    }
+    c = g_pads[port];
+    if (!c) {
+        pthread_mutex_unlock(&g_pads_lock);
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+    pad_rumble(c, port, v);
+    pthread_mutex_unlock(&g_pads_lock);
+    return ERROR_SUCCESS;
+}
+
+/* Under g_pads_lock. */
+static void pad_rumble(SDL_GameController *c, DWORD port, const XBOX_VIBRATION *v)
+{
+    (void)port;
     /* SDL rumble needs a duration: XBOX_RUMBLE_EFFECT_MS, which
      * input_core.c renews every XBOX_RUMBLE_REFRESH_MS while the level is
      * held (the same level again only moves SDL's expiry on: no write to the
@@ -508,8 +693,7 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
                                    SDL_GameControllerGetVendor(c),
                                    SDL_GameControllerGetProduct(c))) {
             SDL_GameControllerRumble(c, 0, 0, 0);
-            pthread_mutex_unlock(&g_pads_lock);
-            return ERROR_SUCCESS;
+            return;
         }
     }
 #endif
@@ -517,8 +701,6 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
         g_last_on_ms = sdl_now_ms();
     SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
                              (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? XBOX_RUMBLE_EFFECT_MS : 0);
-    pthread_mutex_unlock(&g_pads_lock);
-    return ERROR_SUCCESS;
 }
 
 /* The end of the run (input_core.c, motors already set to zero through

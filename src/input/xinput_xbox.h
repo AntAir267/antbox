@@ -121,6 +121,9 @@ void xbox_InputRumbleTick(DWORD dwPort);
  * second for a port the title does not read).
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
+/* A controller was just plugged in: the next read asks at once, so its first
+ * press isn't lost to the wait between probes of an empty port. */
+void xbox_InputProbeSoon(void);
 
 /**
  * Get controller capabilities.

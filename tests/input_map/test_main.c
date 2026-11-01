@@ -1330,6 +1330,41 @@ static void test_first_pad(void)
     CHECK(xbox_InputFirstPadGeneration() == g0 + 2, "and counted");
 }
 
+static void test_pad_merge(void)
+{
+    XBOX_HOST_SDL_GAMEPAD a, b;
+    XBOX_HOST_XINPUT_GAMEPAD x = {0}, y = {0};
+
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    a.button[XBOX_SDL_BUTTON_A] = 1;
+    b.button[XBOX_SDL_BUTTON_START] = 1;
+    a.axis[XBOX_SDL_AXIS_LEFTX] = 1000;
+    b.axis[XBOX_SDL_AXIS_LEFTX] = -20000;
+    a.axis[XBOX_SDL_AXIS_TRIGGERLEFT] = 30000;
+    b.axis[XBOX_SDL_AXIS_TRIGGERLEFT] = 100;
+    xbox_InputMergeSdl(&a, &b);
+    CHECK(a.button[XBOX_SDL_BUTTON_A] && a.button[XBOX_SDL_BUTTON_START], "pad merge 1");
+    CHECK(a.axis[XBOX_SDL_AXIS_LEFTX] == -20000, "pad merge 2");
+    CHECK(a.axis[XBOX_SDL_AXIS_TRIGGERLEFT] == 30000, "pad merge 3");
+
+    x.wButtons = 1;
+    y.wButtons = 2;
+    x.bLeftTrigger = 10;
+    y.bLeftTrigger = 200;
+    x.sThumbLY = -32768;
+    y.sThumbLY = 32767;
+    xbox_InputMergeXInput(&x, &y);
+    CHECK(x.wButtons == 3 && x.bLeftTrigger == 200, "pad merge 4");
+    CHECK(x.sThumbLY == -32768, "pad merge 5");
+
+    /* The title's say over RECOMP_USB_PADS. */
+    xbox_InputSetPlayers(2);
+    CHECK(!xbox_InputPadsMerged(), "pad merge 6");
+    xbox_InputSetPlayers(1);
+    CHECK(xbox_InputPadsMerged(), "pad merge 7");
+}
+
 static void test_control_scheme(void)
 {
     XBOX_INPUT_STATE st;
@@ -1377,6 +1412,7 @@ int main(int argc, char **argv)
     test_deadzone();
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
+    test_pad_merge();
     test_block();
     test_keyboard_play();
     test_rumble();

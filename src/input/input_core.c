@@ -503,6 +503,11 @@ static int due(DWORD port)
         || g_be->now_ms() - g_last_probe[port] >= XBOX_INPUT_PROBE_MS;
 }
 
+void xbox_InputProbeSoon(void)
+{
+    memset(g_probed, 0, sizeof g_probed);
+}
+
 /* A key of the map went down: the keyboard is the device in use. */
 static void keyboard_active(void)
 {

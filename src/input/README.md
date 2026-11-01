@@ -220,6 +220,23 @@ test.
 | D or Right arrow | Left stick right |
 <!-- keyboard_map:end -->
 
+## Every controller is player 1's
+
+With one player, every connected controller feeds the first port, merged: a
+button held on any, each stick axis and trigger from the one pushed furthest,
+rumble on all. Plug-in order, late plug-ins and unplugging don't matter, and a
+silent device a handheld also lists costs nothing. A button down since a device
+opened, or an axis resting off centre, counts only from its first real move, so
+a device doing nothing can't hold anything down. A title's local multiplayer game
+calls `xbox_InputSetPlayers(2)`, and ports go to controllers one each at their next
+press; `xbox_InputSetPlayers(1)` in its menus merges them again. A title that never
+calls it follows `RECOMP_USB_PADS`: more than one keeps a port per controller.
+
+`xbox_InputSetPlayers(2)` gives a title no second pad by itself: the emulated pads
+are plugged in at start from `RECOMP_USB_PADS`. A title with local multiplayer sets
+`RECOMP_USB_PADS=2` and calls `xbox_InputSetPlayers(1)` at start. Ports then go by
+first press, so a second pad that presses first after the split becomes player 1.
+
 ## The first controller's player
 
 `input.first_pad` (settings.toml, the overlay's Input page as "First

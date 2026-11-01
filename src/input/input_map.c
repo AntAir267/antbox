@@ -159,6 +159,53 @@ void xbox_InputSetFirstPadPort(int port)
 int      xbox_InputFirstPadPort(void)       { return s_first_pad_port; }
 unsigned xbox_InputFirstPadGeneration(void) { return s_first_pad_gen; }
 
+static volatile int s_players;   /* 0: the title hasn't said */
+
+void xbox_InputSetPlayers(int players)
+{
+    int n = players > 1 ? players : 1;
+    if (n != s_players) {
+        s_players = n;
+        s_first_pad_gen++;       /* the ports already taken go back */
+    }
+}
+
+int xbox_InputPadsMerged(void)
+{
+    int n = s_players;
+    if (!n) {
+        const char *e = recomp_env(RENV_USB_PADS);
+        n = e ? atoi(e) : 1;
+    }
+    return n < 2;
+}
+
+static int16_t merge_axis(int16_t a, int16_t b)
+{
+    return abs((int)b) > abs((int)a) ? b : a;
+}
+
+void xbox_InputMergeXInput(XBOX_HOST_XINPUT_GAMEPAD *into, const XBOX_HOST_XINPUT_GAMEPAD *from)
+{
+    into->wButtons |= from->wButtons;
+    if (from->bLeftTrigger > into->bLeftTrigger)
+        into->bLeftTrigger = from->bLeftTrigger;
+    if (from->bRightTrigger > into->bRightTrigger)
+        into->bRightTrigger = from->bRightTrigger;
+    into->sThumbLX = merge_axis(into->sThumbLX, from->sThumbLX);
+    into->sThumbLY = merge_axis(into->sThumbLY, from->sThumbLY);
+    into->sThumbRX = merge_axis(into->sThumbRX, from->sThumbRX);
+    into->sThumbRY = merge_axis(into->sThumbRY, from->sThumbRY);
+}
+
+void xbox_InputMergeSdl(XBOX_HOST_SDL_GAMEPAD *into, const XBOX_HOST_SDL_GAMEPAD *from)
+{
+    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
+        into->button[b] |= from->button[b];
+    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
+        into->axis[a] = merge_axis(into->axis[a], from->axis[a]);
+}
+
 void xbox_InputMirrorFaceXInput(XBOX_HOST_XINPUT_GAMEPAD *pad)
 {
     uint16_t b = pad->wButtons, o = (uint16_t)(b & ~(XBOX_XI_A | XBOX_XI_B | XBOX_XI_X | XBOX_XI_Y));
