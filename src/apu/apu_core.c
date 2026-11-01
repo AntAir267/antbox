@@ -349,6 +349,35 @@ static void apu_isr_on_holder(void)
         apu_irq_stats.holder_delivered++;
 }
 
+/* A front end that stays trapped with nothing left to tell the title: the sound
+ * stops for good while the game runs on (Wreckless, 1 run in 34 under load: traps,
+ * deliveries and posts all stand still [measured]). A write to IEN now raises a line
+ * it unmasks; DSOUND's service pass dropping an idle trap under its guard would look
+ * the same [guess], so this stays. FETINTSTS is otherwise latched once (see update_irq), since a
+ * replay can find a voice already released; a trap still held this long is still
+ * real, and normal service takes milliseconds, so it's raised again. */
+#define APU_FE_TRAP_STUCK_NS 250000000ull
+static uint64_t s_fe_trap_since;
+
+static void fe_trap_watch(MCPXAPUState *d)
+{
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    static unsigned said;
+
+    if (!s_fe_trap_since)
+        s_fe_trap_since = now;
+    if (now - s_fe_trap_since < APU_FE_TRAP_STUCK_NS)
+        return;
+    s_fe_trap_since = now;
+    if (said++ < 8)
+        fprintf(stderr, "[APU] front end stuck trapped: ISTS %08X IEN %08X FECTL %08X line %d;"
+                " raising it again\n", (unsigned)qatomic_read(&d->regs[NV_PAPU_ISTS]),
+                (unsigned)d->regs[NV_PAPU_IEN], (unsigned)qatomic_read(&d->regs[NV_PAPU_FECTL]),
+                (int)InterlockedCompareExchange(&s_irq_line, 0, 0));
+    qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
+    d->set_irq = true;
+}
+
 static void apu_deliver_irq(MCPXAPUState *d)
 {
     static int tib_ready;
@@ -464,6 +493,15 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~(uint32_t)val);
         update_irq(d);
         qemu_cond_broadcast(&d->cond);
+        break;
+    case NV_PAPU_IEN:
+        /* The line is a level: unmasking a status bit already set raises it
+         * now. Without this a trap latched while it was masked stayed
+         * pending with the line low (MA2's log: ISTS 10, IEN D9, line 0), and
+         * nothing raised it until the next status change, which a trapped
+         * front end never makes. */
+        qatomic_set(&d->regs[addr], (uint32_t)val);
+        update_irq(d);
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
@@ -1443,6 +1481,7 @@ static void *mcpx_apu_frame_thread(void *arg)
              * digital zero in the music every few seconds). The interrupt is
              * delivered below; the wait is after it. */
             apu_irq_stats.fe_trapped_frames++;
+            fe_trap_watch(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -1457,6 +1496,8 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
+        if (!fe_trapped)
+            s_fe_trap_since = 0;
         apu_deliver_irq(d);
 
         /* Let the guest in once per frame.

@@ -233,6 +233,7 @@ extern "C" {
     X(TRACE_PROFILE,     TRACE, "call_profile",    "RECOMP_TRACE_PROFILE",     "call profile; =n report interval") \
     X(IRQL_TRACE,        TRACE, "irql",            "RECOMP_IRQL_TRACE",        "first IRQL transitions") \
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
+    X(APU_TRAP_LOSE,     DEBUG, "apu_trap_lose",   NULL,                       "the Nth front end trap loses its interrupt, to test the recovery") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
     X(AUDIO_CHANNELS,    TRACE, "audio_channels",  NULL,                       "level of every APU mixbin and output channel, once a second: [AUDIO-CH]") \
     X(MIX_TRACE,         TRACE, "mix",             "RECOMP_MIX_TRACE",         "=file: per-voice mix study: who turned each voice on, its bins, volumes, speaker shares and levels, once a second; output peaks before the clamp") \

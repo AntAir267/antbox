@@ -293,7 +293,8 @@ static void host_opts(unsigned scale)
 {
     struct nv2a_host_opts o;
     memset(&o, 0, sizeof o);
-    o.shader_cache = "none";
+    /* No disk caches, so runs compare, unless a run measures them. */
+    o.shader_cache = getenv("NVR_REPLAY_CACHE") ? getenv("NVR_REPLAY_CACHE") : "none";
     o.render_scale = scale;
     nv2a_host_opts_set(&o);
 }

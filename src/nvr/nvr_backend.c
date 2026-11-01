@@ -36,6 +36,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "nv2a_vk_core.h"
 #include "nv2a_vk_glsl.h"
@@ -49,6 +50,7 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_texmip.h"
 #include "nv2a_texscale.h"
+#include "nv2a_pcache.h"
 #include "nvr/nvr_backend.h"
 #include "platform/recomp_env.h"
 
@@ -134,6 +136,7 @@ static void retire_image(struct nvk_image *im);
 static void view_garbage(VkImageView v);
 static void occ_query_begin(void);
 static void occ_init(void);
+static int draw_init_all(void);
 static void occ_pass_end(void);
 struct NvrOccQuery;
 static struct NvrOccQuery *s_occ_q;  /* the query counting now, or NULL */
@@ -193,7 +196,7 @@ static int init(void)
             }
         }
     }
-    if (!draw_init()) {
+    if (!draw_init_all()) {
         s_failed = 1;
         return 0;
     }
@@ -1447,38 +1450,89 @@ static void *ring_take(int r, VkDeviceSize n, VkDeviceSize align, VkDeviceSize *
 #define NVR_VS_CACHE 512
 static struct { uint32_t hash, len; uint16_t inputs; VkShaderModule m; } s_vs[NVR_VS_CACHE];
 
+/* The tables below are shared with the pre-warm thread (see "the saved list"):
+ * looked up and filled under this lock, built outside it. */
+static pthread_mutex_t s_sh_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pc_built(int kind, uint64_t ns);
+static void pc_put(uint32_t type, const void *data, uint32_t len);
+static uint64_t mono_ns(void);
+enum { NVR_PC_VS, NVR_PC_FS, NVR_PC_PSO };
+
+/* Under s_sh_mu: the program's slot, or its free one; -1 when the table is full. */
+static int vs_slot(uint32_t hash, uint32_t len)
+{
+    uint32_t i, slot = hash % NVR_VS_CACHE;
+    for (i = 0; i < NVR_VS_CACHE; i++, slot = (slot + 1) % NVR_VS_CACHE)
+        if (!s_vs[slot].m || (s_vs[slot].hash == hash && s_vs[slot].len == len))
+            return (int)slot;
+    return -1;
+}
+
+/* The module for `len` slots, built here and entered unless another thread was
+ * first. `parsed` and `glsl` (65536) are the caller's. */
+static VkShaderModule vs_build(const uint32_t *slots, uint32_t len, uint32_t hash, uint16_t *inputs,
+                               NV2AVshProgram *parsed, char *glsl)
+{
+    VkShaderModule m;
+    char what[32];
+    int slot;
+
+    d3d8_vsh_parse(slots, (int)len, parsed);
+    snprintf(what, sizeof what, "program %08X", hash);
+    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, 65536) <= 0)
+        return VK_NULL_HANDLE;
+    if (!(m = module_from_glsl(NVK_STAGE_VERTEX, glsl, what)))
+        return VK_NULL_HANDLE;
+    pthread_mutex_lock(&s_sh_mu);
+    slot = vs_slot(hash, len);
+    if (slot < 0 || s_vs[slot].m) {
+        VkShaderModule have = slot < 0 ? VK_NULL_HANDLE : s_vs[slot].m;
+        if (slot >= 0)
+            *inputs = s_vs[slot].inputs;
+        pthread_mutex_unlock(&s_sh_mu);
+        vkDestroyShaderModule(s_dev, m, NULL);
+        return have;
+    }
+    s_vs[slot].m = m;
+    s_vs[slot].hash = hash;
+    s_vs[slot].len = len;
+    s_vs[slot].inputs = parsed->inputs_read;
+    *inputs = parsed->inputs_read;
+    pthread_mutex_unlock(&s_sh_mu);
+    return m;
+}
+
 /* The vertex program's module, made once per program (by its slots' hash). */
 static VkShaderModule vs_program(const struct nv2a_pb_vsh *v, uint16_t *inputs)
 {
     static NV2AVshProgram parsed;
     static char glsl[65536];
-    uint32_t len = 0, hash = nv2a_vsh_program_hash(v, &len), i, slot;
-    char what[32];
+    uint32_t len = 0, hash = nv2a_vsh_program_hash(v, &len);
+    uint64_t t0;
+    VkShaderModule m;
+    int slot;
 
     if (!len)
         return VK_NULL_HANDLE;
-    slot = hash % NVR_VS_CACHE;
-    for (i = 0; i < NVR_VS_CACHE; i++, slot = (slot + 1) % NVR_VS_CACHE) {
-        if (s_vs[slot].m && s_vs[slot].hash == hash && s_vs[slot].len == len) {
-            *inputs = s_vs[slot].inputs;
-            return s_vs[slot].m;
-        }
-        if (!s_vs[slot].m)
-            break;
+    pthread_mutex_lock(&s_sh_mu);
+    slot = vs_slot(hash, len);
+    if (slot >= 0 && s_vs[slot].m) {
+        *inputs = s_vs[slot].inputs;
+        m = s_vs[slot].m;
+        pthread_mutex_unlock(&s_sh_mu);
+        return m;
     }
-    if (s_vs[slot].m)
+    pthread_mutex_unlock(&s_sh_mu);
+    if (slot < 0)
         return VK_NULL_HANDLE;          /* full: not drawn (the old backend's
                                          * cache is the measure of how many) */
-    d3d8_vsh_parse(&v->prog[v->start][0], (int)len, &parsed);
-    snprintf(what, sizeof what, "program %08X", hash);
-    if (d3d8_vsh_generate_glsl(&parsed, D3D8_GLSL_SCREEN_SPACE, glsl, sizeof glsl) <= 0)
-        return VK_NULL_HANDLE;
-    s_vs[slot].m = module_from_glsl(NVK_STAGE_VERTEX, glsl, what);
-    s_vs[slot].hash = hash;
-    s_vs[slot].len = len;
-    s_vs[slot].inputs = parsed.inputs_read;
-    *inputs = parsed.inputs_read;
-    return s_vs[slot].m;
+    t0 = mono_ns();
+    m = vs_build(&v->prog[v->start][0], len, hash, inputs, &parsed, glsl);
+    if (m) {
+        pc_built(NVR_PC_VS, mono_ns() - t0);
+        pc_put(NVR_PC_VS, &v->prog[v->start][0], len * 16u);
+    }
+    return m;
 }
 
 static struct nv2a_stage s_stage[4];
@@ -1546,7 +1600,49 @@ static NvrDepth *dt_for_zcolor(const struct nv2a_stage *t)
 }
 
 #define NVR_FS_CACHE 512
-static struct { uint32_t key[41]; VkShaderModule m; int valid; } s_fs[NVR_FS_CACHE];
+static struct { uint32_t key[41], h; VkShaderModule m; int valid; } s_fs[NVR_FS_CACHE];
+
+/* What the saved list holds for a fragment shader: its key and its state. */
+typedef struct { uint32_t key[41]; NV2ACombinerState st; } NvrFsDisk;
+
+/* Under s_sh_mu: the key's slot, or its free one; -1 when the table is full. */
+static int fs_slot(const uint32_t *key, uint32_t h)
+{
+    uint32_t i, slot = h % NVR_FS_CACHE;
+    for (i = 0; i < NVR_FS_CACHE; i++, slot = (slot + 1) % NVR_FS_CACHE)
+        if (!s_fs[slot].valid || !memcmp(s_fs[slot].key, key, 41 * 4))
+            return (int)slot;
+    return -1;
+}
+
+/* The module for a combiner state, built here and entered unless another
+ * thread was first. `glsl` (65536) is the caller's. */
+static VkShaderModule fs_build(const uint32_t *key, uint32_t h, const NV2ACombinerState *st, char *glsl)
+{
+    VkShaderModule m;
+    char what[32];
+    int slot;
+
+    snprintf(what, sizeof what, "combiners %08X", h);
+    if (d3d8_combiners_generate_glsl(st, glsl, 65536) <= 0)
+        return VK_NULL_HANDLE;
+    if (!(m = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, what)))
+        return VK_NULL_HANDLE;
+    pthread_mutex_lock(&s_sh_mu);
+    slot = fs_slot(key, h);
+    if (slot < 0 || s_fs[slot].valid) {
+        VkShaderModule have = slot < 0 ? VK_NULL_HANDLE : s_fs[slot].m;
+        pthread_mutex_unlock(&s_sh_mu);
+        vkDestroyShaderModule(s_dev, m, NULL);
+        return have;
+    }
+    memcpy(s_fs[slot].key, key, 41 * 4);
+    s_fs[slot].h = h;
+    s_fs[slot].m = m;
+    s_fs[slot].valid = 1;
+    pthread_mutex_unlock(&s_sh_mu);
+    return m;
+}
 
 /* The draw's fragment module: the combiners the registers program, or the
  * basic one. As the old backend's fs_select, less what slice 2a lacks
@@ -1555,9 +1651,11 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
 {
     static char glsl[65536];
     NV2ACombinerState st;
-    uint32_t key[41], modes = 0, signs = 0, shadows = 0, h, i, slot;
+    uint32_t key[41], modes = 0, signs = 0, shadows = 0, h;
+    uint64_t t0;
+    VkShaderModule m;
+    int fslot;
     int n, wbuf;
-    char what[32];
 
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         return s_fs_basic;
@@ -1607,15 +1705,14 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     key[39] = (uint32_t)wbuf << 16;
     key[40] = shadows;
     h = fnv32(key, sizeof key);
-    slot = h % NVR_FS_CACHE;
-    for (i = 0; i < NVR_FS_CACHE; i++, slot = (slot + 1) % NVR_FS_CACHE) {
-        if (s_fs[slot].valid && !memcmp(s_fs[slot].key, key, sizeof key))
-            return s_fs[slot].m;
-        if (!s_fs[slot].valid)
-            break;
+    pthread_mutex_lock(&s_sh_mu);
+    fslot = fs_slot(key, h);
+    if (fslot < 0 || s_fs[fslot].valid) {
+        VkShaderModule have = fslot < 0 ? VK_NULL_HANDLE : s_fs[fslot].m;
+        pthread_mutex_unlock(&s_sh_mu);
+        return have;
     }
-    if (s_fs[slot].valid)
-        return VK_NULL_HANDLE;
+    pthread_mutex_unlock(&s_sh_mu);
     memset(&st, 0, sizeof st);
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw, v->rc_ctl,
                              v->rc_fcw0, v->rc_fcw1, modes, &st);
@@ -1630,13 +1727,17 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
     st.wbuffer = (uint8_t)wbuf;
     st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
     st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
-    snprintf(what, sizeof what, "combiners %08X", h);
-    if (d3d8_combiners_generate_glsl(&st, glsl, sizeof glsl) <= 0)
-        return VK_NULL_HANDLE;
-    memcpy(s_fs[slot].key, key, sizeof key);
-    s_fs[slot].m = module_from_glsl(NVK_STAGE_FRAGMENT, glsl, what);
-    s_fs[slot].valid = 1;
-    return s_fs[slot].m;
+    t0 = mono_ns();
+    m = fs_build(key, h, &st, glsl);
+    if (m) {
+        NvrFsDisk dk;
+        pc_built(NVR_PC_FS, mono_ns() - t0);
+        memset(&dk, 0, sizeof dk);
+        memcpy(dk.key, key, sizeof key);
+        dk.st = st;
+        pc_put(NVR_PC_FS, &dk, sizeof dk);
+    }
+    return m;
 }
 
 /* ---- pipelines -------------------------------------------------------------- */
@@ -1647,6 +1748,7 @@ typedef struct {
     uint32_t blend[4];          /* enable, src, dst, VkBlendOp */
 } NvrPsoKey;
 
+static VkPipelineCache s_pcache;
 #define NVR_PSO_CACHE 2048
 static struct { NvrPsoKey k; VkPipeline p; } s_pso[NVR_PSO_CACHE];
 
@@ -1790,9 +1892,319 @@ static VkPipeline pipeline_new(const NvrPsoKey *k)
     gp.pColorBlendState = &cb;
     gp.pDynamicState = &dy;
     gp.layout = s_playout;
-    if (vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gp, NULL, &p) != VK_SUCCESS)
+    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gp, NULL, &p) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     return p;
+}
+
+/* Under s_sh_mu: the key's slot, or its free one; -1 when the table is full. */
+static int pso_slot(const NvrPsoKey *k)
+{
+    uint32_t i, slot = fnv32(k, sizeof *k) % NVR_PSO_CACHE;
+    for (i = 0; i < NVR_PSO_CACHE; i++, slot = (slot + 1) % NVR_PSO_CACHE)
+        if (!s_pso[slot].p || !memcmp(&s_pso[slot].k, k, sizeof *k))
+            return (int)slot;
+    return -1;
+}
+
+/* The pipeline for a key, built here and entered unless another thread was first. */
+static VkPipeline pso_build(const NvrPsoKey *k)
+{
+    VkPipeline p = pipeline_new(k);
+    int slot;
+
+    if (!p)
+        return VK_NULL_HANDLE;
+    pthread_mutex_lock(&s_sh_mu);
+    slot = pso_slot(k);
+    if (slot < 0 || s_pso[slot].p) {
+        VkPipeline have = slot < 0 ? VK_NULL_HANDLE : s_pso[slot].p;
+        pthread_mutex_unlock(&s_sh_mu);
+        vkDestroyPipeline(s_dev, p, NULL);
+        return have;
+    }
+    s_pso[slot].k = *k;
+    s_pso[slot].p = p;
+    pthread_mutex_unlock(&s_sh_mu);
+    return p;
+}
+
+/* A pipeline as the saved list holds it: its shaders by what they are, not by
+ * this run's handles. fs_h 0: the basic fragment shader. */
+typedef struct {
+    uint32_t vs_hash, vs_len, fs_h, pad;
+    uint32_t nf4, topo, wmask, depth;
+    uint32_t blend[4];
+} NvrPsoDisk;
+
+static int pso_disk(const NvrPsoKey *k, NvrPsoDisk *d)
+{
+    int i, found = k->vs == (uint64_t)(uintptr_t)s_vs_pass;
+
+    memset(d, 0, sizeof *d);        /* vs_len 0: the pass-through vertex shader */
+    pthread_mutex_lock(&s_sh_mu);
+    for (i = 0; i < NVR_VS_CACHE && !found; i++)
+        if (s_vs[i].m && (uint64_t)(uintptr_t)s_vs[i].m == k->vs) {
+            d->vs_hash = s_vs[i].hash;
+            d->vs_len = s_vs[i].len;
+            found = 1;
+        }
+    if (found && k->fs != (uint64_t)(uintptr_t)s_fs_basic) {
+        found = 0;
+        for (i = 0; i < NVR_FS_CACHE && !found; i++)
+            if (s_fs[i].valid && (uint64_t)(uintptr_t)s_fs[i].m == k->fs) {
+                d->fs_h = s_fs[i].h;
+                found = 1;
+            }
+    }
+    pthread_mutex_unlock(&s_sh_mu);
+    d->nf4 = k->nf4;
+    d->topo = k->topo;
+    d->wmask = k->wmask;
+    d->depth = k->depth;
+    memcpy(d->blend, k->blend, sizeof d->blend);
+    return found;
+}
+
+/* ---- the saved list ---------------------------------------------------------
+ *
+ * Xbox shaders are only known once the title sends them, so a first playthrough
+ * compiles them mid-frame. What was built is remembered as keys (nv2a_pcache.h),
+ * and the next start builds them on a thread of its own before the title asks,
+ * so a driver update doesn't bring the stutter back; the driver's pipeline cache
+ * is saved beside it and makes that quick. Draw-time builds are counted, which is
+ * the first-run stutter measured. */
+static nv2a_pcache *s_pcf;
+static char s_blob_path[1100];
+static uint32_t s_pso_new;           /* built since the blob was last saved */
+static int s_blob_saving;
+static uint64_t s_built_n[3], s_built_ns[3], s_built_max[3], s_warm_n[3], s_warm_ms;
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void pc_built(int kind, uint64_t ns)
+{
+    s_built_n[kind]++;
+    s_built_ns[kind] += ns;
+    if (ns > s_built_max[kind])
+        s_built_max[kind] = ns;
+    if (kind == NVR_PC_PSO)
+        __atomic_fetch_add(&s_pso_new, 1, __ATOMIC_RELAXED);
+}
+
+static void pc_put(uint32_t type, const void *data, uint32_t len)
+{
+    if (s_pcf)
+        nv2a_pcache_put(s_pcf, type, data, len);
+}
+
+struct nvr_blob_hdr {
+    char     magic[8];
+    uint32_t vendor, device, driver, len;
+    uint64_t fnv;
+};
+
+static void blob_load(void)
+{
+    VkPipelineCacheCreateInfo ci;
+    struct nvr_blob_hdr h;
+    void *data = NULL;
+    FILE *f;
+
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    if (s_blob_path[0] && (f = fopen(s_blob_path, "rb")) != NULL) {
+        if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "NVRPCB1", 8)
+                && h.vendor == C->props.vendorID && h.device == C->props.deviceID
+                && h.driver == C->props.driverVersion && (data = malloc(h.len)) != NULL
+                && fread(data, 1, h.len, f) == h.len
+                && nv2a_fnv64(data, h.len, NV2A_FNV64_INIT) == h.fnv) {
+            ci.initialDataSize = h.len;
+            ci.pInitialData = data;
+        }
+        fclose(f);
+    }
+    if (vkCreatePipelineCache(s_dev, &ci, NULL, &s_pcache) != VK_SUCCESS)
+        s_pcache = VK_NULL_HANDLE;
+    fprintf(stderr, LOGP "pipeline cache: %zu bytes from disk\n", ci.initialDataSize);
+    free(data);
+}
+
+static void *blob_save_main(void *arg)
+{
+    size_t n = 0;
+    char tmp[1110];
+    void *data;
+    (void)arg;
+
+    if (vkGetPipelineCacheData(s_dev, s_pcache, &n, NULL) == VK_SUCCESS && n
+            && (data = malloc(n)) != NULL) {
+        if (vkGetPipelineCacheData(s_dev, s_pcache, &n, data) == VK_SUCCESS) {
+            struct nvr_blob_hdr h;
+            FILE *f;
+            memset(&h, 0, sizeof h);
+            memcpy(h.magic, "NVRPCB1", 8);
+            h.vendor = C->props.vendorID;
+            h.device = C->props.deviceID;
+            h.driver = C->props.driverVersion;
+            h.len = (uint32_t)n;
+            h.fnv = nv2a_fnv64(data, n, NV2A_FNV64_INIT);
+            snprintf(tmp, sizeof tmp, "%s.tmp", s_blob_path);
+            if ((f = fopen(tmp, "wb")) != NULL) {
+                int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(data, 1, n, f) == n;
+                if (fclose(f) == 0 && ok)
+                    rename(tmp, s_blob_path);
+                else
+                    remove(tmp);
+            }
+        }
+        free(data);
+    }
+    __atomic_store_n(&s_blob_saving, 0, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* In the background: reading the blob out can take a while. */
+static void blob_save(int wait)
+{
+    pthread_t th;
+
+    if (!s_pcache || !s_blob_path[0] || !__atomic_exchange_n(&s_pso_new, 0, __ATOMIC_ACQ_REL)
+            || __atomic_exchange_n(&s_blob_saving, 1, __ATOMIC_ACQ_REL))
+        return;
+    if (wait || pthread_create(&th, NULL, blob_save_main, NULL) != 0)
+        blob_save_main(NULL);
+    else
+        pthread_detach(th);
+}
+
+static int s_warm_stop, s_warm_running;
+static pthread_t s_warm_th;
+
+/* Builds everything on the list. A draw that gets there first just wins. */
+static void *prewarm_main(void *arg)
+{
+    static NV2AVshProgram parsed;
+    static char glsl[65536];
+    uint64_t t0 = mono_ns();
+    size_t n = nv2a_pcache_count(s_pcf), i;
+    int pass;
+
+    (void)arg;
+    nv2a_pcache_lower_priority();
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < n && !__atomic_load_n(&s_warm_stop, __ATOMIC_ACQUIRE); i++) {
+            uint32_t type, len;
+            const void *d;
+            if (!nv2a_pcache_get(s_pcf, i, &type, &d, &len))
+                break;
+            if (pass == 0 && type == NVR_PC_VS && len >= 16 && len % 16 == 0
+                    && len <= NV2A_VSH_SLOTS * 16u) {
+                uint32_t hash = 2166136261u, k;
+                uint16_t in = 0;
+                for (k = 0; k < len / 4u; k++)      /* nv2a_vsh_program_hash */
+                    hash = (hash ^ ((const uint32_t *)d)[k]) * 16777619u;
+                if (vs_build((const uint32_t *)d, len / 16u, hash, &in, &parsed, glsl))
+                    s_warm_n[NVR_PC_VS]++;
+            } else if (pass == 0 && type == NVR_PC_FS && len == sizeof(NvrFsDisk)) {
+                static NvrFsDisk dk;
+                memcpy(&dk, d, sizeof dk);
+                if (fs_build(dk.key, fnv32(dk.key, sizeof dk.key), &dk.st, glsl))
+                    s_warm_n[NVR_PC_FS]++;
+            } else if (pass == 1 && type == NVR_PC_PSO && len == sizeof(NvrPsoDisk)) {
+                NvrPsoDisk dk;
+                NvrPsoKey k;
+                int j, ok = 1;
+                memcpy(&dk, d, sizeof dk);
+                memset(&k, 0, sizeof k);
+                pthread_mutex_lock(&s_sh_mu);
+                j = dk.vs_len ? vs_slot(dk.vs_hash, dk.vs_len) : -1;
+                if (!dk.vs_len)
+                    k.vs = (uint64_t)(uintptr_t)s_vs_pass;
+                else if (j >= 0 && s_vs[j].m)
+                    k.vs = (uint64_t)(uintptr_t)s_vs[j].m;
+                else
+                    ok = 0;
+                if (!dk.fs_h) {
+                    k.fs = (uint64_t)(uintptr_t)s_fs_basic;
+                } else {
+                    k.fs = 0;
+                    for (j = 0; j < NVR_FS_CACHE; j++)
+                        if (s_fs[j].valid && s_fs[j].h == dk.fs_h)
+                            k.fs = (uint64_t)(uintptr_t)s_fs[j].m;
+                    ok = ok && k.fs;
+                }
+                pthread_mutex_unlock(&s_sh_mu);
+                if (!ok)
+                    continue;
+                k.nf4 = dk.nf4;
+                k.topo = dk.topo;
+                k.wmask = dk.wmask;
+                k.depth = dk.depth;
+                memcpy(k.blend, dk.blend, sizeof k.blend);
+                if (pso_build(&k))
+                    s_warm_n[NVR_PC_PSO]++;
+            }
+        }
+    }
+    s_warm_ms = (mono_ns() - t0) / 1000000u;
+    fprintf(stderr, LOGP "pre-warm: %llu vertex, %llu fragment, %llu pipelines from the list in"
+            " %llu ms\n", (unsigned long long)s_warm_n[0], (unsigned long long)s_warm_n[1],
+            (unsigned long long)s_warm_n[2], (unsigned long long)s_warm_ms);
+    __atomic_fetch_add(&s_pso_new, 1, __ATOMIC_RELAXED);
+    return NULL;
+}
+
+/* The way out: no thread in Vulkan when the driver's own exit runs. */
+static void pc_stop(void)
+{
+    __atomic_store_n(&s_warm_stop, 1, __ATOMIC_RELEASE);
+    if (s_warm_running)
+        pthread_join(s_warm_th, NULL);
+    s_warm_running = 0;
+    for (int t = 0; t < 2000 && __atomic_load_n(&s_blob_saving, __ATOMIC_ACQUIRE); t++) {
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    blob_save(1);
+}
+
+/* After draw_init: the driver's cache, the list and its thread. */
+static void pc_start(void)
+{
+    char dir[1024], path[1100], msg[256], ver[160];
+
+    if (!nvk_cache_dir(dir, sizeof dir)) {
+        fprintf(stderr, LOGP "no disk cache for pipelines\n");
+        blob_load();
+        return;
+    }
+    snprintf(s_blob_path, sizeof s_blob_path, "%s/nvr_pipeline_%04X_%04X.bin", dir,
+             C->props.vendorID, C->props.deviceID);
+    blob_load();
+    snprintf(path, sizeof path, "%s/nvr_pipelines.bin", dir);
+    /* What the keys mean, not the build: a rebuild keeps the list. */
+    snprintf(ver, sizeof ver, "nvr pipelines 1; NvrPsoDisk %zu; NvrFsDisk %zu; vsh slots %d",
+             sizeof(NvrPsoDisk), sizeof(NvrFsDisk), (int)NV2A_VSH_SLOTS);
+    s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
+    fprintf(stderr, LOGP "pipeline list: %s: %s\n", path, msg);
+    if (s_pcf && nv2a_pcache_count(s_pcf)
+            && pthread_create(&s_warm_th, NULL, prewarm_main, NULL) == 0)
+        s_warm_running = 1;
+    atexit(pc_stop);
+}
+
+static int draw_init_all(void)
+{
+    if (!draw_init())
+        return 0;
+    pc_start();
+    return 1;
 }
 
 static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
@@ -1800,7 +2212,9 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     NvrPsoKey k;
-    uint32_t i, slot;
+    uint64_t t0;
+    VkPipeline p;
+    int slot;
 
     memset(&k, 0, sizeof k);
     k.vs = (uint64_t)(uintptr_t)vs;
@@ -1813,18 +2227,23 @@ static VkPipeline pipeline(VkShaderModule vs, VkShaderModule fs, uint32_t nf4,
     k.blend[1] = k.blend[0] ? g->blend_sfactor : 0u;
     k.blend[2] = k.blend[0] ? g->blend_dfactor : 0u;
     k.blend[3] = k.blend[0] ? (uint32_t)blend_op(g->blend_equation) : 0u;
-    slot = fnv32(&k, sizeof k) % NVR_PSO_CACHE;
-    for (i = 0; i < NVR_PSO_CACHE; i++, slot = (slot + 1) % NVR_PSO_CACHE) {
-        if (s_pso[slot].p && !memcmp(&s_pso[slot].k, &k, sizeof k))
-            return s_pso[slot].p;
-        if (!s_pso[slot].p)
-            break;
+    pthread_mutex_lock(&s_sh_mu);
+    slot = pso_slot(&k);
+    if (slot < 0 || s_pso[slot].p) {
+        VkPipeline have = slot < 0 ? VK_NULL_HANDLE : s_pso[slot].p;
+        pthread_mutex_unlock(&s_sh_mu);
+        return have;
     }
-    if (s_pso[slot].p)
-        return VK_NULL_HANDLE;
-    s_pso[slot].k = k;
-    s_pso[slot].p = pipeline_new(&k);
-    return s_pso[slot].p;
+    pthread_mutex_unlock(&s_sh_mu);
+    t0 = mono_ns();
+    p = pso_build(&k);
+    if (p) {
+        NvrPsoDisk dk;
+        pc_built(NVR_PC_PSO, mono_ns() - t0);
+        if (pso_disk(&k, &dk))
+            pc_put(NVR_PC_PSO, &dk, sizeof dk);
+    }
+    return p;
 }
 
 /* ---- textures ------------------------------------------------------------- */
@@ -3354,6 +3773,8 @@ static void nvr_on_flip(uint32_t surface_offset, uint32_t pitch)
         if (win && !layer)
             hpx = readback(t);
         frame_submit(0, "nvr flip");
+        if (s_flips % 300 == 299)
+            blob_save(0);
         if (++s_flips % 300 == 0)
             fprintf(stderr, LOGP "flip %llu: %llu clears, %llu draws (skipped: %llu masked,"
                     " %llu no target, %llu no program, %llu no pipeline, %llu ring), %llu seeds,"
@@ -3365,6 +3786,17 @@ static void nvr_on_flip(uint32_t surface_offset, uint32_t pitch)
                     (unsigned long long)s_draw_skips[SKIP_PSO],
                     (unsigned long long)s_draw_skips[SKIP_RING],
                     (unsigned long long)s_seeds, (unsigned long long)s_readbacks);
+        if (s_flips % 300 == 0) {
+            static uint64_t said;
+            uint64_t n = s_built_n[0] + s_built_n[1] + s_built_n[2];
+            if (n != said) {
+                said = n;
+                fprintf(stderr, LOGP "built at a draw so far: %llu vertex, %llu fragment,"
+                        " %llu pipelines, worst %.1f ms\n", (unsigned long long)s_built_n[0],
+                        (unsigned long long)s_built_n[1], (unsigned long long)s_built_n[2],
+                        (s_built_max[2] > s_built_max[1] ? s_built_max[2] : s_built_max[1]) / 1e6);
+            }
+        }
     }
     if (!pitch || !addr || layer)
         return;
@@ -3450,6 +3882,11 @@ void nvr_print_stats(void)
             (unsigned long long)s_draw_skips[SKIP_SCISSOR], (unsigned long long)s_seeds,
             (unsigned long long)s_readbacks, (unsigned long long)s_tex_uploads,
             (unsigned long long)s_rtt_binds, (unsigned long long)s_tex_syncs);
+    fprintf(stderr, LOGP "built at a draw: %llu vertex (%.1f ms, worst %.1f), %llu fragment (%.1f ms,"
+            " worst %.1f), %llu pipelines (%.1f ms, worst %.1f)\n",
+            (unsigned long long)s_built_n[0], s_built_ns[0] / 1e6, s_built_max[0] / 1e6,
+            (unsigned long long)s_built_n[1], s_built_ns[1] / 1e6, s_built_max[1] / 1e6,
+            (unsigned long long)s_built_n[2], s_built_ns[2] / 1e6, s_built_max[2] / 1e6);
     fprintf(stderr, LOGP "ghosts: %llu kept, %llu revived, %llu copied from, %llu written back\n",
             (unsigned long long)s_ghost_kept, (unsigned long long)s_ghost_revived,
             (unsigned long long)s_ghost_copies, (unsigned long long)s_ghost_flushes);

@@ -578,11 +578,24 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            apu_irq_stats.traps++;
+            {
+                /* RECOMP_DEBUG=apu_trap_lose=N: the Nth trap's interrupt is lost,
+                 * for testing what recovers from that (fe_trap_watch). */
+                static int lose = -1;
+                if (lose < 0) {
+                    const char *e = recomp_env(RENV_APU_TRAP_LOSE);
+                    lose = e ? atoi(e) : 0;
+                }
+                if (lose && --lose == 0) {
+                    fprintf(stderr, "[APU] apu_trap_lose: this trap's interrupt is lost\n");
+                    break;
+                }
+            }
             /* Latched here, once per trap; update_irq no longer re-derives
              * it from FECTL (see there). */
             qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
             d->set_irq = true;
-            apu_irq_stats.traps++;
         }
         break;
 
