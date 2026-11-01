@@ -2,6 +2,10 @@
 
 This guide walks you through recompiling your first Xbox game, from extracting the XBE to getting the game running on Windows.
 
+> **On antbox:** this guide comes from xboxrecomp. The ports built on antbox run on Linux
+> with Vulkan, not the D3D11 and OpenGL backends the table below describes. See the
+> [main README](../README.md#platforms).
+
 ## What You Need
 
 The Python pipeline — Steps 1 through 5, everything that turns an XBE into C
@@ -48,7 +52,7 @@ Two directories, and it matters which is which:
 
 ```bash
 # Clone the toolkit
-git clone https://github.com/sp00nznet/xboxrecomp.git
+git clone https://github.com/AntAir267/antbox.git
 
 # Create your game-specific repo from the template
 cp -r xboxrecomp/templates/new-game my_xbox_game   # Windows cmd: xcopy /E /I xboxrecomp\templates\new-game my_xbox_game

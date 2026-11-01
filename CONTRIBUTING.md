@@ -15,13 +15,13 @@ You need:
 Build the toolkit libraries:
 
 ```bash
-git clone https://github.com/sp00nznet/xboxrecomp.git
+git clone https://github.com/AntAir267/antbox.git
 cd xboxrecomp
 cmake -S . -B build
 cmake --build build --config Release
 ```
 
-This produces six static libraries in `build/src/*/Release/`. See the [README](README.md) for the full architecture diagram and library descriptions.
+This produces six static libraries in `build/src/*/Release/`. See the [xboxrecomp README](docs/UPSTREAM-README.md) for the full architecture diagram and library descriptions.
 
 ### macOS
 
@@ -58,7 +58,7 @@ The repository has two halves:
 1. **Python toolchain** (`tools/`) -- parses XBE files, disassembles x86, identifies library functions, and lifts machine code to C.
 2. **C runtime libraries** (`src/`) -- six static libraries that replace Xbox hardware and kernel at link time.
 
-See the [README](README.md) for the detailed directory tree and architecture diagram.
+See the [xboxrecomp README](docs/UPSTREAM-README.md) for the detailed directory tree and architecture diagram.
 
 ## How to Contribute
 
