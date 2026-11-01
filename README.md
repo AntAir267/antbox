@@ -1,8 +1,9 @@
 # antbox
 
-A shared toolkit for statically recompiling original Xbox games into native programs:
-the game's x86 code becomes C, with no emulator and no interpreter. It's a fork of
-xboxrecomp, and it's what these ports are built on:
+A shared toolkit for statically recompiling original Xbox games into native programs. The
+game's x86 code becomes C and runs natively, and the Xbox kernel is replaced by native code.
+The graphics and sound chips and USB pads the game's libraries talk to are still simulated
+in software. It's a fork of xboxrecomp, and it's what these ports are built on:
 
 - Wreckless: The Yakuza Missions
 - Double-S.T.E.A.L 2: Second Clash
