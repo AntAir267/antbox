@@ -3,7 +3,15 @@
 A shared toolkit for statically recompiling original Xbox games into native programs. The
 game's x86 code becomes C and runs natively, and the Xbox kernel is replaced by native code.
 The graphics and sound chips and USB pads the game's libraries talk to are still simulated
-in software. It's a fork of xboxrecomp, and it's what these ports are built on:
+in software.
+
+**antbox is a fork of the `takedawn` branch of
+[xenophobentx/xboxrecomp](https://github.com/xenophobentx/xboxrecomp/tree/takedawn), the
+toolkit of [Takedawn](https://github.com/xenophobentx/takedawn).** GitHub doesn't show that
+link because this repository started fresh, so it's stated here; see
+[Credits and license](#credits-and-license) for the full line of projects.
+
+It's what these ports are built on:
 
 - Wreckless: The Yakuza Missions
 - Double-S.T.E.A.L 2: Second Clash
