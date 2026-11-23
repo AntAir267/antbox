@@ -601,6 +601,13 @@ DWORD_PTR xbox_GuestCpuMask(void)
 }
 
 #if !defined(_WIN32)
+#if defined(__ELF__) && !defined(__APPLE__)
+/* The bounds of the guest_text section (recomp_guest_section.h), which the
+ * linker defines when one exists; weak, so 0 when the title has none. */
+extern const char __start_guest_text[] __attribute__((weak, visibility("hidden")));
+extern const char __stop_guest_text[] __attribute__((weak, visibility("hidden")));
+#endif
+
 static BOOL CALLBACK guest_turn_setup(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
     (void)once; (void)param; (void)ctx;
@@ -612,14 +619,23 @@ static BOOL CALLBACK guest_turn_setup(PINIT_ONCE once, PVOID param, PVOID *ctx)
         if (code && size)
             guest_turn_set_code(code, (size_t)size);
     }
+#elif defined(__ELF__)
+    /* Linux, the Deck, Android: the same section, as guest_text. Without
+     * it a guest thread changes over only at kernel calls and waits, and
+     * one that spins with no kernel call keeps the token. */
+    if (!guest_turn_has_code() && __start_guest_text && __stop_guest_text
+            && __stop_guest_text > __start_guest_text)
+        guest_turn_set_code(__start_guest_text,
+                            (size_t)(__stop_guest_text - __start_guest_text));
 #endif
     if (guest_turn_has_code())
         fprintf(stderr, "  [KERNEL] guest threads take turns on one guest CPU"
                         " (guest_cpus=token); preempted in the lifted code\n");
     else
         fprintf(stderr, "  [KERNEL] guest threads take turns on one guest CPU"
-                        " (guest_cpus=token); no __TEXT,__guest section, so"
-                        " they change over only at kernel calls and waits\n");
+                        " (guest_cpus=token); no guest code section"
+                        " (recomp_guest_section.h), so they change over only"
+                        " at kernel calls and waits\n");
     fflush(stderr);
     return TRUE;
 }
@@ -762,6 +778,24 @@ void xbox_GuestThreadPin(const char *role)
         return;
     while (!((mask >> core) & 1))
         core++;
+#if defined(_WIN32)
+    /* No token on Windows (its blocking calls are the system's, not the
+     * compat layer's that give it up): guest_cpus=token pins the guest
+     * threads to one core instead, which holds them to one CPU the same
+     * way, and overrides a title's xbox_GuestCpusDefaultUnpinned like any
+     * other guest_cpus value. Said once, so a soak log shows which mode
+     * it ran in. */
+    if (guest_cpus_token()) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [KERNEL] guest_cpus=token on Windows: the guest"
+                            " threads are pinned to one core (cpu %d) instead"
+                            " of taking turns on a token\n", core);
+            fflush(stderr);
+        }
+    }
+#endif
 #if defined(_WIN32)
     {
         /* Before the first pin: a pinned thread needs the class. */

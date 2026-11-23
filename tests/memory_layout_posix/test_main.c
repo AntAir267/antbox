@@ -213,6 +213,27 @@ int main(int argc, char **argv)
         check(0, "mapped region covers the 0x70000 probe", "region too small");
     }
 
+    /* 3b. A heap page's physical name is its alias in the first mirror
+     *     (xbox_PhysRamName, upstream 80d40d9): va + the RAM size, which the
+     *     mirror shows with the same bytes, and which no window page has.
+     *     Anything outside the heap keeps its own number. */
+    {
+        uint32_t alias = xbox_PhysRamAlias(), va = XBOX_HEAP_BASE + 0x1234u;
+        char detail[128];
+        snprintf(detail, sizeof detail, "alias 0x%08X, heap VA 0x%08X named 0x%08X",
+                 alias, va, xbox_PhysRamName(va));
+        check(alias == (uint32_t)size, "heap pages alias into the first mirror", detail);
+        check(xbox_PhysRamName(va) == va + alias, "a heap VA is named va + the RAM size",
+              detail);
+        check(xbox_PhysRamName(0x00040000u) == 0x00040000u,
+              "an address below the heap keeps its own number", detail);
+        if (alias && va + alias < 2 * size) {
+            p[va] = 0x3C;
+            check(p[va + alias] == 0x3C, "the alias reads the heap page's bytes",
+                  "the first mirror does not show the heap page");
+        }
+    }
+
     /* 4. Teardown has to give the addresses back, or nothing can re-init. */
     xbox_MemoryLayoutShutdown();
     BOOL again = xbox_MemoryLayoutInit(xbe, n);

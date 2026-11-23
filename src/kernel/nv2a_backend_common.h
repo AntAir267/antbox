@@ -563,6 +563,38 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
 
 /* SET_VERTEX_DATA_ARRAY_FORMAT type codes: NV2A_VTX_* (d3d8_vsh_parse.h). */
 
+/* A normalised unsigned byte as a float, b / 255.0f: the quotient of every
+ * byte, worked out by the compiler (a division per colour channel was most of
+ * a D3DCOLOR's decode; BO-282). tests/nv2a_vtx_gather checks all 256 against
+ * the division. */
+#define NV2A_U8F(i)   ((float)(i) / 255.0f)
+#define NV2A_U8F4(i)  NV2A_U8F(i), NV2A_U8F((i) + 1), NV2A_U8F((i) + 2), NV2A_U8F((i) + 3)
+#define NV2A_U8F16(i) NV2A_U8F4(i), NV2A_U8F4((i) + 4), NV2A_U8F4((i) + 8), NV2A_U8F4((i) + 12)
+#define NV2A_U8F64(i) NV2A_U8F16(i), NV2A_U8F16((i) + 16), NV2A_U8F16((i) + 32), NV2A_U8F16((i) + 48)
+static const float nv2a_vtx_unorm8[256] = {
+    NV2A_U8F64(0), NV2A_U8F64(64), NV2A_U8F64(128), NV2A_U8F64(192)
+};
+#undef NV2A_U8F64
+#undef NV2A_U8F16
+#undef NV2A_U8F4
+#undef NV2A_U8F
+
+/* A normalised signed short as a float, s / 32767.0f clamped to -1. The
+ * product in double rounds to the same float as the quotient for every s:
+ * the quotient is never within 2^-40 of a float's rounding boundary (its
+ * denominator is 32767), and the product is within 2^-52 of it. Exact, and
+ * no division (tests/nv2a_vtx_gather checks all 65536). */
+static inline float nv2a_vtx_snorm16(int16_t s)
+{
+    float f = (float)((double)s * (1.0 / 32767.0));
+    return f < -1.0f ? -1.0f : f;
+}
+
+/* CMP's fields as floats (nv2a_backend_common.c): x and y (11 bits each,
+ * signed) over 1023, z (the top 10, signed) over 511, by the field's bits. */
+extern const float nv2a_vtx_cmp11[2048];
+extern const float nv2a_vtx_cmp10[1024];
+
 /* One attribute of `size` components of `type` at p as float4, missing
  * components (0,0,0,1). Returns 0 for a type with no decoder (out is then
  * (0,0,0,1)). Decoded the way xemu hands them to GL. */
@@ -577,10 +609,10 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
     case NV2A_VTX_D3DCOLOR:
         /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
          * component order of every other format here. Returned as R,G,B,A. */
-        out[0] = (float)p[2] / 255.0f;
-        out[1] = (float)p[1] / 255.0f;
-        out[2] = (float)p[0] / 255.0f;
-        out[3] = (float)p[3] / 255.0f;
+        out[0] = nv2a_vtx_unorm8[p[2]];
+        out[1] = nv2a_vtx_unorm8[p[1]];
+        out[2] = nv2a_vtx_unorm8[p[0]];
+        out[3] = nv2a_vtx_unorm8[p[3]];
         return 1;
     case NV2A_VTX_FLOAT:
         for (i = 0; i < size && i < 4; i++)
@@ -588,15 +620,13 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
         return 1;
     case NV2A_VTX_UBYTE:
         for (i = 0; i < size && i < 4; i++)
-            out[i] = (float)p[i] / 255.0f;
+            out[i] = nv2a_vtx_unorm8[p[i]];
         return 1;
     case NV2A_VTX_S1:
         for (i = 0; i < size && i < 4; i++) {
             int16_t s;
-            float f;
             memcpy(&s, p + 2 * i, 2);
-            f = (float)s / 32767.0f;
-            out[i] = f < -1.0f ? -1.0f : f;
+            out[i] = nv2a_vtx_snorm16(s);
         }
         return 1;
     case NV2A_VTX_S32K:
@@ -608,14 +638,10 @@ static inline int nv2a_vtx_decode(uint32_t type, uint32_t size,
         return 1;
     case NV2A_VTX_CMP: {
         uint32_t w;
-        int32_t x, y, z;
         memcpy(&w, p, 4);
-        x = (int32_t)(w << 21) >> 21;
-        y = (int32_t)(w << 10) >> 21;
-        z = (int32_t)w >> 22;
-        out[0] = (float)x / 1023.0f;
-        out[1] = (float)y / 1023.0f;
-        out[2] = (float)z / 511.0f;
+        out[0] = nv2a_vtx_cmp11[w & 0x7FFu];
+        out[1] = nv2a_vtx_cmp11[(w >> 11) & 0x7FFu];
+        out[2] = nv2a_vtx_cmp10[w >> 22];
         return 1;
     }
     default:
@@ -663,7 +689,8 @@ static inline void nv2a_idx_range(const uint16_t *v, uint32_t n,
  * too short, a type with no decoder) is its SET_VERTEX_DATA value inl[slot[k]].
  * mem is the guest memory base (xbox_GetMemoryOffset()). The stores go out
  * in address order, which write-combined upload memory needs; the per-element
- * work (the stream's base and kind) is worked out once per draw. */
+ * work (the stream's base, its kind, how many of an inline payload's
+ * vertices it reaches) is worked out once per draw. */
 void nv2a_vtx_gather(const struct nv2a_pb_draw *d, const int *slot, int nf4,
                      uint32_t lo, uint32_t count, const float (*inl)[4],
                      const uint8_t *mem, float *out);
@@ -686,6 +713,37 @@ enum nv2a_topology {
 uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
                            uint32_t base, uint32_t *out,
                            enum nv2a_topology *topo);
+
+/* BO-385, lines at a render scale above 1. The NV2A draws a line one pixel
+ * wide and has no width to set; xemu draws it surface_scale_factor pixels
+ * wide (glLineWidth in pgraph/gl/draw.c, a dynamic vkCmdSetLineWidth in
+ * pgraph/vk/draw.c where the device has wideLines), so a line looks as at
+ * 1x at any scale. Metal has no line width at all and Vulkan's wideLines is
+ * optional (Adreno), so here a line list of a scaled target becomes two
+ * triangles a segment, one guest pixel wide, drawn by the backend's
+ * pass-through vertex stage (vs_pass and its twins): the batch's vertices
+ * are run through the vertex program on the CPU (nv2a_vsh_run, as the
+ * software rasteriser does) or, without a program, taken as the
+ * pre-transformed vertices they are.
+ *
+ * nv2a_wide_lines: whether a draw of this topology into a target w guest
+ * pixels wide drawn hw host pixels wide is expanded (not at 1x, not with
+ * RECOMP_DEBUG=wide_lines=0, not with fog on, which the pass-through stage
+ * does not carry).
+ *
+ * nv2a_lines_expand: the n indices at lidx (line list pairs, rebased by
+ * -lo, of `count` vertices from lo) into out, NV2A_WL_F4 float4s a vertex
+ * (the pass-through layout: position in surface pixels with 1/w, oD0, oD1,
+ * oT0..oT3), and oidx, a triangle list. Room: 2 * n vertices and 3 * n
+ * indices. A segment with an end the program could not place (behind the
+ * eye, not finite) is left out. Returns the index count (6 a segment); the
+ * vertex count is two thirds of it. */
+#define NV2A_WL_F4 7
+int nv2a_wide_lines(const struct nv2a_pb_vsh *v, enum nv2a_topology topo,
+                    uint32_t w, uint32_t hw);
+uint32_t nv2a_lines_expand(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
+                           const uint32_t *lidx, uint32_t n, uint32_t lo, uint32_t count,
+                           const uint8_t *mem, float *out, uint32_t *oidx);
 
 /* FNV-1a over the vertex program's slots, from v->start through the slot
  * with the FINAL bit (or the end). *len, if given, gets the slot count. */
@@ -1062,7 +1120,8 @@ enum nv2a_present_filter {
 enum nv2a_present_aspect {
     NV2A_ASPECT_FRAME = 0,      /* stock: the frame's width:height */
     NV2A_ASPECT_4_3,
-    NV2A_ASPECT_16_9
+    NV2A_ASPECT_16_9,
+    NV2A_ASPECT_16_10           /* a title's 16:9 mode set up for a 16:10 picture (BO-271) */
 };
 
 struct nv2a_host_opts {
@@ -1180,6 +1239,24 @@ void nv2a_occ_set_scale_x2(struct nv2a_occ *o, unsigned x2);
  * helpers above are the fast paths). */
 void nv2a_resample_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t sw, uint32_t sh,
                              uint8_t *dst, uint32_t dst_pitch, uint32_t dw, uint32_t dh);
+
+/* BO-178, reductions of a scaled render target. A title's post effect
+ * (Burnout 3's bloom: 640x480 -> 320x240 -> 160x120) reads a whole target
+ * into a smaller one with a few point or bilinear taps placed in the
+ * title's texels: at 1x they cover the source, at a render scale they hit
+ * a few host texels of each title texel and skip the rest, so the result
+ * is coarser than 1x and flickers as the picture moves. A draw that reads
+ * a scaled target (host size above guest size) into a target smaller than
+ * it in guest pixels (not larger on either side, smaller on one) reads
+ * instead an area-averaged copy of it at its guest size: the 1x texels,
+ * sampled at host-pixel positions. Same-size passes (a blur in place, a
+ * self copy) and enlargements keep the host-size texture. At 1x nothing is
+ * scaled and nothing changes. */
+int nv2a_rt_reduce_draw(uint32_t src_w, uint32_t src_h, uint32_t src_hw, uint32_t src_hh,
+                        uint32_t dst_w, uint32_t dst_h);
+/* RECOMP_DEBUG=rt_reduce=0 turns it off; rt_reduce_ab=n on for n flips,
+ * off for n (one line on each change). `flips`: the backend's flip count. */
+int nv2a_rt_reduce_on(uint32_t flips);
 
 /* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
  * this target until both fit max_dim. Returns the N used (>= 1). */

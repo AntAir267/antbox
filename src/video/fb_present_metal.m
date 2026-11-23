@@ -32,6 +32,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CAMetalDisplayLink.h>
 #import <QuartzCore/CATransaction.h>
 #import <QuartzCore/CAEDRMetadata.h>
 #import <IOKit/IOKitLib.h>
@@ -307,6 +308,396 @@ int fbm_visible(SDL_Window *win)
     return 1;
 }
 
+static int attime_on(void);
+
+/* ---- the display-link presenter (PC_LINK, BO-236) --------------------------
+ *
+ * On macOS 14 and later display.present_timing = auto presents from a
+ * CAMetalDisplayLink. Its callback names the next refresh the window can
+ * fill: a drawable for it, the time its work must be committed by
+ * (targetTimestamp) and the time it will be on the glass
+ * (targetPresentationTimestamp). The present thread runs the link's run loop
+ * (fbm_link_wait), takes the newest finished frame until shortly before the
+ * deadline (fbm_link_left_ns), and presents it into that drawable with a
+ * plain present: no presentDrawable:atTime: (the link asserts on it), no
+ * skip rule, no second guess of when the system shows it. A refresh with no
+ * new frame presents nothing (fbm_link_drop).
+ *
+ * The title's clock follows the link: each callback reports a point `phase`
+ * before the commit deadline to the vblank's display lock, so the emulated
+ * vblank (and the High refresh flip grid, which reads the same reports)
+ * lands just before the refresh it is for and its frame is finished by the
+ * deadline. A frame that still misses (its vblank was an earlier refresh's)
+ * is counted; four in two seconds move the vblank 1 ms earlier, calm takes
+ * it back (pc_link_frame).
+ *
+ * The link's rate: 60 for the title's own 60 fps, the display's top rate
+ * with High refresh on (the grid needs every refresh). The same path for a
+ * fixed 60 or 120 Hz display, variable refresh and ProMotion, built-in or
+ * external: there is no grid of ours to keep in step with the system's.
+ *
+ * Why (#42): in fullscreen macOS gave a drawable back only once the next
+ * frame was on the glass, so two drawables held the window to every other
+ * refresh, and with three the frames aimed at a refresh with atTime missed
+ * it a quarter of the time on one display path; the lead that grew after
+ * misses then collided with the two-in-flight rule (120 flips, ~96 on the
+ * glass). With the link the system hands out the drawable for a refresh it
+ * can make and says which. */
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+API_AVAILABLE(macos(14.0))
+@interface TDLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
+@end
+#endif
+
+static id              s_lk;                  /* CAMetalDisplayLink; the present thread's */
+static id              s_lk_del;
+static id              s_lk_upd;              /* the pending CAMetalDisplayLinkUpdate, retained */
+static pc_link         s_lkp;
+static uint64_t        s_lk_tt, s_lk_tpt;     /* its deadline and on-glass time, host ns */
+static int             s_lk_presented;        /* the refresh named last got a new frame */
+static uint64_t        s_lk_made_ns;
+static double          s_lk_hz_set;
+static volatile double s_lk_hz_want = 60.0;   /* the main thread's (timing_poll) */
+static volatile int    s_win_vis = 1;         /* the main thread's (timing_poll) */
+static atomic_int      s_lk_failed;
+/* The run-loop mode the link is in and the present thread runs (BO-347): a
+ * private one. AppKit puts work on the run loop of whatever thread it was
+ * called on, in the default, modal-panel and event-tracking modes: a
+ * first-responder change on this thread (SDL_StartTextInput, before BO-347
+ * the overlay's online name editor) left an observer there that switched the
+ * input method off the main thread, and AppKit aborts on that. In a mode of
+ * its own this loop runs the link's source and nothing that was put on it
+ * for the default mode. Core Animation's commit observer is not run either:
+ * the layer changes this thread makes are in explicit transactions
+ * (hdr_layer, hdr_meta), and any implicit one is flushed after each run. */
+#define LK_RUNLOOP_MODE CFSTR("TakedawnPresentLinkMode")
+/* A layer a CAMetalDisplayLink was made for is the link's for its life:
+ * -nextDrawable on it throws (CAMetalLayerInvalidOperation, "should not be
+ * called when using CAMetalDisplayLink"), even after the link is
+ * invalidated. Set once the link is made; from then on every present of
+ * this layer goes through the link's drawable, whatever the setting says
+ * (a change takes effect at the next start). */
+static atomic_int      s_lk_bound;
+/* Leaving the link while running (the overlay's Frame presentation): the
+ * present thread invalidates the link (s_lk_torn), then the main thread
+ * makes the window's Metal view and layer again (fbm_main_tick), under
+ * s_layer_lock, which every present holds. */
+static atomic_int      s_relayer_want, s_lk_torn;
+static os_unfair_lock  s_layer_lock = OS_UNFAIR_LOCK_INIT;
+/* A display change while the link stays (timing_poll): the link's learned
+ * steps and the kernel's lock start over (lk_rate, on the present thread). */
+static atomic_int      s_lk_reset_want;
+/* A frame held back as stale (fbm_present returned 3): its vblank, so that a
+ * newer frame presented in its place counts it (pc_link_frame). */
+static uint64_t        s_lk_stale_vbl;
+/* The link's watchdog (fbm_link_wait): visible time with no refresh named.
+ * LK_QUIET_NS of it and the link and the layer are made again (the relayer
+ * of a live switch); a new link that names nothing for as long gives way
+ * to aimed for the session. */
+#define LK_QUIET_NS 3000000000ull
+static uint64_t        s_lk_quiet_from, s_lk_wait_last;
+static int             s_lk_recovering;
+/* For the [PRESENT] link line, every 10 s with diagnostic logging. */
+static struct {
+    uint64_t t0;
+    unsigned cbs, presents, empty, replaced, missed, stale;
+    double cb_to_tt, tt_to_tpt;      /* sums, ms */
+    double cb_to_tt_min, cb_to_tt_max;
+} s_lks;
+
+static int link_os_ok(void)
+{
+    if (@available(macOS 14.0, *))
+        return 1;
+    return 0;
+}
+
+static void lk_teardown(void)
+{
+    if (s_lk_upd) {
+        [s_lk_upd release];
+        s_lk_upd = nil;
+    }
+    if (s_lk) {
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+        if (@available(macOS 14.0, *))
+            [(CAMetalDisplayLink *)s_lk invalidate];
+#endif
+        [s_lk release];
+        s_lk = nil;
+        fprintf(stderr, "[PRESENT] display link stopped\n");
+    }
+    [s_lk_del release];
+    s_lk_del = nil;
+    s_lk_hz_set = 0;
+}
+
+/* The link's callback, on the present thread (its run loop). */
+static void lk_update(id update, uint64_t tt, uint64_t tpt)
+{
+    uint64_t now = xbox_HostNowNs(), per = 0, rep;
+    if (s_lk_upd) {
+        /* The one before was never taken (the thread was busy past it). */
+        [s_lk_upd release];
+        s_lks.replaced++;
+    }
+    s_lk_upd = [update retain];
+    s_lk_quiet_from = now;
+    if (s_lk_recovering) {
+        s_lk_recovering = 0;
+        fprintf(stderr, "[PRESENT] display link: the new link names refreshes again\n");
+    }
+    if (!s_lks.cbs && !s_lks.t0)
+        fprintf(stderr, "[PRESENT] display link: first refresh named %.1f ms after it was made\n",
+                (now - s_lk_made_ns) / 1e6);
+    s_lk_tt = tt;
+    s_lk_tpt = tpt;
+    rep = pc_link_tick(&s_lkp, tt, tpt, !s_lk_presented, &per);
+    s_lk_tt = pc_link_deadline(&s_lkp);         /* with the slack */
+    s_lk_presented = 0;
+    if (rep && per)
+        xbox_VblankDisplayRefresh(rep, per);
+    s_lks.cbs++;
+    {
+        double a = tt > now ? (tt - now) / 1e6 : -((now - tt) / 1e6);
+        s_lks.cb_to_tt += a;
+        if (s_lks.cbs == 1 || a < s_lks.cb_to_tt_min) s_lks.cb_to_tt_min = a;
+        if (s_lks.cbs == 1 || a > s_lks.cb_to_tt_max) s_lks.cb_to_tt_max = a;
+        s_lks.tt_to_tpt += tpt > tt ? (tpt - tt) / 1e6 : 0;
+    }
+    if (!s_lks.t0)
+        s_lks.t0 = now;
+    if (now - s_lks.t0 >= 10000000000ull) {
+        double n = s_lks.cbs ? s_lks.cbs : 1, dt = (now - s_lks.t0) / 1e9;
+        fprintf(stderr, "[PRESENT] display link %.0f s: %.1f callbacks/s (period %.3f ms),"
+                " %u presents, %u with no new frame, %u not taken in time, %u frames late"
+                " for their refresh, %u a refresh behind (the newer one waited for);"
+                " callback to deadline %.2f ms (%.2f..%.2f), deadline to"
+                " glass %.2f ms; deadline taken %.2f ms after the link's, vblank %.1f ms"
+                " before it\n", dt,
+                s_lks.cbs / dt, s_lkp.period_ns / 1e6, s_lks.presents, s_lks.empty,
+                s_lks.replaced, s_lks.missed, s_lks.stale, s_lks.cb_to_tt / n, s_lks.cb_to_tt_min,
+                s_lks.cb_to_tt_max, s_lks.tt_to_tpt / n, s_lkp.slack_eff_ns / 1e6,
+                s_lkp.phase_ns / 1e6);
+        memset(&s_lks, 0, sizeof s_lks);
+        s_lks.t0 = now;
+    }
+}
+
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+@implementation TDLinkDelegate
+- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update
+{
+    (void)link;
+    lk_update(update, mach_to_host_ns((uint64_t)(update.targetTimestamp * 1e9)),
+              mach_to_host_ns((uint64_t)(update.targetPresentationTimestamp * 1e9)));
+    /* Back to fbm_link_wait: the frame is taken outside the callback. */
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+@end
+#endif
+
+static void lk_rate(void)
+{
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+    if (@available(macOS 14.0, *)) {
+        double hz = s_lk_hz_want;
+        int reset = atomic_exchange(&s_lk_reset_want, 0);
+        if (s_lk && hz > 0 && hz != s_lk_hz_set) {
+            ((CAMetalDisplayLink *)s_lk).preferredFrameRateRange
+                = CAFrameRateRangeMake((float)hz, (float)hz, (float)hz);
+            /* A change of the running link's rate (not its first): the
+             * steps of the old rate held the period for ~9 callbacks, each
+             * report off the new grid, and the kernel stood its lock down
+             * for ~18 s (the Fable review of BO-236). */
+            reset |= s_lk_hz_set > 0;
+            s_lk_hz_set = hz;
+            /* The slack (pc_link_set_slack): RECOMP_PRESENT_LINK_SLACK, else
+             * the link's lead less about a 60 Hz refresh
+             * (PC_LINK_SLACK_AUTO, BO-236). */
+            {
+                const char *e = recomp_env(RENV_PRESENT_LINK_SLACK);
+                pc_link_set_slack(&s_lkp, e && *e
+                    ? (uint64_t)(env_ms(RENV_PRESENT_LINK_SLACK, 0.0, 0.0, 30.0) * 1e6)
+                    : PC_LINK_SLACK_AUTO);
+            }
+            if (s_lkp.slack_ns == PC_LINK_SLACK_AUTO)
+                fprintf(stderr, "[PRESENT] display link: %.0f refreshes a second asked, the deadline"
+                        " taken after the link's by its lead less %.1f ms\n", hz,
+                        PC_LINK_COMMIT_MIN_NS / 1e6);
+            else
+                fprintf(stderr, "[PRESENT] display link: %.0f refreshes a second asked, the deadline"
+                        " taken %.1f ms after the link's\n", hz, s_lkp.slack_ns / 1e6);
+        }
+        if (s_lk && reset) {
+            pc_link_reset(&s_lkp);
+            xbox_VblankDisplayRelearn();
+            fprintf(stderr, "[PRESENT] display link: the rate or the display changed; its steps"
+                    " and the vblank's lock learnt again\n");
+        }
+    }
+#endif
+}
+
+static int lk_make(void)
+{
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+    if (@available(macOS 14.0, *)) {
+        CAMetalDisplayLink *l = [[CAMetalDisplayLink alloc] initWithMetalLayer:s_layer];
+        float lat;
+        if (!l)
+            return 0;
+        s_lk_del = [[TDLinkDelegate alloc] init];
+        l.delegate = s_lk_del;
+        lat = (float)env_ms(RENV_PRESENT_LINK_LATENCY, 1.0, 1.0, 2.0);
+        l.preferredFrameLatency = lat < 1.5f ? 1.0f : 2.0f;
+        s_lk = l;
+        pc_link_init(&s_lkp,
+                     (uint64_t)(env_ms(RENV_PRESENT_LINK_PHASE, PC_LINK_PHASE_NS / 1e6, 1.0, 12.0) * 1e6),
+                     (uint64_t)(env_ms(RENV_PRESENT_LINK_GUARD, PC_LINK_GUARD_NS / 1e6, 0.0, 8.0) * 1e6));
+        lk_rate();                      /* the rate, and the slack that goes with it */
+        [l addToRunLoop:[NSRunLoop currentRunLoop] forMode:(NSString *)LK_RUNLOOP_MODE];
+        atomic_store(&s_lk_bound, 1);
+        s_lk_made_ns = xbox_HostNowNs();
+        s_lk_quiet_from = s_lk_wait_last = s_lk_made_ns;
+        s_lk_stale_vbl = 0;
+        atomic_store(&s_lk_reset_want, 0);
+        memset(&s_lks, 0, sizeof s_lks);
+        fprintf(stderr, "[PRESENT] display link started: frame latency %.0f, the vblank %.1f ms"
+                " before each refresh's commit deadline (the link's + %.1f ms), frames taken until"
+                " %.1f ms before it\n", (double)l.preferredFrameLatency, s_lkp.phase_ns / 1e6,
+                s_lkp.slack_ns / 1e6, s_lkp.guard_ns / 1e6);
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+int fbm_link_wait(uint64_t timeout_ns)
+{
+    uint64_t t0;
+    if (!s_layer)
+        return -1;
+    if (atomic_load(&s_lk_bound)) {
+        if (s_strategy != PC_LINK) {
+            /* Switched away: the link goes now; the main thread then makes
+             * the layer again, and nothing presents until it has. */
+            if (s_lk) {
+                @autoreleasepool {
+                    lk_teardown();
+                }
+            }
+            atomic_store(&s_lk_torn, 1);
+            return -1;
+        }
+        if (!s_lk)
+            return -1;                  /* torn: waiting for the new layer */
+    } else if (s_strategy != PC_LINK || atomic_load(&s_lk_failed)) {
+        return -1;
+    }
+    @autoreleasepool {
+        if (!s_lk && !lk_make()) {
+            atomic_store(&s_lk_failed, 1);
+            fprintf(stderr, "[PRESENT] display link: none for this layer; frames are aimed"
+                    " instead (display.present_timing = aimed)\n");
+            return -1;
+        }
+        lk_rate();
+        if (s_lk_upd)
+            return 1;
+        t0 = xbox_HostNowNs();
+        CFRunLoopRunInMode(LK_RUNLOOP_MODE, (double)timeout_ns / 1e9, false);
+        /* What the default mode's Core Animation observer committed before
+         * (LK_RUNLOOP_MODE): nothing at all on a normal turn. */
+        [CATransaction flush];
+        if (s_lk_upd)
+            return 1;
+        /* Back with nothing and at once (a run loop with no source): do not
+         * spin on it. */
+        if (xbox_HostNowNs() - t0 < 1000000ull)
+            xbox_HostSleepNs(4000000ull);
+        /* No callback while the window can be seen. A fullscreen change
+         * pauses the link for a while; display sleep, an unplug or a GPU
+         * reset may stop it for good, and nothing else can present this
+         * layer (s_lk_bound). Only visible time counts (a hidden or
+         * minimised window, or a thread that was not here, starts the
+         * count again). LK_QUIET_NS of it: the link goes, and the main
+         * thread makes the layer again as for a live switch
+         * (fbm_main_tick); the next turn makes a new link on it. Should
+         * that one name nothing either, aimed takes over on the next new
+         * layer for the session (s_lk_failed, timing_poll). */
+        {
+            uint64_t now = xbox_HostNowNs();
+            if (!s_win_vis || now - s_lk_wait_last > 500000000ull)
+                s_lk_quiet_from = now;
+            s_lk_wait_last = now;
+            if (now - s_lk_quiet_from >= LK_QUIET_NS) {
+                if (!s_lk_recovering) {
+                    s_lk_recovering = 1;
+                    fprintf(stderr, "[PRESENT] display link: no refresh named for %.1f s with"
+                            " the window in sight: the link and the window's layer made"
+                            " again\n", (now - s_lk_quiet_from) / 1e9);
+                } else {
+                    s_lk_recovering = 0;
+                    atomic_store(&s_lk_failed, 1);
+                    fprintf(stderr, "[PRESENT] display link: the new link named no refresh"
+                            " either: frames are aimed instead for the session"
+                            " (display.present_timing = aimed)\n");
+                }
+                lk_teardown();
+                s_lk_quiet_from = 0;
+                atomic_store(&s_relayer_want, 1);
+                atomic_store(&s_lk_torn, 1);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* A frame of the link's (presented, or dropped as stale): pc_link_frame,
+ * with whether the vblank follows the link now. 1: it missed its refresh. */
+static int lk_count(uint64_t vblank_ns)
+{
+    uint64_t ref = 0, per = 0;
+    int locked = xbox_DisplayGrid(xbox_HostNowNs(), &ref, &per) == 2;
+    int missed = 0, moved = pc_link_frame(&s_lkp, vblank_ns, locked, &missed);
+    s_lks.missed += missed;
+    if (moved > 0)
+        fprintf(stderr, "[PRESENT] display link: frames came after their refresh's"
+                " deadline; the vblank now %.1f ms before it\n", s_lkp.phase_ns / 1e6);
+    else if (moved < 0)
+        fprintf(stderr, "[PRESENT] display link: frames on time; the vblank back to"
+                " %.1f ms before the deadline\n", s_lkp.phase_ns / 1e6);
+    return missed;
+}
+
+uint64_t fbm_link_left_ns(void)
+{
+    uint64_t until, now;
+    if (!s_lk_upd)
+        return 0;
+    until = pc_link_take_until(&s_lkp, s_lk_tt);
+    now = xbox_HostNowNs();
+    return until > now ? until - now : 0;
+}
+
+void fbm_link_drop(void)
+{
+    if (s_lk_upd) {
+        [s_lk_upd release];
+        s_lk_upd = nil;
+        s_lks.empty++;
+    }
+}
+
+void fbm_link_thread_exit(void)
+{
+    @autoreleasepool {
+        lk_teardown();
+    }
+}
+
 static void timing_status(void)
 {
     pc_status st;
@@ -358,11 +749,55 @@ static void timing_poll(SDL_Window *win)
     }
     display_probe(win, &d, name, sizeof name, &fs);
     {
-        /* auto unless the setting says otherwise: on macOS legacy's two
-         * drawables showed every other frame on some displays (BO-239). */
-        const char *t = recomp_env(RENV_PRESENT_TIMING);
-        strategy = pc_pick(&d, t && *t ? pc_setting(t) : PC_SET_AUTO);
+        /* RECOMP_DEBUG=timing_cycle=<s>: the live switches, in turn. */
+        static double every = -1;
+        static uint64_t at;
+        static int step;
+        if (every < 0) {
+            const char *e = recomp_env(RENV_TIMING_CYCLE);
+            every = e && *e ? atof(e) : 0;
+        }
+        if (every > 0) {
+            static const char *const seq[] = { "aimed", "auto", "legacy", "auto" };
+            uint64_t now = xbox_HostNowNs();
+            if (!at)
+                at = now + (uint64_t)(every * 1e9);
+            else if (now >= at) {
+                at = now + (uint64_t)(every * 1e9);
+                recomp_env_set(RENV_PRESENT_TIMING, seq[step % 4]);
+                fprintf(stderr, "[PRESENT] timing_cycle: display.present_timing = %s\n", seq[step % 4]);
+                step++;
+            }
+        }
     }
+    {
+        /* auto unless the setting says otherwise: on macOS legacy's two
+         * drawables showed every other frame on some displays (BO-239).
+         * auto is the display link where there is one (macOS 14 and
+         * later, BO-236), else the aimed presents of 0.2.x. */
+        const char *t = recomp_env(RENV_PRESENT_TIMING);
+        int set = t && *t ? pc_setting(t) : PC_SET_LINK;
+        if (set == PC_SET_LINK && (!link_os_ok() || atomic_load(&s_lk_failed)))
+            set = PC_SET_AUTO;
+        strategy = pc_pick(&d, set);
+        if (atomic_load(&s_lk_bound) && strategy != PC_LINK && !atomic_load(&s_relayer_want)) {
+            fprintf(stderr, "[PRESENT] timing: leaving the display link: the window's Metal"
+                    " layer is made again\n");
+            atomic_store(&s_relayer_want, 1);
+        }
+    }
+    /* The link's rate (the present thread applies it): the title's 60
+     * where the display can show it evenly, the display's top rate with
+     * High refresh on (its grid needs every refresh) or where 60 does not
+     * divide a fixed rate. */
+    {
+        int m;
+        double hz = d.refresh_hz > 0 ? d.refresh_hz : 60.0;
+        s_lk_hz_want = recomp_env_on(RENV_GFX_HIGH_REFRESH) ? hz
+                     : d.vrr || pc_multiple_of_60(hz, &m) ? 60.0 : hz;
+        (void)m;
+    }
+    s_win_vis = fbm_visible(win);
     changed = strategy != s_strategy || d.vrr != s_disp.vrr
               || (int)(d.refresh_hz * 100) != (int)(s_disp.refresh_hz * 100)
               || strcmp(name, s_disp_name) || fs != s_disp_fullscreen;
@@ -370,6 +805,10 @@ static void timing_poll(SDL_Window *win)
         timing_status();
         return;
     }
+    /* Another display (or mode) under a link that stays: its steps and the
+     * kernel's lock start over (lk_rate). */
+    if (strategy == PC_LINK && s_strategy == PC_LINK)
+        atomic_store(&s_lk_reset_want, 1);
     os_unfair_lock_lock(&s_pc_lock);
     s_disp = d;
     s_strategy = strategy;
@@ -383,14 +822,23 @@ static void timing_poll(SDL_Window *win)
     snprintf(s_disp_name, sizeof s_disp_name, "%s", name);
     s_disp_fullscreen = fs;
     {
+        /* legacy keeps two drawables where they are enough: a window on a
+         * 60 Hz display. Fullscreen, a display over 60 Hz or a variable one
+         * get a third (BO-236): there a drawable came back only once the
+         * next frame was on the glass, which held two drawables to every
+         * other refresh (30 fps on a 60 Hz external display, about 96 of
+         * 120 on a ProMotion panel). RECOMP_PRESENT_DRAWABLES=2 or 3
+         * decides. */
         const char *e = recomp_env(RENV_PRESENT_DRAWABLES);
-        int n = strategy != PC_LEGACY ? 3 : (e && atoi(e) == 3) ? 3 : 2;
+        int n = strategy != PC_LEGACY ? 3
+              : e && (atoi(e) == 2 || atoi(e) == 3) ? atoi(e)
+              : fs || d.vrr || d.refresh_hz > 61.0 ? 3 : 2;
         if ((int)s_layer.maximumDrawableCount != n)
             s_layer.maximumDrawableCount = n;
     }
     /* The vblank follows the display only where there is a grid to follow;
      * the on-glass times are its clock then, not a CVDisplayLink. */
-    if (strategy == PC_LOCK && s_link) {
+    if ((strategy == PC_LOCK || strategy == PC_LINK) && s_link) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         CVDisplayLinkStop(s_link);
@@ -399,7 +847,7 @@ static void timing_poll(SDL_Window *win)
         s_link = NULL;
     }
     if (strategy != PC_LEGACY || !s_link)
-        xbox_VblankDisplayLockAuto(strategy == PC_LOCK);
+        xbox_VblankDisplayLockAuto(strategy == PC_LOCK || strategy == PC_LINK);
     fprintf(stderr, "[PRESENT] timing: %s on \"%s\" (%s%.2f Hz%s, %s): ",
             pc_strategy_name(strategy), s_disp_name, d.builtin ? "built-in, " : "",
             d.refresh_hz, d.vrr ? ", variable refresh" : ", fixed",
@@ -410,10 +858,16 @@ static void timing_poll(SDL_Window *win)
     case PC_LOCK:
         fprintf(stderr, "the vblank %.1f ms before a display refresh, each frame"
                 " shown %d refresh(es) after it, handed over %.1f ms after the refresh"
-                " before its own, 3 drawables\n",
+                " before its own%s, 3 drawables\n",
                 s_pacer.phase_ns / 1e6, s_pacer.depth,
                 (s_pacer.handover_ns < s_pacer.period_ns / 2 ? s_pacer.handover_ns
-                                                             : s_pacer.period_ns / 2) / 1e6);
+                                                             : s_pacer.period_ns / 2) / 1e6,
+                attime_on() ? "" : " (RECOMP_PRESENT_ATTIME=0: handed over at once instead)");
+        break;
+    case PC_LINK:
+        fprintf(stderr, "frames presented from the display link at %.0f a second, the"
+                " vblank%s following its refreshes, 3 drawables\n", s_lk_hz_want,
+                recomp_env_on(RENV_GFX_HIGH_REFRESH) ? " and the High refresh grid" : "");
         break;
     case PC_TIMED:
     case PC_TIMED_ODD:
@@ -452,7 +906,8 @@ static FILE *glass_file(void)
             s_glass_f = fopen(path, "w");
             if (s_glass_f)
                 fprintf(s_glass_f, "flip,vblank_ns,commit_ns,at_ns,target_ns,glass_ns,late,skipped,"
-                        "steps,strategy,depth,refresh_hz,vrr\n");
+                        "steps,strategy,depth,refresh_hz,vrr,"
+                        "acq_ns,sched_ns,gpu_start_ns,gpu_end_ns\n");
             else
                 fprintf(stderr, "[PRESENT] RECOMP_TRACE=glass: cannot write %s\n", path);
         }
@@ -460,10 +915,19 @@ static FILE *glass_file(void)
     return s_glass_f;
 }
 
+/* The trace's columns past the pacer's (BO-239, #42): how long nextDrawable
+ * took, and the present command buffer's scheduled, GPU start and GPU end
+ * times on the host clock. Where the frame's time went before the glass:
+ * a GPU that finishes late, a drawable that comes back late, or a system
+ * that shows a finished frame a refresh late all look alike in glass_ns. */
+typedef struct {
+    uint64_t acq_ns, sched_ns, gpu_start_ns, gpu_end_ns;
+} glass_extra;
+
 /* One presented (or skipped) game frame: the ring, the pacer, the vblank's
- * lock, the trace. Any thread. */
+ * lock, the trace. Any thread. x: the extra columns, or NULL. */
 static void glass_note(uint32_t flip, uint64_t vblank_ns, uint64_t commit_ns,
-                       const pc_aim *aim, uint64_t glass_ns, int skipped)
+                       const pc_aim *aim, uint64_t glass_ns, int skipped, const glass_extra *x)
 {
     pc_sample smp;
     uint64_t report = 0, period = 0;
@@ -505,11 +969,25 @@ static void glass_note(uint32_t flip, uint64_t vblank_ns, uint64_t commit_ns,
                 strategy == PC_LOCK ? "one refresh less between a frame's vblank and its refresh"
                                     : "2 ms less between a frame's vblank and its present");
     if ((f = glass_file()) != NULL)
-        fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%d,%d,%u,%d,%d,%.3f,%d\n", flip,
+        fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%d,%d,%u,%d,%d,%.3f,%d,%llu,%llu,%llu,%llu\n", flip,
                 (unsigned long long)vblank_ns, (unsigned long long)commit_ns,
                 (unsigned long long)aim->at_ns, (unsigned long long)aim->target_ns,
                 (unsigned long long)glass_ns, aim->late, skipped, smp.steps, strategy, depth,
-                hz, vrr);
+                hz, vrr,
+                (unsigned long long)(x ? x->acq_ns : 0), (unsigned long long)(x ? x->sched_ns : 0),
+                (unsigned long long)(x ? x->gpu_start_ns : 0), (unsigned long long)(x ? x->gpu_end_ns : 0));
+}
+
+/* RECOMP_PRESENT_ATTIME=0: a locked display's frames handed over at once,
+ * the target still accounted (BO-239: does the time itself delay them?). */
+static int attime_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PRESENT_ATTIME);
+        on = !(e && *e == '0');
+    }
+    return on;
 }
 
 static const char s_blit_msl[] =
@@ -702,9 +1180,14 @@ static void hdr_meta(void)
         return;
     s_meta_peak = peak;
     s_meta_scale = scale;
+    /* On the present thread too (no run loop that commits an implicit
+     * transaction, LK_RUNLOOP_MODE): an explicit one. */
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     s_layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0.0001f
                                                           maxLuminance:peak
                                                     opticalOutputScale:scale];
+    [CATransaction commit];
     fprintf(stderr, "[PRESENT] HDR10 metadata: max %.0f nits (the display's peak), SDR white %.1f nits"
             " (EDR 1.0; potential %.3f / granted %.3f): a code of N nits is N nits on the panel\n",
             peak, scale, nv2a_host_hdr_potential(), nv2a_host_hdr_granted());
@@ -742,8 +1225,12 @@ static void hdr_layer(int on)
      * light to the peak, and the peak patch needs values past the display's
      * peak clipped, not compressed: no system tone map (PQ as well). */
     if (@available(macOS 15.0, *)) {
-        if ([s_layer respondsToSelector:@selector(setToneMapMode:)])
+        if ([s_layer respondsToSelector:@selector(setToneMapMode:)]) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
             s_layer.toneMapMode = mode ? CAToneMapModeNever : CAToneMapModeAutomatic;
+            [CATransaction commit];
+        }
     }
     /* SMAA's last pass writes the frame's format: made again. */
     for (int k = 0; k < 3; k++) {
@@ -1067,6 +1554,42 @@ static int fail(char *err, size_t n, const char *what)
     return 0;
 }
 
+static int s_vsync_on, s_shots_on;
+
+/* The layer's state (fbm_create, and the layer made again when the link is
+ * left, fbm_main_tick). Main thread. */
+static void layer_setup(SDL_Window *win)
+{
+    int w = 0, h = 0;
+    s_layer.device = s_dev;
+    s_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    /* The SDL renderer this replaces draws SDR content as sRGB. */
+    {
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        s_layer.colorspace = cs;
+        CGColorSpaceRelease(cs);
+    }
+    s_hdr_win = -1;                 /* applied to this layer, whatever it was */
+    hdr_layer(nv2a_host_hdr_active());
+    s_layer.framebufferOnly = s_shots_on || hdr_probe_on() ? NO : YES;
+    s_layer.displaySyncEnabled = s_vsync_on ? YES : NO;
+    /* Two drawables: at most one frame queued ahead of the display
+     * (the BO-74 latency measurement's recommendation, with display
+     * sync on). RECOMP_PRESENT_DRAWABLES=3 gives one more of slack;
+     * timing_poll sets the strategy's count. */
+    {
+        const char *e = recomp_env(RENV_PRESENT_DRAWABLES);
+        s_layer.maximumDrawableCount = (e && atoi(e) == 3) ? 3 : 2;
+        if (e)
+            fprintf(stderr, "[PRESENT] CAMetalLayer: %d drawables, display sync %s\n",
+                    (int)s_layer.maximumDrawableCount, s_vsync_on ? "on" : "off");
+    }
+    s_layer.allowsNextDrawableTimeout = YES;
+    SDL_Metal_GetDrawableSize(win, &w, &h);
+    if (w > 0 && h > 0)
+        s_layer.drawableSize = CGSizeMake(w, h);
+}
+
 int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
 {
     NSError *e = nil;
@@ -1160,33 +1683,12 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         if (!s_layer)
             return fail(err, errn, "SDL_Metal_GetLayer returned NULL");
         [s_layer retain];
-        s_layer.device = s_dev;
-        s_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        /* The SDL renderer this replaces draws SDR content as sRGB. */
-        {
-            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-            s_layer.colorspace = cs;
-            CGColorSpaceRelease(cs);
-        }
         hdr_display(win);           /* BO-110: what the display can show */
         nv2a_host_set_hdr_patch_fn(hdr_patch);
-        hdr_layer(nv2a_host_hdr_active());
-        s_layer.framebufferOnly = shots || hdr_probe_on() ? NO : YES;
-        s_layer.displaySyncEnabled = vsync ? YES : NO;
-        /* Two drawables: at most one frame queued ahead of the display
-         * (the BO-74 latency measurement's recommendation, with display
-         * sync on). RECOMP_PRESENT_DRAWABLES=3 gives one more of slack. */
-        {
-            const char *e = recomp_env(RENV_PRESENT_DRAWABLES);
-            s_layer.maximumDrawableCount = (e && atoi(e) == 3) ? 3 : 2;
-            if (e)
-                fprintf(stderr, "[PRESENT] CAMetalLayer: %d drawables, display sync %s\n",
-                        (int)s_layer.maximumDrawableCount, vsync ? "on" : "off");
-        }
-        s_layer.allowsNextDrawableTimeout = YES;
-        SDL_Metal_GetDrawableSize(win, &w, &h);
-        if (w > 0 && h > 0)
-            s_layer.drawableSize = CGSizeMake(w, h);
+        s_vsync_on = vsync;
+        s_shots_on = shots;
+        layer_setup(win);
+        (void)w; (void)h;
         if (recomp_env_on(RENV_WINDOW_FLOAT)) {
             SDL_SysWMinfo wm;
             SDL_VERSION(&wm.version);
@@ -1206,6 +1708,9 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
 void fbm_destroy(void)
 {
     int k;
+    /* The present thread has stopped (and invalidated the link): the next
+     * layer is not bound to it. */
+    atomic_store(&s_lk_bound, 0);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (s_link) {
@@ -1781,6 +2286,29 @@ void fbm_main_tick(SDL_Window *win)
         if (!s_layer || now < next)
             return;
         next = now + 8000000ull;
+        if (atomic_load(&s_relayer_want) && atomic_load(&s_lk_torn)) {
+            /* The display link is gone (fbm_link_wait): a layer it never had,
+             * since -nextDrawable throws on one it had (BO-236). */
+            os_unfair_lock_lock(&s_layer_lock);
+            if (s_view)
+                SDL_Metal_DestroyView(s_view);
+            [s_layer release];
+            s_layer = nil;
+            s_view = SDL_Metal_CreateView(win);
+            if (s_view && (s_layer = (CAMetalLayer *)SDL_Metal_GetLayer(s_view)) != nil) {
+                [s_layer retain];
+                layer_setup(win);
+            }
+            atomic_store(&s_lk_bound, 0);
+            atomic_store(&s_lk_torn, 0);
+            atomic_store(&s_relayer_want, 0);
+            s_strategy = -1;                /* timing_poll below sets the drawables */
+            os_unfair_lock_unlock(&s_layer_lock);
+            fprintf(stderr, "[PRESENT] timing: the window's Metal layer made again%s\n",
+                    s_layer ? "" : " FAILED: nothing is presented");
+            if (!s_layer)
+                return;
+        }
         cur = s_layer.drawableSize;
         SDL_Metal_GetDrawableSize(win, &dw, &dh);
         if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
@@ -1793,8 +2321,21 @@ void fbm_main_tick(SDL_Window *win)
 /* Slot k (fw x fh) into the window. 0 when no drawable came (timeout, display
  * asleep, window hidden): the caller keeps the frame and tries again. On the
  * present thread (fb_present_sdl.c). */
+static int fbm_present_locked(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
+                              const char *shot_path, uint32_t flip, uint64_t vblank_ns);
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 const char *shot_path, uint32_t flip, uint64_t vblank_ns)
+{
+    int rc = 0;
+    os_unfair_lock_lock(&s_layer_lock);
+    if (s_layer)
+        rc = fbm_present_locked(win, k, fw, fh, filter, shot_path, flip, vblank_ns);
+    os_unfair_lock_unlock(&s_layer_lock);
+    return rc;
+}
+
+static int fbm_present_locked(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
+                              const char *shot_path, uint32_t flip, uint64_t vblank_ns)
 {
     int ok = 0;
 
@@ -1807,15 +2348,16 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         id<MTLBuffer> shot = nil;
         struct nv2a_rect r;
         int whole, dw = 0, dh = 0;
-        uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0;
+        uint64_t t_acq0 = xbox_LatOn() ? xbox_HostNowNs() : 0, acq_ns = 0;
         pc_aim aim;
-        int timed;
+        int timed, link;
 
         (void)win;
         memset(&aim, 0, sizeof aim);
         /* The drawable's size, the display and the timing strategy are the
          * main thread's (fbm_main_tick): this runs on the present thread. */
-        timed = s_strategy != PC_LEGACY;
+        link = s_strategy == PC_LINK;
+        timed = s_strategy != PC_LEGACY && !link;
         /* Never wait for a drawable: with two presents still on their way
          * to the glass the third drawable is the one on it. A new game
          * frame is skipped then (and said so); a redraw is tried again. */
@@ -1830,11 +2372,54 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             if (!vblank_ns)
                 return 0;
             atomic_fetch_add(&s_skips, 1);
-            glass_note(flip, vblank_ns, xbox_HostNowNs(), &aim, 0, 1);
+            glass_note(flip, vblank_ns, xbox_HostNowNs(), &aim, 0, 1, NULL);
             return 2;
         }
     take:
+        if (link) {
+            /* The display link's drawable for the refresh it named
+             * (fbm_link_wait); none pending: the frame waits for the next. */
+            if (!s_lk_upd)
+                return 0;
+            /* A frame meant for the refresh before: while this refresh's
+             * take-until is still ahead the newer frame is waited for
+             * (3), and this one dropped when it comes; at the take-until
+             * it is shown after all, rather than nothing. */
+            if (vblank_ns && !shot_path && pc_link_stale(&s_lkp, vblank_ns)
+                    && fbm_link_left_ns() > 0) {
+                s_lks.stale++;
+                s_lk_stale_vbl = vblank_ns;
+                return 3;
+            }
+            /* The frame held back for this one is dropped: it missed its
+             * refresh as surely as one shown a refresh late (counted). */
+            if (s_lk_stale_vbl && vblank_ns && vblank_ns != s_lk_stale_vbl)
+                lk_count(s_lk_stale_vbl);
+            s_lk_stale_vbl = 0;
+            d = nil;
+            if (@available(macOS 14.0, *))
+                d = [(CAMetalDisplayLinkUpdate *)s_lk_upd drawable];
+            if (!d) {
+                fbm_link_drop();
+                return 0;
+            }
+            acq_ns = 0;
+            aim.target_ns = s_lk_tpt;
+            if (vblank_ns)
+                aim.late = lk_count(vblank_ns);
+            goto have;
+        }
+        if (atomic_load(&s_lk_bound)) {
+            /* Never: -nextDrawable throws on a layer the link has. */
+            static int said;
+            if (!said++)
+                fprintf(stderr, "[PRESENT] display link: a present outside the link was"
+                        " refused (BO-236)\n");
+            return 0;
+        }
+        acq_ns = xbox_HostNowNs();
         d = [s_layer nextDrawable];
+        acq_ns = xbox_HostNowNs() - acq_ns;
         if (!d) {
             if (!s_no_drawable++)
                 fprintf(stderr, "[PRESENT] no drawable (the window is hidden, behind"
@@ -1845,6 +2430,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             fprintf(stderr, "[PRESENT] drawables again after %u tries\n", s_no_drawable);
             s_no_drawable = 0;
         }
+    have:
         if (t_acq0) {
             char b[32];
             snprintf(b, sizeof b, "%llu", (unsigned long long)xbox_HostNowNs());
@@ -1951,6 +2537,37 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                 if (t > 0)
                     xbox_PacingPresent(mach_to_host_ns((uint64_t)(t * 1e9)));
             }];
+        /* The time between the title's frames (16.7 ms, 8.3 under High
+         * refresh at 120 Hz): the median of the last 16, for the lead's
+         * ceiling (present_cadence.h, BO-236). */
+        if (timed && vblank_ns) {
+            static uint64_t prev_vbl, iv[16], applied;
+            static int n_iv;
+            if (prev_vbl && vblank_ns > prev_vbl && vblank_ns - prev_vbl < 50000000ull) {
+                iv[n_iv++] = vblank_ns - prev_vbl;
+                if (n_iv == 16) {
+                    uint64_t srt[16], med;
+                    int i, j;
+                    memcpy(srt, iv, sizeof srt);
+                    for (i = 1; i < 16; i++)
+                        for (j = i; j > 0 && srt[j - 1] > srt[j]; j--) {
+                            uint64_t t = srt[j];
+                            srt[j] = srt[j - 1];
+                            srt[j - 1] = t;
+                        }
+                    med = srt[8];
+                    n_iv = 0;
+                    if (med > applied + 500000 || med + 500000 < applied
+                            || s_pacer.frame_ns != applied) {
+                        applied = med;
+                        os_unfair_lock_lock(&s_pc_lock);
+                        pc_pacer_set_frame(&s_pacer, med);
+                        os_unfair_lock_unlock(&s_pc_lock);
+                    }
+                }
+            }
+            prev_vbl = vblank_ns;
+        }
         /* Aimed here, with the pass encoded: what is left before the
          * commit is the same few microseconds every frame. */
         if (timed && vblank_ns) {
@@ -1960,25 +2577,52 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             os_unfair_lock_unlock(&s_pc_lock);
             if (aim.at_ns > now + 100000000ull)   /* never park a frame */
                 aim.at_ns = 0;
+            if (!attime_on())
+                aim.at_ns = 0;                     /* RECOMP_PRESENT_ATTIME=0: at once */
         }
         /* When it reached the glass: the pacer's feedback and the graph's
          * trace (a redraw of the same frame only gives its drawable back). */
-        if (timed || glass_measure_on()) {
+        if (timed || link || glass_measure_on()) {
             uint64_t vb = vblank_ns, commit_ns = xbox_HostNowNs();
             uint32_t fl2 = flip;
             pc_aim aim2 = aim;
+            /* RECOMP_TRACE=glass only: the command buffer's own times, read
+             * by the presented handler (the GPU finishes before the glass;
+             * 0 should it not have reported yet). */
+            __block uint64_t gx_sched = 0, gx_gs = 0, gx_ge = 0;
+            uint64_t gx_acq = acq_ns;
+            int traced = glass_file() != NULL;
+            if (traced) {
+                [cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+                    (void)c;
+                    gx_sched = xbox_HostNowNs();
+                }];
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                    CFTimeInterval gs = c.GPUStartTime, ge = c.GPUEndTime;
+                    if (gs > 0)
+                        gx_gs = mach_to_host_ns((uint64_t)(gs * 1e9));
+                    if (ge > 0)
+                        gx_ge = mach_to_host_ns((uint64_t)(ge * 1e9));
+                }];
+            }
             atomic_fetch_add(&s_inflight, 1);
             s_last_commit_ns = commit_ns;
             [d addPresentedHandler:^(id<MTLDrawable> dr) {
                 CFTimeInterval t = dr.presentedTime;   /* 0: never shown */
+                glass_extra x;
                 if (atomic_fetch_sub(&s_inflight, 1) <= 0)
                     atomic_store(&s_inflight, 0);       /* reset while it was out */
+                x.acq_ns = gx_acq;
+                x.sched_ns = gx_sched;
+                x.gpu_start_ns = gx_gs;
+                x.gpu_end_ns = gx_ge;
                 if (vb)
                     glass_note(fl2, vb, commit_ns, &aim2,
-                               t > 0 ? mach_to_host_ns((uint64_t)(t * 1e9)) : 0, 0);
+                               t > 0 ? mach_to_host_ns((uint64_t)(t * 1e9)) : 0, 0,
+                               traced ? &x : NULL);
             }];
         }
-        if (aim.at_ns)
+        if (aim.at_ns && !link)
             [cb presentDrawable:d atTime:host_ns_to_mach_s(aim.at_ns)];
         else
             [cb presentDrawable:d];
@@ -2003,6 +2647,14 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         if (pt_on())
             pt_watch(cb, PT_SCALE);
         [cb commit];
+        if (link) {
+            /* The update (and its drawable) is the system's again. */
+            [s_lk_upd release];
+            s_lk_upd = nil;
+            s_lks.presents++;
+            if (vblank_ns)
+                s_lk_presented = 1;     /* a new frame, not a redraw */
+        }
         if (t_acq0)
             xbox_LatRow('P', flip, 0, NULL);
         [s_slot_cb[k] release];

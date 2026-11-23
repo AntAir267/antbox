@@ -7,7 +7,8 @@ cmake_minimum_required(VERSION 3.20)
 project(save_io_test C)
 set(CMAKE_C_STANDARD 11)
 add_executable(save_io_test test_main.c
-    ../../src/platform/recomp_save_dir.c ../../src/platform/recomp_env.c)
+    ../../src/platform/recomp_save_dir.c ../../src/platform/recomp_env.c
+    ../../src/platform/recomp_exe_dir.c)
 target_include_directories(save_io_test PRIVATE ../../src/platform ../../src)
 enable_testing()
 add_test(NAME save_io

@@ -30,6 +30,8 @@ int main(void) {
     bad|=expect("0",1);
     bad|=expect("10",1);
     bad|=expect("klingon",1);
+    bad|=expect("dutch",1);     /* the title's own: the dashboard reports English */
+    bad|=expect("swedish",1);
     bad|=expect(NULL,1);
     if(bad) return 1;
     puts("PASS: XC_LANGUAGE follows game.language, English otherwise.");

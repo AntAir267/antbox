@@ -67,14 +67,61 @@ void xbox_OverlayFramePresented(void);
 /* The loop is ending: the title is let go, the settings written. */
 void xbox_OverlayShutdown(void);
 
-/* Rows of the host's own on the Graphics page, under the settings: up to
- * four actions whose text and effect are the port's (Android: which Vulkan
- * driver the next start loads, a restart). fn(row, 0) gives the row's text
+/* Rows of the host's own on the Graphics page, at its end: up to four
+ * actions whose text and effect are the port's (Android: which Vulkan
+ * driver the next start loads, a restart). Rows that belong to the host's
+ * own page go there instead (xbox_OverlaySetHostPage). fn(row, 0) gives the row's text
  * as it now stands (NULL or "": no such row at the moment; the pointer must
  * stay good until the next call for that row); fn(row, 1) is the row
  * activated, on the overlay's thread, and returns the text after it. */
 #define XBOX_OVERLAY_HOST_ROWS 4
 void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate));
+
+/* A page of the host's own (a tab of its own before System), for a title's
+ * settings that are not toolkit settings: the Mods tab of Burnout 3. The host
+ * gives the tab's name, how many rows the page has now, each row as text, and
+ * what a row does. Rows are asked for again every frame, so a state kept by the
+ * host (the same one its own menus show) is always the one on the screen.
+ * Calls come on the overlay's thread, with the title paused; any call may be
+ * made on any row index below count(). NULL removes the page (the tab then says
+ * the build has none). Up to XBOX_OVERLAY_HOSTPAGE_ROWS rows are shown. */
+#define XBOX_OVERLAY_HOSTPAGE_ROWS 48
+enum {
+    XBOX_HOSTROW_INFO,      /* a line of text (label) */
+    XBOX_HOSTROW_WARN,      /* the same, in the attention colour */
+    XBOX_HOSTROW_TOGGLE,    /* label, value, a switch (on) that the row turns */
+    XBOX_HOSTROW_ACTION,    /* label, value; activating does something */
+    XBOX_HOSTROW_HEADER     /* a section's title (label), as the toolkit's pages have */
+};
+/* A row's small tag after its label (BO-338), as the toolkit's rows have: a change that
+ * is used from the next race or the next start. */
+enum {
+    XBOX_HOSTTAG_NONE,
+    XBOX_HOSTTAG_NEXT_RACE,
+    XBOX_HOSTTAG_NEXT_START
+};
+typedef struct xbox_overlay_hostrow {
+    int  kind;              /* XBOX_HOSTROW_* */
+    int  on;                /* a toggle: the switch's state */
+    int  enabled;           /* 0: shown dim and not activated (a mod that cannot be used) */
+    char label[200];
+    char value[48];         /* the box at the right: "ON", "OFF*", "APPLY"... */
+    char hint[700];         /* the footer's help while the row is selected */
+    int  tag;               /* XBOX_HOSTTAG_*: NEXT RACE / NEXT START after the label (BO-338) */
+    int  tag_hot;           /* 1: the tag in the attention colour (a change is waiting for it) */
+    int  adv;               /* 1: an advanced row, shown only with "Show advanced settings" on (BO-338) */
+} xbox_overlay_hostrow;
+typedef struct xbox_overlay_hostpage {
+    const char *name;                                  /* the tab: "Mods" */
+    int  (*count)(void);
+    void (*row)(int i, xbox_overlay_hostrow *out);
+    void (*activate)(int i);                           /* A, Enter or a click on row i */
+    /* Optional: the page's choices back to the host's defaults. With it the
+     * page ends with "Reset this page to the defaults", asked once more as
+     * on the toolkit's pages; NULL: no such row. */
+    void (*reset)(void);
+} xbox_overlay_hostpage;
+void xbox_OverlaySetHostPage(const xbox_overlay_hostpage *page);
 
 /* Tests (overlay_shot): the place on the open page of the row whose text
  * starts with `prefix` (0 is the first), -1 when the page has none. */
@@ -83,6 +130,8 @@ int xbox_OverlayTestRowIndex(const char *prefix);
  * with `prefix`, and the cursor put on it (1 when there is one). */
 int xbox_OverlayTestHasRow(const char *prefix);
 int xbox_OverlayTestSelectRow(const char *prefix);
+/* Tests (overlay_shot): "Show advanced settings" on (1) or off (0) on the open page (BO-338). */
+void xbox_OverlayTestShowAdvanced(int on);
 
 #ifdef __cplusplus
 }

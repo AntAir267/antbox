@@ -14,7 +14,9 @@
  *   notice      XR_NOTICE(...)   always printed (stderr): the few lines a
  *                                player or a bug report needs: the version,
  *                                the device and display, where the settings
- *                                and saves are
+ *                                and saves are; the online layer's "[NET]"
+ *                                lines (xnet_hle_note: sign-in, a game made
+ *                                or joined, a peer linked, messages shown)
  *   diagnostic  every other print to stdout or stderr: printed only while
  *               g_xr_log_diag is set
  *

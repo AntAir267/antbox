@@ -313,13 +313,156 @@ static void test_readme(const char *path)
           "README key table is missing line %u: %s", (unsigned)row, want);
 }
 
+/* ── rebinding (keyboard.h) ──────────────────────────────────────────── */
+
+static int vk_state_btn_a(int vk)           /* the pad A (analog 0) after only `vk` is held */
+{
+    XBOX_INPUT_STATE st;
+
+    xbox_InputKeysClear();
+    if (vk)
+        xbox_InputKeySet(vk, 1);
+    xbox_InputKeyboardState(&st);
+    xbox_InputKeysClear();
+    return st.Gamepad.bAnalogButtons[0];
+}
+
+static int g_changes;
+static void on_change(void) { g_changes++; }
+
+static void test_rebind(void)
+{
+    char buf[256];
+    int other = -1;
+
+    xbox_InputKeyBindingsReset();
+    CHECK(xbox_InputKeyBindingsAreDefault(), "defaults after reset");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 0) == 0x20 && xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 1) == 0,
+          "boost is Space");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_ACCELERATE, 0) == 'W' && xbox_InputKeyBinding(XBOX_KEYACT_ACCELERATE, 1) == 0x26,
+          "accelerate is W, Up");
+    xbox_InputKeyBindingsFormat(buf, sizeof buf);
+    CHECK(!buf[0], "defaults write nothing: '%s'", buf);
+
+    /* A key that has an action is refused, and nothing moves. */
+    CHECK(xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 0x10, &other) == -2 && other == XBOX_KEYACT_LOOK_BACK,
+          "Shift is look back's: refused (%d)", other);
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 0) == 0x20, "boost unchanged by the refusal");
+    CHECK(xbox_InputKeyBind(XBOX_KEYACT_BOOST, 1, 0x20, &other) == -2 && other == XBOX_KEYACT_BOOST,
+          "the same key in both slots of one action: refused");
+    CHECK(xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 0x70, NULL) == -1, "F1 is not bindable");
+    CHECK(xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 0x12, NULL) == -1, "Alt is not bindable");
+    CHECK(xbox_InputKeyBind(99, 0, 'Z', NULL) == -1 && xbox_InputKeyBind(0, 5, 'Z', NULL) == -1, "bad action or slot");
+
+    /* Free the key, then take it. */
+    CHECK(xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 'Z', NULL) == 0, "boost to Z");
+    CHECK(vk_state_btn_a('Z') == 255 && vk_state_btn_a(0x20) == 0, "Z is A now, Space is nothing");
+    CHECK(xbox_InputKeyOwner('Z') == XBOX_KEYACT_BOOST && xbox_InputKeyOwner(0x20) == -1, "owners");
+    CHECK(xbox_InputKeyBind(XBOX_KEYACT_LOOK_BACK, 0, 0x20, NULL) == 0, "look back to the freed Space");
+    xbox_InputKeyBindingsFormat(buf, sizeof buf);
+    CHECK(!strcmp(buf, "boost=Z;look_back=Space"), "file text: '%s'", buf);
+    CHECK(!xbox_InputKeyBindingsAreDefault(), "not default");
+
+    /* The text reads back to the same bindings, and a swap in one text works. */
+    xbox_InputKeyBindingsReset();
+    CHECK(xbox_InputKeyBindingsParse("boost=Z;look_back=Space") == 2, "parse two");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 0) == 'Z' && xbox_InputKeyBinding(XBOX_KEYACT_LOOK_BACK, 0) == 0x20,
+          "parsed");
+    xbox_InputKeyBindingsReset();
+    CHECK(xbox_InputKeyBindingsParse("boost=Shift;look_back=Space") == 2
+          && xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 0) == 0x10 && xbox_InputKeyBinding(XBOX_KEYACT_LOOK_BACK, 0) == 0x20,
+          "a swap in one text");
+    xbox_InputKeyBindingsFormat(buf, sizeof buf);
+    CHECK(!strcmp(buf, "boost=Shift;look_back=Space"), "the swap writes back: '%s'", buf);
+
+    /* Two keys, one, none; names in any case; junk left out. */
+    CHECK(xbox_InputKeyBindingsParse(" Accelerate = i , period ;brake=;steer_left=nope,Q;flying=X;boost") >= 3, "parse mixed");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_ACCELERATE, 0) == 'I' && xbox_InputKeyBinding(XBOX_KEYACT_ACCELERATE, 1) == 0xBE,
+          "accelerate I, Period");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_BRAKE, 0) == 0 && xbox_InputKeyBinding(XBOX_KEYACT_BRAKE, 1) == 0, "brake: none");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_STEER_LEFT, 0) == 0 && xbox_InputKeyBinding(XBOX_KEYACT_STEER_LEFT, 1) == 0,
+          "steer left: the unknown name left out, and Q is White's, so refused: no keys");
+    xbox_InputKeyBindingsReset();
+
+    /* A text that gives one key to two actions: the first keeps it. */
+    xbox_InputKeyBindingsParse("boost=Z;look_back=Z");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 0) == 'Z' && xbox_InputKeyBinding(XBOX_KEYACT_LOOK_BACK, 0) == 0,
+          "a doubled key in a file");
+    CHECK(xbox_InputKeyOwner('Z') == XBOX_KEYACT_BOOST, "one owner");
+    xbox_InputKeyBindingsReset();
+
+    /* Names. */
+    CHECK(!strcmp(xbox_InputKeyName('W'), "W") && !strcmp(xbox_InputKeyName(0x26), "Up")
+          && !strcmp(xbox_InputKeyName(0x09), "Tab") && !strcmp(xbox_InputKeyName(0xBC), "Comma")
+          && !xbox_InputKeyName(0x99)[0], "key names");
+    CHECK(xbox_InputKeyFromName("up") == 0x26 && xbox_InputKeyFromName("tab") == 0x09
+          && xbox_InputKeyFromName("a") == 'A' && xbox_InputKeyFromName("F1") == 0 && xbox_InputKeyFromName("") == 0,
+          "names to keys");
+    for (int vk = 1; vk < 256; vk++)
+        if (xbox_InputKeyBindable(vk))
+            CHECK(xbox_InputKeyFromName(xbox_InputKeyName(vk)) == vk, "name round trip for 0x%02X", vk);
+    xbox_InputKeyActionKeys(XBOX_KEYACT_ACCELERATE, buf, sizeof buf);
+    CHECK(!strcmp(buf, "W, Up"), "menu line: '%s'", buf);
+    xbox_InputKeyActionKeys(XBOX_KEYACT_BOOST, buf, sizeof buf);
+    CHECK(!strcmp(buf, "Space"), "menu line: '%s'", buf);
+
+    /* The listener: told after each change, and only a change. */
+    {
+        g_changes = 0;
+        xbox_InputKeyBindingsSetListener(on_change);
+        xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 'Z', NULL);
+        CHECK(g_changes == 1, "a key bound: told once (%d)", g_changes);
+        xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 'Z', NULL);
+        CHECK(g_changes == 1, "the same key again: not told (%d)", g_changes);
+        xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 0x10, NULL);
+        CHECK(g_changes == 1, "a refused key: not told (%d)", g_changes);
+        xbox_InputKeyBindingsParse("brake=P");
+        CHECK(g_changes == 2, "a text parsed: told (%d)", g_changes);
+        xbox_InputKeyBindingsReset();
+        CHECK(g_changes == 3, "a reset: told (%d)", g_changes);
+        xbox_InputKeyBindingsSetListener(NULL);
+        xbox_InputKeyBind(XBOX_KEYACT_BOOST, 0, 'Z', NULL);
+        CHECK(g_changes == 3, "no listener: nobody told");
+        xbox_InputKeyBindingsReset();
+    }
+
+    /* A key rebound is what the game sees as Esc's action too. */
+    xbox_InputKeyBind(XBOX_KEYACT_BACK, 0, 'B', NULL);
+    xbox_InputKeySet('B', 1);
+    CHECK(xbox_InputKeyActionHeld(XBOX_KEYACT_BACK), "held through the action");
+    xbox_InputKeysClear();
+    xbox_InputKeyBindingsReset();
+
+    /* The environment's text at the first use is read by keys_ensure only
+     * once; the tests above ran after it, so it is checked in its own run:
+     * see RECOMP_KEYBOARD_KEYS in tests/input_keyboard/CMakeLists.txt. */
+}
+
+/* Run with RECOMP_KEYBOARD_KEYS="boost=Z;look_back=Space" (CMakeLists.txt):
+ * the bindings are what the environment says from the first use, a name
+ * wrong in it left out. */
+static void test_env(void)
+{
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_BOOST, 0) == 'Z', "boost from the environment");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_LOOK_BACK, 0) == 0x20, "look back from the environment");
+    CHECK(xbox_InputKeyBinding(XBOX_KEYACT_ACCELERATE, 0) == 'W', "the rest are the defaults");
+    xbox_InputKeyBindingsReset();
+    CHECK(xbox_InputKeyBindingsAreDefault(), "reset over the environment");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[2], "env")) {
+        test_env();
+        printf("input_keyboard env: %d checks, %d failed\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     test_rows();
     test_unmapped();
     test_combos();
     test_enable();
     test_activity();
+    test_rebind();
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     printf("input_keyboard: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

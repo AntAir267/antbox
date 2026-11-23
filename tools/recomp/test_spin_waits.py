@@ -178,6 +178,8 @@ def test_lowered_back_edge_compiles():
            "volatile int g_xbox_spin_sleep;\n"
            "volatile int g_xbox_irq_pending;\n"
            "void xbox_SpinWait(uint32_t va) { (void)va; }\n"
+           "#define RECOMP_REGS_OUT() ((void)0)\n"
+           "#define RECOMP_REGS_IN() ((void)0)\n"
            + m.group(0) +
            "#define CMP_L(a, b) ((a) < (b))\n"
            "int f(int32_t _fas, int32_t _fbs) {\n"

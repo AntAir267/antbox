@@ -228,6 +228,18 @@ int main(void)
         CHECK(nv2a_host_dither() == 0);
     }
 
+    /* ---- BO-178: which draws read a scaled target at its guest size ---- */
+    CHECK(nv2a_rt_reduce_draw(640, 480, 1280, 960, 320, 240) == 1);   /* bloom 2:1 */
+    CHECK(nv2a_rt_reduce_draw(320, 240, 960, 720, 160, 120) == 1);    /* 3x */
+    CHECK(nv2a_rt_reduce_draw(640, 480, 960, 720, 320, 240) == 1);    /* 1.5x */
+    CHECK(nv2a_rt_reduce_draw(640, 480, 1280, 960, 640, 240) == 1);   /* smaller on one side */
+    CHECK(nv2a_rt_reduce_draw(640, 480, 640, 480, 320, 240) == 0);    /* 1x: nothing */
+    CHECK(nv2a_rt_reduce_draw(160, 120, 320, 240, 160, 120) == 0);    /* same size: a blur */
+    CHECK(nv2a_rt_reduce_draw(160, 120, 320, 240, 640, 480) == 0);    /* enlarged */
+    CHECK(nv2a_rt_reduce_draw(64, 32, 128, 64, 128, 128) == 0);       /* larger on one side */
+    CHECK(nv2a_rt_reduce_draw(0, 0, 0, 0, 320, 240) == 0);
+    CHECK(nv2a_rt_reduce_on(0) == 1);                                 /* on by default */
+
     printf("render_scale: all passed\n");
     return 0;
 }

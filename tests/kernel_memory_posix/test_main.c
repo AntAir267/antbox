@@ -209,6 +209,19 @@ int main(void)
     }
 
     /*
+     * 6b. With no first RAM mirror mapped (this test maps no layout), a heap
+     * page has no alias and keeps its own number, as before upstream 80d40d9.
+     */
+    {
+        uint32_t va = 0x00F80000u + 0x2000u;   /* inside the heap */
+        char detail[96];
+        snprintf(detail, sizeof detail, "0x%08X gave 0x%08llX", va,
+                 (unsigned long long)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)va));
+        check((uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)va) == va,
+              "MmGetPhysicalAddress: a heap VA without a mirror is unchanged", detail);
+    }
+
+    /*
      * 7. A guest asking for executable memory gets usable memory.
      *
      * PAGE_EXECUTE_READWRITE became PROT_READ|PROT_WRITE|PROT_EXEC, which

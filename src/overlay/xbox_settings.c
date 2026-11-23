@@ -13,6 +13,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_texscale.h"
 #include "nv2a_texup.h"
+#include "nv2a_filmup.h"
 #include "apu_xaudio2.h"
 #include "apu.h"                /* mcpx_apu_set_fx_level */
 #include "apu_bus.h"
@@ -22,6 +23,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <io.h>              /* _commit */
+#else
+#include <unistd.h>          /* fsync */
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -41,8 +47,8 @@ static void sx_setenv_keep(const char *n, const char *v)
 
 #define LOGP "[SETTINGS] "
 
-static const char *const k_aspects[]  = { "4:3", "16:9", NULL };
-static const char *const k_aspect_env[] = { "0", "1", NULL };
+static const char *const k_aspects[]  = { "4:3", "16:9", "16:10", NULL };
+static const char *const k_aspect_env[] = { "0", "1", "16:10", NULL };
 static const char *const k_filters[]  = { "nearest", "linear", "integer", NULL };
 static const char *const k_overscan[] = { "off", "crop", "fill", NULL };
 static const char *const k_fits[]     = { "letterbox", "fill16x10", NULL };
@@ -55,6 +61,7 @@ static const char *const k_aniso_env[] = { "1", "2", "4", "8", "16", NULL };
 static const char *const k_ui_scale[] = { "off", "2x", "4x", NULL };
 static const char *const k_texup[]    = { "off", "fsrcnnx", "nnedi3", NULL };
 static const char *const k_texup_sc[] = { "2x", "4x", NULL };
+static const char *const k_filmup[]   = { "off", "cheap", "best", NULL };
 static const char *const k_lod[]      = { "off", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_lod_env[]  = { "0", "auto", "-0.5", "-1", "-1.5", NULL };
 static const char *const k_aa[]       = { "off", "fxaa", "smaa", NULL };
@@ -76,9 +83,13 @@ static const char *const k_scenery_detail[] = { "original", "far", NULL };
 static const char *const k_score_board[] = { "original", "smooth", NULL };
 static const char *const k_rival_marker[] = { "original", "farther", NULL };
 static const char *const k_crashnav_map[] = { "stretched", "native", NULL };
+static const char *const k_pictures[] = { "stretch", "blur", "black", NULL };
 static const char *const k_power[]    = { "stock", "performance", "battery", "auto", NULL };
 static const char *const k_lfe_lowpass[] = { "off", "80", "100", "120", NULL };
-static const char *const k_timing[]   = { "legacy", "auto", NULL };
+/* auto: macOS 14 and later present from a CAMetalDisplayLink, before it
+ * as aimed (BO-236); aimed: auto of 0.2.x, each frame aimed at one refresh
+ * (BO-115, BO-239). The Metal presenter is the only reader. */
+static const char *const k_timing[]   = { "legacy", "auto", "aimed", NULL };
 #if defined(__APPLE__)
 #define XS_TIMING_BUILTIN 1   /* auto (BO-239) */
 #else
@@ -87,8 +98,12 @@ static const char *const k_timing[]   = { "legacy", "auto", NULL };
 static const char *const k_frame_pacing[] = { "auto", "low_latency", "smooth", NULL };
 static const char *const k_custom_level[] = { "off", "quieter", "match", "louder", NULL };
 static const char *const k_hdr_decode[] = { "2.2", "srgb", NULL };
-/* XC_LANGUAGE 1..9 (kernel.h xbox_language_names): the kernel reads the name. */
-static const char *const k_language[] = { "english", "japanese", "german", "french", "spanish", "italian", "korean", "chinese", "portuguese", NULL };
+static const char *const k_online[] = { "off", "internet", "lan", NULL };
+/* XC_LANGUAGE 1..9 (kernel.h xbox_language_names): the kernel reads the name.
+ * Then languages a title has that the dashboard does not: the kernel reports
+ * English for them and the title picks them itself (its own language menu);
+ * the title reads game.language for that. */
+static const char *const k_language[] = { "english", "japanese", "german", "french", "spanish", "italian", "korean", "chinese", "portuguese", "dutch", "swedish", NULL };
 
 /* Designated, so the state half of the struct starts zero. */
 #define SETTING(k, t, f, e, c, ev, mn, mx, b) \
@@ -190,6 +205,13 @@ static xs_setting s_set[XS_COUNT] = {
      * and markers, or kept 4:3 with the rest of the menu (BO-222). Stretched
      * as shipped. Live. */
     [XS_DISPLAY_CRASHNAV_MAP] = SETTING("display.crashnav_map", XS_CHOICE, 0, RENV_DISPLAY_CRASHNAV_MAP, k_crashnav_map, NULL, 0, 0, 0),
+    /* With display.hud_fix in 16:9, the title's 4:3 full-screen pictures
+     * (Burnout 3: loading screens, menu films, the Crash Nav map) across the
+     * picture as shipped, or 4:3 with a blurred, darkened copy of the
+     * picture or dark sides beside them (BO-315). Blurred sides by default
+     * (the owner's choice, 2026-10-30): a title reads an unset variable as
+     * blur. Live. */
+    [XS_DISPLAY_PICTURES]   = SETTING("display.pictures", XS_CHOICE, 0, RENV_DISPLAY_PICTURES, k_pictures, NULL, 0, 0, 1),
     /* The title's own menu sounds in the overlay (BO-190): on as shipped
      * when the port names them. Live. */
     [XS_AUDIO_MENU_SOUNDS]  = SETTING("audio.menu_sounds", XS_BOOL, 0, RENV_AUDIO_MENU_SOUNDS, NULL, NULL, 0, 0, 1),
@@ -209,6 +231,11 @@ static xs_setting s_set[XS_COUNT] = {
     [XS_GRAPHICS_TEXUP_ROADS] = SETTING("graphics.texup_roads", XS_BOOL, 0, RENV_GFX_TEXUP_ROADS, NULL, NULL, 0, 0, 0),
     /* BO-272: on as shipped; off spreads the jobs through the race. Live. */
     [XS_GRAPHICS_TEXUP_PRELOAD] = SETTING("graphics.texture_upscale_preload", XS_BOOL, 0, RENV_GFX_TEXUP_PRELOAD, NULL, NULL, 0, 0, 1),
+    /* BO-136: the machine's default (nv2a_filmup_default: best, cheap on
+     * Android and ARM Linux; set at load). Live. */
+    [XS_GRAPHICS_FILMUP]    = SETTING("graphics.film_upscale", XS_CHOICE, 0, RENV_GFX_FILMUP, k_filmup, NULL, 0, 0, 2),
+    [XS_ONLINE_MODE]        = SETTING("online.mode", XS_CHOICE, XS_RESTART, RENV_ONLINE, k_online, NULL, 0, 0, 0),
+    [XS_ONLINE_REACTIONS]   = SETTING("online.reactions", XS_BOOL, XS_RESTART, RENV_ONLINE_REACTIONS, NULL, NULL, 0, 0, 1),
     [XS_GRAPHICS_SOFTBODY]  = SETTING("graphics.softbody", XS_BOOL, XS_RESTART, RENV_GFX_SOFTBODY, NULL, NULL, 0, 0, 0),
     [XS_GAME_RACE_CLOCK]    = SETTING("game.race_clock", XS_BOOL, 0, RENV_GAME_RACE_CLOCK, NULL, NULL, 0, 0, 0),
     /* With a music folder set: the title starts on the custom soundtrack the
@@ -312,14 +339,37 @@ static struct {
     int keep_empty;                   /* an empty value is a value (written as ""); absent is not */
 } s_text[] = {
     { "audio.custom_music_dir", RENV_AUDIO_MUSIC_DIR, "", 0, 0, 0 },
+    /* BO-267: the keyboard's keys that differ from the defaults, as
+     * "boost=Shift;look_back=Space" (input/keyboard.h). */
+    { "input.keys", RENV_KEYBOARD_KEYS, "", 0, 0, 0 },
     { "display.present_mode", RENV_PRESENT_MODE, "", 0, 0, 0 },
     { "console.hdd_key", RENV_CONSOLE_HDKEY, "", 0, 0, 0 },
     { "console.eeprom", RENV_CONSOLE_EEPROM, "", 0, 0, 0 },
+    { "online.server", RENV_ONLINE_SERVER, "", 0, 0, 0 },
+    { "online.name", RENV_ONLINE_NAME, "", 0, 0, 0 },
+    { "online.code", RENV_ONLINE_CODE, "", 0, 0, 0 },
     /* BO-230: the soundtrack last chosen in the title's screen; "" is EA
      * GAMES TRAX chosen, no key is nothing chosen yet. */
     { "audio.custom_music_soundtrack", RENV_AUDIO_CUSTOM_SOUNDTRACK, "", 0, 0, 1 },
+    /* BO-236: "2" once display.present_timing is of 0.3 or later: a stored
+     * legacy without it is 0.2.x's (mostly the #42 workaround) and moves to
+     * auto once where the display-link presenter is there. */
+    { "display.present_timing_rev", RENV_PRESENT_TIMING_REV, "", 0, 0, 0 },
 };
+/* By its key, not a number: a text setting added above it moved the index
+ * once (int030's input.keys) and the rev was written into the soundtrack. */
+static int text_index(const char *key);
+#define TEXT_TIMING_REV text_index("display.present_timing_rev")
 #define TEXT_COUNT ((int)(sizeof s_text / sizeof s_text[0]))
+
+static int text_index(const char *key)
+{
+    int i;
+    for (i = 0; i < TEXT_COUNT; i++)
+        if (!strcmp(s_text[i].key, key))
+            return i;
+    return 0;   /* not reached: the key is in the table */
+}
 
 /* ── value <-> text ────────────────────────────────────────────────── */
 
@@ -575,6 +625,9 @@ static void apply(xs_id id)
     case XS_GRAPHICS_TEXUP_PRELOAD:
         nv2a_texup_set_preload(v != 0.0);
         break;
+    case XS_GRAPHICS_FILMUP:
+        nv2a_filmup_set_mode((int)v);
+        break;
     case XS_GRAPHICS_AA:
         nv2a_host_set_post_aa((int)v);
         break;
@@ -770,6 +823,14 @@ void xbox_SettingsFlush(void)
     if (InterlockedExchange(&writing, 1))
         return;
     s_dirty = 0;
+#if defined(__APPLE__)
+    /* BO-236: a timing chosen from 0.3 on is kept as chosen (the rev says
+     * it is not 0.2.x's, see timing_migrate). */
+    if (s_set[XS_DISPLAY_PRESENT_TIMING].user && strcmp(s_text[TEXT_TIMING_REV].val, "2")) {
+        snprintf(s_text[TEXT_TIMING_REV].val, sizeof s_text[TEXT_TIMING_REV].val, "2");
+        s_text[TEXT_TIMING_REV].user = 1;
+    }
+#endif
     snprintf(tmp, sizeof tmp, "%s.tmp", s_path);
     f = fopen(tmp, "wb");
     if (!f) {
@@ -808,16 +869,27 @@ void xbox_SettingsFlush(void)
         write_texts(f, sec, 1);
     }
     write_texts(f, NULL, 0);
+    /* On the disk before it replaces the old file, and replaced in one step
+     * (XboxXBERecomp's settings.cpp does the same, MIT): a crash or power loss
+     * leaves the old file or the new, never a short one or none. */
+    fflush(f);
+#if defined(_WIN32)
+    _commit(_fileno(f));
+#else
+    fsync(fileno(f));
+#endif
     if (fclose(f) != 0) {
         XR_ERROR( LOGP "cannot write %s\n", tmp);
         InterlockedExchange(&writing, 0);
         return;
     }
 #if defined(_WIN32)
-    remove(s_path);
-#endif
+    if (!MoveFileExA(tmp, s_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        XR_ERROR( LOGP "cannot replace %s\n", s_path);
+#else
     if (rename(tmp, s_path) != 0)
         XR_ERROR( LOGP "cannot replace %s\n", s_path);
+#endif
     else
         fprintf(stderr, LOGP "saved\n");
     InterlockedExchange(&writing, 0);
@@ -948,6 +1020,32 @@ static void load_file(void)
 
 /* ── start-up ──────────────────────────────────────────────────────── */
 
+#if defined(__APPLE__)
+/* BO-236: display.present_timing = legacy stored by 0.2.x (no
+ * display.present_timing_rev) was mostly the #42 workaround (two drawables
+ * held a fullscreen window to every other refresh). Where the display-link
+ * presenter is there (macOS 14 and later) it moves to the default once, said
+ * in the log; the file then carries the rev, and legacy chosen again stays.
+ * A stored auto is the default already; RECOMP_PRESENT_TIMING decides over
+ * both. */
+static void timing_migrate(void)
+{
+    xs_setting *s = &s_set[XS_DISPLAY_PRESENT_TIMING];
+    if (s_text[TEXT_TIMING_REV].user || !s->user || s->locked || (int)s->value != 0)
+        return;
+    if (!__builtin_available(macOS 14.0, *))
+        return;
+    s->value = s->filev = s->def;
+    s->user = 0;
+    snprintf(s_text[TEXT_TIMING_REV].val, sizeof s_text[TEXT_TIMING_REV].val, "2");
+    s_text[TEXT_TIMING_REV].user = 1;
+    s_dirty = 1;
+    XR_NOTICE(LOGP "display.present_timing: legacy from an earlier version moved to auto once"
+              " (frames now go out with the display link, BO-236); legacy chosen again"
+              " in the overlay stays\n");
+}
+#endif
+
 static int env_real(recomp_env_id id)
 {
     const char *v = getenv(recomp_env_name(id));
@@ -972,6 +1070,7 @@ void xbox_SettingsInit(const char *title)
         }
     /* Diagnostic logging defaults to what this build does (xr_log.h). */
     s_set[XS_ADVANCED_DIAG_LOG].builtin = xr_log_default();
+    s_set[XS_GRAPHICS_FILMUP].builtin = nv2a_filmup_default();
     for (i = 0; i < XS_COUNT; i++) {
         xs_setting *s = &s_set[i];
         s->value = s->def = s->builtin;
@@ -998,6 +1097,9 @@ void xbox_SettingsInit(const char *title)
         snprintf(s_path, sizeof s_path, "%s/settings.toml", dir);
     }
     load_file();
+#if defined(__APPLE__)
+    timing_migrate();
+#endif
 
     /* The file's values into the environment, under what the user set and
      * over what the host defaults (which come after and do not replace). */
@@ -1022,6 +1124,7 @@ void xbox_SettingsInit(const char *title)
     /* recomp_save_dir read the table before these were set. */
     recomp_env_reload();
     XR_NOTICE( LOGP "%s\n", s_path);
+    xbox_SettingsFlush();      /* a migration above (BO-236); nothing when unchanged */
 }
 
 void xbox_SettingsGameDefault(const char *name, const char *value)

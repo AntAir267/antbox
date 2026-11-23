@@ -18,7 +18,11 @@
  *              the refresh at 60 Hz; RECOMP_PRESENT_HANDOVER past half a
  *              refresh is half a refresh; frames shown a refresh early put
  *              it back at half a refresh; slips still raise the depth.
- *   timed      the vblank plus the lead; six late frames add 2 ms.
+ *   forced     BO-239 (#42): at 60 Hz a frame shown a refresh late takes
+ *              the next frame's refresh; that frame is forced late, not a
+ *              slip; a skip breaks the chain; a whole stream a refresh late
+ *              is one slip.
+ *   timed     the vblank plus the lead; six late frames add 2 ms.
  *   statistics even 120 Hz (2-2-2), the 1-3-1-3 repeat, 144 Hz, a variable
  *              display with small and with large jitter, 30 fps content, a
  *              frame the presenter skipped, a window that shows nothing, the
@@ -80,7 +84,10 @@ static void strategy(void)
     check(pc_pick(&d, PC_SET_AUTO) == PC_TIMED, "auto, rate unknown: timed");
     check(pc_pick(&d, PC_SET_LOCK) == PC_TIMED, "lock forced without a rate: timed");
     check(pc_pick(NULL, PC_SET_AUTO) == PC_TIMED, "auto, no display: timed");
-    check(pc_setting("auto") == PC_SET_AUTO && pc_setting("legacy") == PC_SET_LEGACY
+    check(pc_setting("auto") == PC_SET_LINK && pc_setting("link") == PC_SET_LINK
+          && pc_setting("aimed") == PC_SET_AUTO && pc_pick(&d, PC_SET_LINK) == PC_LINK,
+          "auto and link ask for the display link, aimed is 0.2.x's pick (BO-236)");
+    check(pc_setting("legacy") == PC_SET_LEGACY
           && pc_setting(NULL) == PC_SET_LEGACY && pc_setting("x") == PC_SET_LEGACY
           && pc_setting("timed") == PC_SET_TIMED && pc_setting("lock") == PC_SET_LOCK,
           "the setting's text");
@@ -218,8 +225,12 @@ static void lock(void)
         pc_pacer_aim(&p, v, v + 300000, &a);
         raised += pc_pacer_glass(&p, &a, a.target_ns + R);
     }
-    check(raised == 0 && p.depth == 1 && p.depth_max == 1 && p.slips_all == 40,
-          "60 Hz: the depth stays 1 (2 would be two frames of latency)");
+    /* BO-239: at 60 Hz a frame shown a refresh late takes the next frame's
+     * refresh, so every frame after the first is forced late, not a slip;
+     * here the first was in the grace, so none is a slip. */
+    check(raised == 0 && p.depth == 1 && p.depth_max == 1 && p.slips_all == 0
+          && p.forced_all == 40,
+          "60 Hz: the depth stays 1 (2 would be two frames of latency); all 40 forced");
     check(pc_pacer_lock_report(&p, 2000 * MS) == 2000 * MS - 5 * MS,
           "the lock is told the on-glass time less the phase");
     /* A slip here and there does not raise it. */
@@ -351,8 +362,69 @@ static void handover(void)
         pc_pacer_aim(&p, v, v + 300000, &a);
         raised += pc_pacer_glass(&p, &a, a.target_ns + R);
     }
-    check(raised == 1 && p.depth == 2 && p.slips_all == 4 && p.earlies_all == 0,
-          "120 Hz: four slips still raise the depth, none taken as early");
+    check(raised == 1 && p.depth == 2 && p.slips_all == 4 && p.earlies_all == 0
+          && p.forced_all == 0,
+          "120 Hz: four slips still raise the depth, none taken as early or forced");
+}
+
+/* BO-239 (#42): the reporter's 60 Hz pattern. A frame misses its refresh
+ * and is shown one later; the next frame's refresh is that one, so it is
+ * shown a refresh late too (forced); the presenter skips the one after
+ * (two presents on their way); the frame after that is on time. Only the
+ * first is a slip: the presenter's own recovery costs no second one, and
+ * a chain of frames all one refresh late is one slip, not one per frame. */
+static void forced(void)
+{
+    pc_display d = disp(60, 0, 0);
+    pc_pacer p;
+    pc_aim a;
+    uint64_t R;
+    int i, raised = 0, misses = 0;
+
+    printf("forced\n");
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    R = p.period_ns;
+    p.grid_ns = 1000 * MS;
+    for (i = 1; i <= 2 * PC_GRACE_FRAMES + 600; i++) {
+        uint64_t v = 1000 * MS + (uint64_t)i * R - 5 * MS, shown;
+        int k = i % 6;                 /* 0: miss, 1: forced, 2: skipped, 3-5: on time */
+        pc_pacer_aim(&p, v, v + 300000, &a);
+        if (k == 2)
+            continue;                  /* skipped: never shown, nothing to feed */
+        shown = a.target_ns + (k <= 1 ? R : 0);
+        if (k == 0 && !p.grace)
+            misses++;
+        raised += pc_pacer_glass(&p, &a, shown);
+    }
+    check(misses > 100 && p.slips_all == (uint32_t)misses && p.forced_all == (uint32_t)misses,
+          "60 Hz miss, forced, skip: one slip and one forced per miss");
+    check(raised == 0 && p.depth == 1, "the depth cannot rise at 60 Hz: no raise");
+
+    /* A stream shifted by a refresh (the chain never broken): at most one
+     * slip, here none, as the chain began in the grace. */
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    p.grid_ns = 1000 * MS;
+    for (i = 1; i <= PC_GRACE_FRAMES + 200; i++) {
+        uint64_t v = 1000 * MS + (uint64_t)i * R - 5 * MS;
+        pc_pacer_aim(&p, v, v + 300000, &a);
+        pc_pacer_glass(&p, &a, a.target_ns + R);
+    }
+    check(p.slips_all == 0 && p.forced_all == 200, "every frame a refresh late: no slip, all forced");
+
+    /* Two frames late on their own, a frame on time between: two slips. */
+    pc_pacer_init(&p, PC_LOCK, &d, 5 * MS, 0, 1);
+    p.grid_ns = 1000 * MS;
+    for (i = 1; i <= PC_GRACE_FRAMES + 3; i++) {
+        uint64_t v = 1000 * MS + (uint64_t)i * R - 5 * MS;
+        pc_pacer_aim(&p, v, v + 300000, &a);
+        if (i == PC_GRACE_FRAMES + 2) {
+            /* this frame skipped by the presenter, the next one on time */
+            continue;
+        }
+        pc_pacer_glass(&p, &a, a.target_ns + (i > PC_GRACE_FRAMES && i != PC_GRACE_FRAMES + 3 ? R : 0));
+    }
+    check(p.slips_all == 1 && p.forced_all == 0 && p.grid_ns == a.target_ns,
+          "a skip breaks the chain: the frame after it on time, no forced");
 }
 
 static void timed(void)
@@ -393,6 +465,32 @@ static void timed(void)
         /* BO-211: ten seconds on time take the raise back. */
         check(lowered == 1 && at599 == 14 && p.lead_ns == 12 * MS,
               "600 frames on time: the lead back to 12 ms");
+    }
+    /* BO-236: frames every 8.3 ms (High refresh at 120 Hz): two presents on
+     * their way hold at most 16.7 ms, so the lead stops at 13.7 ms; it was
+     * raised up to 32 and the presenter skipped a quarter of the frames. */
+    {
+        uint64_t f120 = 8333333;
+        int r120 = 0;
+        d = disp(120, 1, 24);
+        pc_pacer_init(&p, PC_TIMED, &d, 5 * MS, 12 * MS, 1);
+        pc_pacer_set_frame(&p, f120);
+        check(pc_pacer_lead_max(&p) == 2 * f120 - 3 * MS, "120 fps: the lead's ceiling is two frames less 3 ms");
+        for (i = 0; i < PC_GRACE_FRAMES + 20 * PC_LATES_RAISE; i++) {
+            v += f120;
+            pc_pacer_aim(&p, v, v + 300000, &a);
+            r120 += pc_pacer_glass(&p, &a, a.target_ns + 3 * MS) > 0;
+        }
+        check(r120 == 0 && p.lead_ns == 12 * MS, "120 fps, every frame late: the lead stays under its ceiling");
+        d = disp(120, 1, 24);
+        pc_pacer_init(&p, PC_TIMED, &d, 5 * MS, 12 * MS, 1);
+        p.lead_ns = 32 * MS;
+        pc_pacer_set_frame(&p, f120);
+        check(p.lead_ns == 2 * f120 - 3 * MS, "a lead raised at 60 fps comes down when frames come at 120");
+        pc_pacer_set_frame(&p, PC_FRAME_NS);
+        check(pc_pacer_lead_max(&p) == 2 * PC_FRAME_NS - 3 * MS, "60 fps: the ceiling is 30.3 ms");
+        pc_pacer_set_frame(&p, 0);
+        check(pc_pacer_lead_max(&p) == PC_LEAD_MAX_NS, "frames not known: the old ceiling");
     }
     d = disp(144, 0, 0);
     pc_pacer_init(&p, PC_TIMED_ODD, &d, 5 * MS, 12 * MS, 1);
@@ -506,11 +604,210 @@ static void statistics(void)
     check(r.samples == 200 && r.expected == 0, "no display: intervals in ms only");
 }
 
+/* The display link (BO-236): callbacks every period, each naming a commit
+ * deadline tt and a refresh on the glass at tt + 8 ms. */
+static void link(void)
+{
+    pc_link l;
+    uint64_t per = 8333333, tt = 3000 * MS, rep, pd = 0, r_dummy = 0;
+    int i, miss, moved = 0, misses = 0;
+
+    printf("link\n");
+    pc_link_init(&l, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+    rep = pc_link_tick(&l, tt, tt + 8 * MS, 0, &pd);
+    check(rep == tt - 4 * MS && pd == 0, "first callback: the vblank 4 ms before the deadline, no period yet");
+    /* A start-up step of 6 ms first (seen on the Mac): the median ignores it. */
+    tt += 6 * MS;
+    pc_link_tick(&l, tt, tt + 8 * MS, 0, &pd);
+    for (i = 0; i < 50; i++) {
+        tt += per;
+        rep = pc_link_tick(&l, tt, tt + 8 * MS, 0, &pd);
+    }
+    check(pd == per, "120 Hz callbacks after a 6 ms start-up step: the period is 8.33 ms");
+    tt += 2 * per;
+    rep = pc_link_tick(&l, tt, tt + 8 * MS, 0, &pd);
+    check(pd == per, "a callback the system left out: still 8.33 ms");
+    check(pc_link_take_until(&l, tt) == tt - PC_LINK_GUARD_NS, "the newest frame is taken until 1.5 ms before the deadline");
+    /* 60 fps frames on 120 Hz callbacks (High refresh on, a 60 fps menu):
+     * every other refresh is empty, and that is no miss. */
+    for (i = 0; i < PC_GRACE_FRAMES + 400; i++) {
+        tt += per;
+        rep = pc_link_tick(&l, tt, tt + 8 * MS, i & 1, &pd);
+        if (!(i & 1)) {
+            moved += pc_link_frame(&l, rep + 200000, 0, &miss) != 0;
+            misses += miss;
+        }
+    }
+    check(!moved && !misses && l.phase_ns == 4 * MS, "60 fps on a 120 Hz link: no miss, the phase stays");
+    /* A frame whose vblank was in time for the refresh before, which went
+     * empty: it missed. The vblank moves 1 ms earlier. */
+    for (i = 0; i < 20 * PC_SLIP_WINDOW; i++) {
+        tt += per;
+        rep = pc_link_tick(&l, tt, tt + 8 * MS, 1, &pd);
+        moved += pc_link_frame(&l, rep - per, 0, &miss) > 0;
+    }
+    check(moved >= 1 && l.phase_ns <= per - PC_LINK_GUARD_NS - MS && l.phase_ns > 4 * MS,
+          "missed frames move the vblank earlier, inside the refresh");
+    {
+        int lowered = 0;
+        for (i = 0; i < 40 * PC_DECAY_FRAMES && l.phase_ns > 4 * MS; i++) {
+            tt += per;
+            rep = pc_link_tick(&l, tt, tt + 8 * MS, 0, &pd);
+            lowered += pc_link_frame(&l, rep, 0, &miss) < 0;
+        }
+        check(lowered >= 1 && l.phase_ns == 4 * MS, "calm frames take the raise back");
+    }
+    /* 60 Hz callbacks: a frame after an empty refresh whose vblank came
+     * after that refresh's take-until is not a miss (the title was slow). */
+    pc_link_init(&l, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+    per = PC_FRAME_NS;
+    for (i = 0; i < 10; i++) {
+        tt += per;
+        rep = pc_link_tick(&l, tt, tt + 16 * MS, 0, &pd);
+    }
+    tt += per;
+    rep = pc_link_tick(&l, tt, tt + 16 * MS, 1, &pd);
+    pc_link_frame(&l, tt - per - 1 * MS, 0, &miss);
+    check(!miss, "60 Hz: a frame after the refresh before's take-until is not a miss");
+    pc_link_frame(&l, tt - per - 3 * MS, 0, &miss);
+    check(miss, "60 Hz: a frame in time for an empty refresh before is a miss");
+    /* BO-236: a slack moves the deadline, the vblank and the take-until
+     * later, never closer than 2 ms to the refresh on the glass. */
+    {
+        pc_link k;
+        uint64_t t = 7000 * MS, r, p;
+        pc_link_init(&k, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+        pc_link_set_slack(&k, 12 * MS);
+        r = pc_link_tick(&k, t, t + 33 * MS, 0, &p);
+        check(pc_link_deadline(&k) == t + 12 * MS && r == t + 8 * MS
+              && pc_link_take_until(&k, pc_link_deadline(&k)) == t + 12 * MS - PC_LINK_GUARD_NS,
+              "slack 12 ms: deadline, vblank and take-until 12 ms later");
+        pc_link_set_slack(&k, 30 * MS);
+        t += PC_FRAME_NS;
+        pc_link_tick(&k, t, t + 16 * MS, 0, &p);
+        check(pc_link_deadline(&k) == t + 14 * MS, "a slack is held 2 ms short of the refresh");
+    }
+    /* The slack by default: the link's lead less PC_LINK_COMMIT_MIN_NS,
+     * keyed to the room, not to the link's rate (the Fable review). */
+    {
+        pc_link k;
+        uint64_t t = 9000 * MS, p;
+        const uint64_t lead120 = 16666667, lead60 = 33366667;
+        pc_link_init(&k, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+        check(k.slack_ns == PC_LINK_SLACK_AUTO, "the slack is automatic by default");
+        /* A 120 Hz display, the link at 60 (High refresh off, the default):
+         * the lead is two 120 Hz refreshes; no slack. */
+        for (i = 0; i < 20; i++) {
+            t += PC_FRAME_NS;
+            pc_link_tick(&k, t, t + lead120, 0, &p);
+        }
+        check(k.slack_eff_ns == 0 && pc_link_deadline(&k) == t,
+              "120 Hz display, link at 60: no slack (the deadline is the link's)");
+        check(t + lead120 - pc_link_take_until(&k, pc_link_deadline(&k)) >= 18 * MS,
+              "120 Hz display, link at 60: frames taken until 18 ms or more before the glass");
+        /* The same display, the link at 120 (High refresh on): no slack. */
+        for (i = 0; i < 20; i++) {
+            t += 8333333;
+            pc_link_tick(&k, t, t + lead120, 0, &p);
+        }
+        check(k.slack_eff_ns == 0, "120 Hz display, link at 120: no slack");
+        /* A 60 Hz display: the lead is two 60 Hz refreshes; the slack is it
+         * less 17 ms, the vblank 4 ms before that. */
+        pc_link_init(&k, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+        for (i = 0; i < 20; i++) {
+            t += PC_FRAME_NS;
+            r_dummy = pc_link_tick(&k, t, t + lead60, 0, &p);
+        }
+        check(k.slack_eff_ns == lead60 - PC_LINK_COMMIT_MIN_NS
+              && pc_link_deadline(&k) == t + lead60 - PC_LINK_COMMIT_MIN_NS
+              && r_dummy == t + lead60 - PC_LINK_COMMIT_MIN_NS - PC_LINK_PHASE_NS,
+              "60 Hz display: the deadline its lead less 17 ms before the glass");
+        check(t + lead60 - r_dummy == PC_LINK_COMMIT_MIN_NS + PC_LINK_PHASE_NS,
+              "60 Hz display: 21 ms from vblank to glass (37 with the link's deadline)");
+        /* One odd lead does not move the slack (the reported grid). */
+        t += PC_FRAME_NS;
+        pc_link_tick(&k, t, t + lead60 + 3 * MS, 0, &p);
+        check(k.slack_eff_ns == lead60 - PC_LINK_COMMIT_MIN_NS, "one odd lead: the slack holds (median)");
+        /* RECOMP_PRESENT_LINK_SLACK overrides it. */
+        pc_link_set_slack(&k, 5 * MS);
+        t += PC_FRAME_NS;
+        pc_link_tick(&k, t, t + lead60, 0, &p);
+        check(k.slack_eff_ns == 5 * MS, "a fixed slack overrides the automatic one");
+        pc_link_set_slack(&k, PC_LINK_SLACK_AUTO);
+        t += PC_FRAME_NS;
+        pc_link_tick(&k, t, t + lead60, 0, &p);
+        check(k.slack_eff_ns == lead60 - PC_LINK_COMMIT_MIN_NS, "back to automatic");
+    }
+    /* The steady "one refresh behind" state (the Fable review): every frame
+     * a little after its take-until, so each is shown a refresh late and no
+     * refresh goes empty. With the vblank following the link it counts as
+     * misses and the phase moves; while the lock settles it does not. */
+    {
+        pc_link k;
+        uint64_t t = 20000 * MS, r = 0, p, prev_r = 0;
+        int raised = 0, m, all = 0;
+        pc_link_init(&k, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+        for (i = 0; i < PC_GRACE_FRAMES + 20; i++) {
+            t += PC_FRAME_NS;
+            prev_r = r;
+            r = pc_link_tick(&k, t, t + 16666667, 0, &p);
+            if (prev_r) {
+                pc_link_frame(&k, prev_r, 0, &m);
+                all += m;
+            }
+        }
+        check(all == 0, "one behind while the lock settles: no miss");
+        for (i = 0; i < 40; i++) {
+            t += PC_FRAME_NS;
+            prev_r = r;
+            r = pc_link_tick(&k, t, t + 16666667, 0, &p);
+            raised += pc_link_frame(&k, prev_r, 1, &m) > 0;
+            all += m;
+        }
+        check(all >= 4 && raised >= 1 && k.phase_ns > PC_LINK_PHASE_NS,
+              "one behind with the vblank locked: misses, the vblank moves earlier");
+        /* A frame of this refresh is no miss, locked or not. */
+        t += PC_FRAME_NS;
+        r = pc_link_tick(&k, t, t + 16666667, 0, &p);
+        pc_link_frame(&k, r + 2 * MS, 1, &m);
+        check(!m, "a frame on time with the vblank locked: no miss");
+    }
+    /* A rate change (60 -> 120): the old steps go, no period until five new
+     * ones, then the new one; the grace starts anew. */
+    {
+        pc_link k;
+        uint64_t t = 30000 * MS, p = 1;
+        pc_link_init(&k, PC_LINK_PHASE_NS, PC_LINK_GUARD_NS);
+        for (i = 0; i < 20; i++) {
+            t += PC_FRAME_NS;
+            pc_link_tick(&k, t, t + 16666667, 0, &p);
+        }
+        check(p == PC_FRAME_NS, "link at 60: 16.67 ms");
+        pc_link_reset(&k);
+        check(k.period_ns == 0 && k.grace == PC_GRACE_FRAMES, "reset: no period, the grace anew");
+        /* The first callback after the reset starts the steps anew. */
+        for (i = 0; i < 6; i++) {
+            t += 8333333;
+            pc_link_tick(&k, t, t + 16666667, 0, &p);
+            if (i == 4)
+                check(p == 0, "reset: no period reported before five new steps");
+        }
+        check(p == 8333333, "reset: the new period after five steps (not the old median for nine)");
+    }
+    /* BO-236, the shift seen at 120 Hz: a frame meant for the refresh
+     * before is stale for this one; a frame of this refresh is not. */
+    check(pc_link_stale(&l, tt - per - 3 * MS) && !pc_link_stale(&l, tt - 4 * MS)
+          && !pc_link_stale(&l, tt - per - 1 * MS) && !pc_link_stale(&l, 0),
+          "a frame in time for the refresh before is stale, this refresh's is not");
+}
+
 int main(void)
 {
+    link();
     strategy();
     lock();
     handover();
+    forced();
     timed();
     statistics();
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);

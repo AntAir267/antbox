@@ -42,7 +42,7 @@ typedef enum { XS_BOOL, XS_INT, XS_FLOAT, XS_CHOICE } xs_type;
 
 enum {
     XS_RESTART = 1,       /* read at start: a change shows after a restart */
-    XS_VIRTUAL = 2,       /* several knobs (the Power page's mode) */
+    XS_VIRTUAL = 2,       /* several knobs (power.mode, on the Display page) */
     XS_FROM_BOOL = 4      /* was a switch: a file's or variable's true / false
                            * still reads, as the float's 1 / 0 (BO-212) */
 };
@@ -111,8 +111,12 @@ typedef enum {
     XS_GRAPHICS_TEXUP_ROADS, /* and the road surfaces too (off: the title's road skip list) */
     XS_DISPLAY_CRASHNAV_MAP, /* BO-222: with the widescreen HUD, a title's map screen full width or 4:3 */
     XS_GRAPHICS_TEXUP_PRELOAD, /* BO-272: the upscaler works through the loading screen and countdown, on as shipped */
-    XS_GRAPHICS_SOFTBODY,    /* a title's soft-body vehicle damage (drawn only), off as shipped; read at start */
+    XS_DISPLAY_PICTURES,     /* BO-315: with the widescreen HUD, a title's 4:3 pictures stretched, or 4:3 with blurred or dark sides */
+    XS_GRAPHICS_FILMUP,      /* BO-136: the films upscaled on the GPU: off / cheap / best (nv2a_filmup.h) */
+    XS_ONLINE_MODE,          /* BO-134: off / internet / lan (xnet_hle.h); read at the start */
+    XS_ONLINE_REACTIONS,     /* BO-352: show the quick reactions other players send, on by default; read at the start */
     XS_GAME_LANGUAGE,        /* the dashboard language the kernel reports (XC_LANGUAGE); a row only where the title has more than one */
+    XS_GRAPHICS_SOFTBODY,    /* a title's soft-body vehicle damage (drawn only), off as shipped; read at start */
 #if defined(__ANDROID__)
     XS_INPUT_VIBRATION,      /* pad motors or the device's vibrator (android_vibration.c) */
     XS_INPUT_TOUCH,          /* the on-screen controls: auto / always / off (touch_pad.h) */
@@ -247,9 +251,11 @@ double  xbox_PowerModeAtLoad(xs_host h, double stored);
 void xbox_SettingsSetBackground(int bg);
 
 /* The languages the title has on its disc, bit i for game.language's
- * choice i (bit 0 English ... bit 8 Portuguese, XC_LANGUAGE - 1). The
- * Language row shows when there is more than one and steps over the
- * others. 0 (the default) shows no row. */
+ * choice i (bit 0 English ... bit 8 Portuguese, XC_LANGUAGE - 1; bit 9
+ * Dutch and bit 10 Swedish, which no dashboard has: XC_LANGUAGE is English
+ * for them and the title sets them itself). The Language row shows when
+ * there is more than one and steps over the others. 0 (the default) shows
+ * no row. */
 void     xbox_SettingsSetLanguages(unsigned mask);
 unsigned xbox_SettingsLanguages(void);
 
@@ -261,7 +267,7 @@ void xbox_SettingsReportRegister(void);
 /* The environment spelling of a value, for the overlay's hints. */
 void xbox_SettingEnvString(const xs_setting *s, double v, char *out, unsigned n);
 
-/* The line at the top of the overlay's Advanced page: the port's name and
+/* The line at the top of the overlay's System page: the port's name and
  * version (NULL or "": none). Here and not in overlay.h, which needs SDL. */
 void xbox_OverlaySetAbout(const char *text);
 
@@ -403,14 +409,14 @@ int xbox_OverlayMenuSoundsState(unsigned wait_ms);
 struct nv2a_texrep_variant;
 void xbox_OverlaySetPadSheets(const struct nv2a_texrep_variant *variants, unsigned n);
 
-/* The "Check for updates" row of the Advanced page (xbox_update.h): the
+/* The "Check for updates" row of the System page (xbox_update.h): the
  * GitHub repository the port's releases are published in ("owner/name") and
  * the running version ("0.1.0"). Without this call, or on a build that
  * cannot make the request (Android), there is no row. The request is made
  * only when the row is pressed. */
 void xbox_OverlaySetUpdateCheck(const char *repo, const char *version);
 
-/* The "Add Steam library art" row of the Advanced page, for a port whose
+/* The "Add Steam library art" row of the System page, for a port whose
  * setup program can write the pictures of its existing Steam shortcut. `run`
  * is called on its own thread when the row is pressed; it puts one line for
  * the player in `line` (what was done, or why not) and returns 1 when art was
@@ -424,7 +430,7 @@ void xbox_OverlaySetSteamArt(int (*run)(char *line, unsigned n));
  * built, or switched off). */
 int xbox_OverlayRequestOpen(void);
 
-/* Cheats, for the session only: rows on the Advanced page, each switched with
+/* Cheats, for the session only: rows on the System page, each switched with
  * A (on asks once more, showing `warning`). While one is on the title's saves
  * go to a copy of the save (recomp_save_sandbox_begin); when the last goes
  * off the player keeps that progress or throws it away. get and set run on
@@ -463,7 +469,7 @@ typedef struct xbox_music_folder_ops {
 } xbox_music_folder_ops;
 void xbox_OverlaySetMusicFolder(const xbox_music_folder_ops *ops);
 
-/* The "save data" rows of the overlay's Advanced page (recomp_save_dir.h's
+/* The "save data" rows of the overlay's System page (recomp_save_dir.h's
  * export and import), for a port that names its title's save: "Export save
  * to home folder" copies UDATA/<title id> and TDATA/<title id> of the save
  * root to a dated folder in `export_dir` and shows the full path; "Import
@@ -485,7 +491,7 @@ void xbox_OverlaySetSaveIO(const xbox_save_io *io);
  * page while one is wanted: a setting flagged XS_RESTART in the table
  * differs from its value at launch (xbox_SettingsNeedRestart: the table is
  * the only list), or the port says so here with its reason, a sentence for
- * the row's note (NULL or "": no longer). The Advanced page always has
+ * the row's note (NULL or "": no longer). The System page always has
  * "Restart game". Nothing restarts unless the player picks the row. */
 void xbox_OverlayWantRestart(const char *reason);
 

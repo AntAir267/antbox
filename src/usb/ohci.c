@@ -509,21 +509,68 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever.
  *
- * The image therefore comes first. The contiguous allocator here does hand
- * out physical numbers inside the image's range (its window is separate
- * storage, so nothing collides there), and asking its page map first, as
- * mcpx_apu_phys (apu_core.c) does, sent 0x0041A904 to the window again:
- * Burnout 3's boot allocates 0x803E7000..0x805E7000 before XPP enumerates,
- * so page 0x41A is "contiguous", and enumeration retried the descriptor for
- * ever with the pad never attached. Outside the image the page map is asked
- * next: a page the first-fit allocator handed out -- or the reserved page 0,
+ * So the image comes before the page map. The contiguous allocator here
+ * does hand out physical numbers inside the image's range (its window is
+ * separate storage, so nothing collides there), and asking its page map
+ * first, as mcpx_apu_phys (apu_core.c) does, sent 0x0041A904 to the window
+ * again: Burnout 3's boot allocates 0x803E7000..0x805E7000 before XPP
+ * enumerates, so page 0x41A is "contiguous", and enumeration retried the
+ * descriptor for ever with the pad never attached.
+ *
+ * But not before the driver's own translations. A title with a large image
+ * has its range reach over the window's physical numbers too: Maximum
+ * Chase's image runs to 0xBF5AB8, and XPP keeps its descriptors in the
+ * window at 0x80408940, physical 0x408940, inside it. A page the driver
+ * translated from the window (MmGetPhysicalAddress records each) is the
+ * window, image range or not; and a page inside the image range with no
+ * record of its own, at the end of an unbroken run of contiguous pages from
+ * a recorded window page at most 32 below, is taken as the same pool (the
+ * driver translates a pool once and offsets from it). That second rule is
+ * a guess: a Burnout-3-shaped title whose statics sit inside such a run
+ * would have them sent to the window again; the "[MM] physical page ...
+ * earlier from" line says when both forms of a page were handed out.
+ *
+ * Before all of it: a heap page's name in the RAM mirror (va + the RAM size,
+ * xbox_PhysRamName) is folded back to the heap address. That range holds no
+ * window or image number, so the order below is unaffected; it is why the
+ * driver's translation record now rarely names a heap page at all.
+ *
+ * Outside the image the page map is asked next: a page the first-fit allocator handed out -- or the reserved page 0,
  * where XPP keeps its private arena -- is the window; then the high-water
  * mark, for a page that was contiguous memory once and has since been
  * freed. */
 static uint32_t bus_resolve(uint32_t addr)
 {
-    uint32_t va;
+    uint32_t va, alias = xbox_PhysRamAlias();
 
+    /* A heap page's name is its alias in the first RAM mirror
+     * (xbox_PhysRamName, upstream 80d40d9/9f70b08): folded back to the heap
+     * address first, from the number alone, as mcpx_apu_phys does. guest_ok
+     * admits RAM only below the mapped size, so the alias itself would be
+     * skipped: upstream's Splinter Cell had a dead pad, XAPI's report buffer
+     * being a heap block. No window or image number lies in the alias range,
+     * so nothing below is shadowed. */
+    if (alias && addr >= alias && addr - alias < OHCI_CONTIG_SIZE)
+        return addr - alias;
+    /* A translation the driver itself took (MmGetPhysicalAddress) outranks the
+     * image test: a title whose image spans the low physical range (Maximum
+     * Chase: .data runs to 0xBF5AB8) puts its descriptors in the contiguous
+     * window at 0x80408940, physical 0x408940, which lies inside the image. */
+    va = addr ? xbox_PhysicalToGuest(addr) : 0;
+    if (va && va >= OHCI_CONTIG_BASE && va - OHCI_CONTIG_BASE < OHCI_CONTIG_SIZE)
+        return va;
+    /* The driver translates a pool's first page and offsets from it: a page
+     * with no record of its own, below which an unbroken run of contiguous
+     * pages leads back to a recorded window page, is the same pool. */
+    if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi && addr < (64u << 20)) {
+        const volatile uint8_t *map = xbox_ContiguousPageMap();
+        uint32_t pg = addr >> 12, k;
+        for (k = 1; k <= 32 && k <= pg && map[pg] && map[pg - k]; k++) {
+            uint32_t b = xbox_PhysicalToGuest((pg - k) << 12);
+            if (b && b >= OHCI_CONTIG_BASE && b - OHCI_CONTIG_BASE < OHCI_CONTIG_SIZE)
+                return b + (k << 12) + (addr & 0xFFFu);
+        }
+    }
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     /* Then the address the driver itself translated this page from

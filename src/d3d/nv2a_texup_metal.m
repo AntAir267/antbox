@@ -40,6 +40,39 @@ static id<MTLDevice>               s_csb_dev;
 static atomic_int                  s_state;     /* 0 / 1 / -1 */
 static int                         s_fp32;
 
+/* The pairs after the texture upscaler's TUM_SAMPLES are the films'. */
+#define FILM_SAMPLES 8
+
+/* The stage-boundary timestamp buffer, once (tum_load's and the films'
+ * loading threads both ask). */
+static void csb_make(id<MTLDevice> dev)
+{
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    static int done;
+    pthread_mutex_lock(&mx);
+    if (!done) {
+        done = 1;
+        if (@available(macOS 11.0, *)) {
+            if ([dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                for (id<MTLCounterSet> cs in [dev counterSets]) {
+                    if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                        MTLCounterSampleBufferDescriptor *cd = [[MTLCounterSampleBufferDescriptor alloc] init];
+                        NSError *e2 = nil;
+                        cd.counterSet = cs;
+                        cd.storageMode = MTLStorageModeShared;
+                        cd.sampleCount = (TUM_SAMPLES + FILM_SAMPLES) * 2;
+                        s_csb = [dev newCounterSampleBufferWithDescriptor:cd error:&e2];
+                        [cd release];
+                        s_csb_dev = [dev retain];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&mx);
+}
+
 int tum_state(void)
 {
     return atomic_load(&s_state);
@@ -87,23 +120,7 @@ int tum_load(id<MTLDevice> dev, const char *dir, int fp32)
             }
         }
         /* Timing of the chunks' own work: stage-boundary timestamps. */
-        if (@available(macOS 11.0, *)) {
-            if ([dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
-                for (id<MTLCounterSet> cs in [dev counterSets]) {
-                    if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
-                        MTLCounterSampleBufferDescriptor *cd = [[MTLCounterSampleBufferDescriptor alloc] init];
-                        NSError *e2 = nil;
-                        cd.counterSet = cs;
-                        cd.storageMode = MTLStorageModeShared;
-                        cd.sampleCount = TUM_SAMPLES * 2;
-                        s_csb = [dev newCounterSampleBufferWithDescriptor:cd error:&e2];
-                        [cd release];
-                        s_csb_dev = [dev retain];
-                        break;
-                    }
-                }
-            }
-        }
+        csb_make(dev);
         fprintf(stderr, LOGP "chunk timing: %s\n", s_csb ? "stage-boundary counters"
                                                     : "command buffer span");
         sd.minFilter = MTLSamplerMinMagFilterNearest;
@@ -433,12 +450,19 @@ int tum_samples_ok(void)
     return s_csb != nil;
 }
 
+static double sample_ms(int i);
+
 double tum_sample_ms(int i)
+{
+    return i >= 0 && i < TUM_SAMPLES ? sample_ms(i) : -1;
+}
+
+static double sample_ms(int i)
 {
     static double ns_per_tick;
     NSData *d;
     const MTLCounterResultTimestamp *ts;
-    if (!s_csb || i < 0 || i >= TUM_SAMPLES)
+    if (!s_csb || i < 0 || i >= TUM_SAMPLES + FILM_SAMPLES)
         return -1;
     if (!ns_per_tick && [s_csb_dev hasUnifiedMemory]) {
         /* Apple silicon: the counter results are nanoseconds already (on
@@ -472,7 +496,7 @@ double tum_sample_ms(int i)
 
 static id<MTLComputeCommandEncoder> tum_encoder(id<MTLCommandBuffer> cb, int sample)
 {
-    if (s_csb && sample >= 0 && sample < TUM_SAMPLES) {
+    if (s_csb && sample >= 0 && sample < TUM_SAMPLES + FILM_SAMPLES) {
         if (@available(macOS 11.0, *)) {
             MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
             pd.sampleBufferAttachments[0].sampleBuffer = s_csb;
@@ -629,4 +653,242 @@ id<MTLTexture> tum_from_file(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLT
 id<MTLTexture> tum_job_scratch(const TumJob *j, int i)
 {
     return j && i >= 0 && i < j->nscratch ? j->scratch[i] : nil;
+}
+
+/* ── films (BO-136) ───────────────────────────────────────────────────── */
+
+#include "nv2a_filmup.h"
+#include "nv2a_filmup_shaders.h"
+
+static id<MTLComputePipelineState> s_fpipe[FILM_P_N];
+static id<MTLSamplerState>         s_fpoint;
+static atomic_int                  s_fstate;
+
+int tum_film_state(void)
+{
+    return atomic_load(&s_fstate);
+}
+
+static void *film_load_main(void *p)
+{
+    id<MTLDevice> dev = (id<MTLDevice>)p;
+    int i, ok = 1;
+    @autoreleasepool {
+        MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+        MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opt.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+        for (i = 0; i < FILM_P_N && ok; i++) {
+            NSError *err = nil;
+            NSString *src = [NSString stringWithUTF8String:k_film_msl[i]];
+            id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opt error:&err];
+            id<MTLFunction> fn;
+            if (!lib) {
+                fprintf(stderr, "[FILMUP] pass %d: %s\n", i,
+                        [[err localizedDescription] UTF8String]);
+                ok = 0;
+                break;
+            }
+            fn = [lib newFunctionWithName:@"main0"];
+            s_fpipe[i] = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+            [fn release];
+            [lib release];
+            if (!s_fpipe[i])
+                ok = 0;
+        }
+        csb_make(dev);
+        sd.minFilter = MTLSamplerMinMagFilterNearest;
+        sd.magFilter = MTLSamplerMinMagFilterNearest;
+        s_fpoint = [dev newSamplerStateWithDescriptor:sd];
+        [sd release];
+        [opt release];
+    }
+    fprintf(stderr, "[FILMUP] film passes: %s\n", ok && s_fpoint ? "ready" : "failed");
+    atomic_store(&s_fstate, ok && s_fpoint ? 1 : -1);
+    [dev release];
+    return NULL;
+}
+
+void tum_film_load_async(id<MTLDevice> dev)
+{
+    static int started;
+    pthread_t th;
+    if (started)
+        return;
+    started = 1;
+    [dev retain];
+    if (pthread_create(&th, NULL, film_load_main, dev) != 0) {
+        [dev release];
+        atomic_store(&s_fstate, -1);
+        return;
+    }
+    pthread_detach(th);
+}
+
+#define FILM_RING 3
+enum { FS_D1, FS_D2, FS_Y, FS_F1, FS_F2, FS_A1, FS_A2, FS_B1, FS_B2, FS_E2, FS_R2, FS_N };
+
+struct TumFilm {
+    id<MTLDevice>  dev;
+    uint32_t       w, h;
+    id<MTLTexture> s[FS_N];          /* made at first use */
+    id<MTLTexture> out[FILM_RING];
+    unsigned       next;
+};
+
+TumFilm *tum_film_new(id<MTLDevice> dev, uint32_t w, uint32_t h)
+{
+    TumFilm *f = (TumFilm *)calloc(1, sizeof *f);
+    if (!f)
+        return NULL;
+    f->dev = [dev retain];
+    f->w = w;
+    f->h = h;
+    return f;
+}
+
+void tum_film_free(TumFilm *f)
+{
+    int i;
+    if (!f)
+        return;
+    for (i = 0; i < FS_N; i++)
+        [f->s[i] release];
+    for (i = 0; i < FILM_RING; i++)
+        [f->out[i] release];
+    [f->dev release];
+    free(f);
+}
+
+uint32_t tum_film_w(const TumFilm *f) { return f ? f->w : 0; }
+uint32_t tum_film_h(const TumFilm *f) { return f ? f->h : 0; }
+
+static id<MTLTexture> film_tex(TumFilm *f, MTLPixelFormat fmt, uint32_t w, uint32_t h)
+{
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                                                  width:w
+                                                                                 height:h
+                                                                              mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    return [f->dev newTextureWithDescriptor:td];
+}
+
+static id<MTLTexture> film_s(TumFilm *f, int i)
+{
+    if (!f->s[i]) {
+        uint32_t k = (i == FS_E2 || i == FS_R2) ? 2u : 1u;
+        f->s[i] = film_tex(f, MTLPixelFormatRGBA16Float, f->w * k, f->h * k);
+    }
+    return f->s[i];
+}
+
+static void film_dispatch(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p,
+                          id<MTLSamplerState> smp, id<MTLTexture> const in[3], int nin,
+                          id<MTLTexture> out, uint32_t dw, uint32_t dh, uint32_t sw, uint32_t sh,
+                          int mode)
+{
+    struct up_params pc;
+    int k;
+    memset(&pc, 0, sizeof pc);
+    pc.size[0] = (int32_t)sw;
+    pc.size[1] = (int32_t)sh;
+    pc.mode = mode;
+    [e setComputePipelineState:p];
+    for (k = 0; k < nin; k++)
+        [e setTexture:in[k] atIndex:(NSUInteger)k];
+    [e setTexture:out atIndex:4];
+    [e setSamplerState:smp atIndex:0];
+    [e setBytes:&pc length:sizeof pc atIndex:0];
+    [e dispatchThreadgroups:MTLSizeMake((dw + 15) / 16, (dh + 15) / 16, 1)
+      threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+}
+
+double tum_film_sample_ms(int sample)
+{
+    return sample >= 0 ? sample_ms(TUM_SAMPLES + sample) : -1;
+}
+
+id<MTLTexture> tum_film_encode(TumFilm *f, id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                               int mode, int *ran, int *sample)
+{
+    static unsigned next_sample;
+    id<MTLComputeCommandEncoder> e;
+    id<MTLTexture> out, in[3];
+    uint32_t w, h, i;
+    int best;
+    if (ran)
+        *ran = NV2A_FILMUP_OFF;
+    if (sample)
+        *sample = -1;
+    if (!f || !src || mode == NV2A_FILMUP_OFF || tum_film_state() != 1)
+        return nil;
+    w = f->w;
+    h = f->h;
+    best = mode == NV2A_FILMUP_BEST && tum_state() == 1;
+    for (i = 0; i < FS_N; i++) {
+        if ((i >= FS_Y && i <= FS_B2) && !best)
+            continue;
+        if ((i == FS_E2 || i == FS_R2) && best)
+            continue;
+        if (!film_s(f, (int)i))
+            return nil;
+    }
+    out = f->out[f->next];
+    if (!out) {
+        out = f->out[f->next] = film_tex(f, MTLPixelFormatBGRA8Unorm, w * 2, h * 2);
+        if (!out)
+            return nil;
+    }
+    f->next = (f->next + 1) % FILM_RING;
+    if (sample && s_csb) {
+        *sample = (int)(next_sample++ % FILM_SAMPLES);
+        e = tum_encoder(cb, TUM_SAMPLES + *sample);
+    } else {
+        e = [cb computeCommandEncoder];
+    }
+    /* The deblock: vertical edges, then horizontal. */
+    in[0] = src; in[1] = f->s[FS_D2];
+    film_dispatch(e, s_fpipe[FILM_P_DEBLOCK], s_fpoint, in, 2, f->s[FS_D1], w, h, w, h, 0);
+    in[0] = src; in[1] = f->s[FS_D1];
+    film_dispatch(e, s_fpipe[FILM_P_DEBLOCK], s_fpoint, in, 2, f->s[FS_D2], w, h, w, h, 1);
+    if (best) {
+        /* BO-245's passes: the luma, FSRCNNX's 13 hooks, its recombine. */
+        static const int io[13][4] = {
+            { FS_Y, -1, -1, FS_F1 }, { FS_Y, -1, -1, FS_F2 },
+            { FS_F1, FS_F2, -1, FS_A1 }, { FS_F1, FS_F2, -1, FS_A2 },
+            { FS_A1, FS_A2, -1, FS_B1 }, { FS_A1, FS_A2, -1, FS_B2 },
+            { FS_B1, FS_B2, -1, FS_A1 }, { FS_B1, FS_B2, -1, FS_A2 },
+            { FS_A1, FS_A2, -1, FS_B1 }, { FS_A1, FS_A2, -1, FS_B2 },
+            { FS_B1, FS_B2, FS_F1, FS_A1 }, { FS_B1, FS_B2, FS_F2, FS_A2 },
+            { FS_A1, FS_A2, -1, FS_B1 },
+        };
+        int k, n;
+        in[0] = f->s[FS_D2];
+        film_dispatch(e, s_pipe[PIPE_LUMA], s_point, in, 1, f->s[FS_Y], w, h, w, h, 0);
+        for (i = 0; i < 13; i++) {
+            for (n = 0, k = 0; k < 3 && io[i][k] >= 0; k++, n++)
+                in[k] = f->s[io[i][k]];
+            film_dispatch(e, s_pipe[PIPE_FSR0 + i], s_point, in, n, f->s[io[i][3]], w, h, w,
+                          h, 0);
+        }
+        in[0] = f->s[FS_D2]; in[1] = f->s[FS_B1];
+        film_dispatch(e, s_pipe[PIPE_RECOMBINE], s_point, in, 2, out, w * 2, h * 2, w, h, 0);
+    } else {
+        in[0] = f->s[FS_D2];
+        film_dispatch(e, s_fpipe[FILM_P_EASU], s_fpoint, in, 1, f->s[FS_E2], w * 2, h * 2, w,
+                      h, 0);
+        in[0] = f->s[FS_E2];
+        film_dispatch(e, s_fpipe[FILM_P_RCAS], s_fpoint, in, 1, f->s[FS_R2], w * 2, h * 2,
+                      w * 2, h * 2, 0);
+        in[0] = f->s[FS_D2]; in[1] = f->s[FS_R2];
+        film_dispatch(e, s_fpipe[FILM_P_RECOMBINE], s_fpoint, in, 2, out, w * 2, h * 2, w, h,
+                      0);
+    }
+    [e endEncoding];
+    if (ran)
+        *ran = best ? NV2A_FILMUP_BEST : NV2A_FILMUP_CHEAP;
+    return out;
 }

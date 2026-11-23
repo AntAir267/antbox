@@ -57,6 +57,9 @@ long long enhance_cfg_int(const char *key, long long def);
 double enhance_cfg_float(const char *key, double def);
 int enhance_cfg_bool(const char *key, int def);   /* env: 1/0 true/false yes/no on/off */
 int enhance_cfg_choice(const char *key, const char *const *choices, int def);
+/* display.widescreen: a bool, or "16:10" (BO-271): the title's 16:9 mode
+ * (1) laid out for a 16:10 picture (*is_1610 = 1). */
+int enhance_widescreen(int *is_1610);
 
 /* Where `key`'s value comes from, for the init log line of a module. */
 enhance_cfg_source enhance_cfg_source_of(const char *key);

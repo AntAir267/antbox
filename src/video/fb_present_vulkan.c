@@ -92,6 +92,7 @@ uint32_t xbox_HostFlipIntervalAsked(void);
 #include "kernel/xbox_pvideo.h"       /* the video overlay */
 #include "kernel/xbox_gamma.h"        /* the display's gamma ramp */
 #include "fb_present_vulkan.h"
+#include "surface_gate.h"
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
 #define LOGP "[PRESENT] "
@@ -1442,9 +1443,32 @@ static VkSurfaceKHR make_surface(VkInstance inst, void *ctx);
 static void destroy_swapchain(void);
 
 #if defined(__ANDROID__)
+/* BO-324: no surface is made while the app is away (surface_gate.h). The
+ * watcher closes the gate before SDL lets the Java thread release the
+ * window; the surface is marked lost only then, so that the presenter does
+ * not start making a new one on the window that is going away. */
+static struct surface_gate s_life = SURFACE_GATE_INIT;
+
 void fbv_android_surface_gone(void)
 {
+    surface_gate_away(&s_life);
     s_surface_lost = 1;
+}
+
+void fbv_android_surface_back(void)
+{
+    surface_gate_back(&s_life);
+}
+
+/* SDL's window, as SDL_Vulkan_CreateSurface would hand it to
+ * vkCreateAndroidSurfaceKHR: NULL between surfaceDestroyed and
+ * surfaceCreated. */
+static int android_has_window(SDL_Window *win)
+{
+    SDL_SysWMinfo wi;
+    SDL_VERSION(&wi.version);
+    return SDL_GetWindowWMInfo(win, &wi) && wi.subsystem == SDL_SYSWM_ANDROID
+           && wi.info.android.window != NULL;
 }
 #endif
 
@@ -1518,14 +1542,42 @@ static int resurface(SDL_Window *win)
         tried_ns = now;
     }
 #endif
+#if defined(__ANDROID__)
+    /* Away (Home, recents, screen off): the window is gone or going, and
+     * the foreground event comes once its new one is ready. Nothing is
+     * torn down or made until then. */
+    if (surface_gate_is_away(&s_life))
+        return 0;
+#endif
     queue_idle();
     pthread_mutex_lock(&s_sc_mu);
     destroy_swapchain();
     pthread_mutex_unlock(&s_sc_mu);
-    if (!nvk_core_replace_surface(make_surface, win)) {
-        if (said++ < 3)
-            fprintf(stderr, LOGP "no surface for the window yet; trying again\n");
-        return 0;
+    {
+        int ok;
+#if defined(__ANDROID__)
+        /* The gate is held only while the surface is made (not over the
+         * queue wait above): the watcher that closes it runs on SDL's main
+         * thread, and SDL lets the Java thread release the window at most
+         * 0.5 s after the pause whether that thread got round or not. */
+        if (!surface_gate_begin(&s_life))
+            return 0;
+        if (!android_has_window(win)) {
+            surface_gate_end(&s_life);
+            if (said++ < 3)
+                fprintf(stderr, LOGP "no Android window to make a surface on; waiting for it\n");
+            return 0;
+        }
+#endif
+        ok = nvk_core_replace_surface(make_surface, win);
+#if defined(__ANDROID__)
+        surface_gate_end(&s_life);
+#endif
+        if (!ok) {
+            if (said++ < 3)
+                fprintf(stderr, LOGP "no surface for the window yet; trying again\n");
+            return 0;
+        }
     }
     s_surface_lost = 0;
     s_recreate = 1;

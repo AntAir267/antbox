@@ -137,9 +137,16 @@ static uint32_t apu_translated(uint32_t a)
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    uint32_t va = apu_translated(a);
+    uint32_t va = apu_translated(a), alias = xbox_PhysRamAlias();
     if (va)
         return g_apu_ram_ptr + va;
+    /* A heap page's name: its alias in the first RAM mirror (xbox_PhysRamName,
+     * upstream 80d40d9), so it is RAM whatever the window holds at the same
+     * offset. The record above already answers for a page the title
+     * translated; this covers the rest of its block. Before the 64 MB case,
+     * which would read a 128 MB map's alias as plain RAM. */
+    if (alias && a >= alias && a - alias < (64u << 20))
+        return g_apu_ram_ptr + (a - alias);
     /* RAM above the window's 64 MB. The target maps 128 MB (a devkit) and
      * its heap runs from 0x038C0000 to 0x08000000, so most of what the title
      * malloc()s -- BLiNX 2's sound buffers among them, handed to DirectSound
@@ -172,16 +179,19 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
  * per-voice line: "xlat-win" or "xlat-ram" (the title translated this page
- * from the window or from RAM), "win" (a page the contiguous allocator
+ * from the window or from RAM), "alias" (a heap page's mirror name not
+ * translated itself: the rest of a block that was), "win" (a page the contiguous allocator
  * handed out), "img" (inside the XBE image), "hiwin" (below the arena's high-water mark but not
  * a live page), "ram" (plain RAM below 64 MB) or "wrap" (at or above 64 MB,
  * which the fallback folds into the low 64 MB). */
 const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
-    uint32_t va = apu_translated(a);
+    uint32_t va = apu_translated(a), alias = xbox_PhysRamAlias();
     if (va)
         return va >= 0x80000000u ? "xlat-win" : "xlat-ram";
+    if (alias && a >= alias && a - alias < (64u << 20))
+        return "alias";
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_ContiguousPageMap()[a >> 12])
@@ -214,6 +224,16 @@ static volatile LONG s_irq_line;
  * 0xFFFFFFBE). A guest that halts the front end itself and later acks
  * anything got the same stale replay, plus an unwanted resume. It also made
  * every trap cost two or three ISR calls instead of one. */
+/* update_irq reads ISTS and IEN, then writes GINTSTS and the line from what
+ * it read: callers hold d->lock, or a raise and a lower cross. The ISR's ack
+ * (an ISTS write on a guest thread) once ran it without the lock. It found
+ * nothing pending; the frame thread then latched a new trap and raised the
+ * line; the ack's update went on to lower it. FETINTSTS stayed set with
+ * GINTSTS clear and set_irq spent, so nothing raised the line again: the
+ * front end stayed trapped and DirectSound's stop-and-wait spun for good
+ * (BO-351, int042 Dee2 and int044 Dee1 on Windows). xemu runs both under the
+ * BQL (hw/xbox/mcpx/apu/apu.c: the frame thread takes it around update_irq,
+ * and MMIO writes arrive with it). */
 static void update_irq(MCPXAPUState *d)
 {
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
@@ -222,8 +242,20 @@ static void update_irq(MCPXAPUState *d)
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         InterlockedExchange(&s_irq_line, 1);
     } else {
+        if (mcpx_apu_irq_lower_hook)
+            mcpx_apu_irq_lower_hook(d);
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         InterlockedExchange(&s_irq_line, 0);
+    }
+}
+
+void (*mcpx_apu_irq_lower_hook)(MCPXAPUState *d);
+
+void mcpx_apu_frame_irq(MCPXAPUState *d)
+{
+    if (d->set_irq) {
+        update_irq(d);
+        d->set_irq = false;
     }
 }
 
@@ -490,9 +522,15 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case NV_PAPU_ISTS:
+        /* Under d->lock, as the frame thread's update_irq is (see there).
+         * The frame thread never holds it while it waits on a guest thread:
+         * it drops it before delivering or posting (apu_deliver_irq), and
+         * VP method writes already take it from the same threads. */
+        qemu_mutex_lock(&d->lock);
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~(uint32_t)val);
         update_irq(d);
         qemu_cond_broadcast(&d->cond);
+        qemu_mutex_unlock(&d->lock);
         break;
     case NV_PAPU_IEN:
         /* The line is a level: unmasking a status bit already set raises it
@@ -1313,8 +1351,7 @@ static void throttle(MCPXAPUState *d)
                 mcpx_apu_vp_idle_scan(d);
         }
         if (d->set_irq) {
-            update_irq(d);
-            d->set_irq = false;
+            mcpx_apu_frame_irq(d);
             apu_deliver_irq(d);
             continue;
         }
@@ -1377,6 +1414,40 @@ static int64_t s_xcnt_off_since;     /* realtime ms they went off, 0: on */
 #define XCNT_OFF_MS 20
 static int s_frame_thread_started;
 
+/* A stretch without a frame (APU_GAP_WARN_US) is reported with what the
+ * thread was doing meanwhile (upstream f2c43ea). No frame means no idle-voice
+ * trap, so a title that stops a voice and waits for it to be retired
+ * (DirectSound's StopEx, then GetStatus) waits all of it: upstream saw a
+ * 102 ms stop freeze Burnout 3 once in ~5000. At most APU_GAP_WARN_MAX lines.
+ * The start is the host's clock in ms, as other host-timed logs. */
+#define APU_GAP_WARN_US 20000
+#define APU_GAP_WARN_MAX 50
+
+typedef struct {
+    int64_t from_us;            /* the last frame; 0 after an idle pause */
+    int64_t slept_us;           /* in throttle since */
+    unsigned trapped, passes;
+} ApuFrameGap;
+
+static void apu_frame_gap_check(ApuFrameGap *g, int64_t now_us)
+{
+    static int shown;
+
+    if (g->from_us && now_us - g->from_us > APU_GAP_WARN_US
+            && shown < APU_GAP_WARN_MAX) {
+        fprintf(stderr, "[APU] no frame for %.1f ms from %.3f ms: %u passes,"
+                        " front end trapped %u, throttle slept %.1f ms,"
+                        " %d queued now%s\n",
+                (now_us - g->from_us) / 1000.0, g->from_us / 1000.0,
+                g->passes, g->trapped, g->slept_us / 1000.0,
+                xa2_is_active() ? xa2_queued_samples() : -1,
+                ++shown == APU_GAP_WARN_MAX ? " (no more shown)" : "");
+    }
+    g->from_us = now_us;
+    g->slept_us = 0;
+    g->trapped = g->passes = 0;
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -1384,11 +1455,13 @@ static void *mcpx_apu_frame_thread(void *arg)
      * session and the big cores, android_perf.c). Unnamed it carried the
      * name of the thread that made it: "Thread-8" on a phone. */
     xbox_log_thread_role("mcpx-apu", 0);
+    ApuFrameGap gap = { 0 };
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
         if (!g_spk.active && !g_cue.active && (d->host_paused
             || (d->pause_requested && !g_test_tone.active && !g_mixer_active_count))) {
+            gap.from_us = 0;
             d->is_idle = true;
             if (dev_paces())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1402,7 +1475,12 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        int64_t throttle_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         throttle(d);
+        int64_t pass_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        gap.slept_us += pass_us - throttle_us;
+        gap.passes++;
+        int div0 = d->ep_frame_div;
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
@@ -1452,6 +1530,7 @@ static void *mcpx_apu_frame_thread(void *arg)
         }
 
         hs_trap(fe_trapped);
+        gap.trapped += fe_trapped;
 
         if (g_spk.active) {
             spk_test_frame(d);
@@ -1487,15 +1566,14 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+        if (d->ep_frame_div != div0)
+            apu_frame_gap_check(&gap, pass_us);
 
         /* What xemu's frame thread does after each frame: turn a pending
          * notification (set by the voice processor or a trapped method) into
          * the interrupt line. Nothing here ever did, so the line never rose
          * even before there was anything to deliver it to. */
-        if (d->set_irq) {
-            update_irq(d);
-            d->set_irq = false;
-        }
+        mcpx_apu_frame_irq(d);
         if (!fe_trapped)
             s_fe_trap_since = 0;
         apu_deliver_irq(d);

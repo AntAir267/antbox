@@ -40,6 +40,17 @@
  *                 there and the overlay says so.
  *   PC_LEGACY     display.present_timing = legacy: present when ready, as
  *                 before BO-115. Measured all the same.
+ *   PC_LINK       macOS 14 and later (BO-236): a CAMetalDisplayLink names
+ *                 each refresh the presenter may fill (its callback, a
+ *                 drawable, the commit deadline and the time on the
+ *                 glass). The emulated vblank, and the High refresh grid,
+ *                 sit `phase` before each commit deadline; a frame finished
+ *                 by the deadline goes into that refresh's drawable with a
+ *                 plain present (no time, no skip rule), a refresh without
+ *                 a new frame presents nothing. One path for 60 Hz, 120 Hz,
+ *                 variable refresh and ProMotion: the link's rate is the
+ *                 title's (60) or, under High refresh, the display's.
+ *                 pc_link_* below is its arithmetic.
  */
 #ifndef XBOX_PRESENT_CADENCE_H
 #define XBOX_PRESENT_CADENCE_H
@@ -67,11 +78,17 @@ int pc_multiple_of_60(double hz, int *mult);
 
 /* ── the strategy ── */
 
-enum { PC_LEGACY = 0, PC_LOCK, PC_TIMED, PC_TIMED_ODD };
-enum { PC_SET_LEGACY = 0, PC_SET_AUTO, PC_SET_LOCK, PC_SET_TIMED };
+enum { PC_LEGACY = 0, PC_LOCK, PC_TIMED, PC_TIMED_ODD, PC_LINK };
+/* PC_SET_AUTO is the per-display pick of 0.2.x ("aimed"; "auto" before
+ * BO-236); PC_SET_LINK asks for PC_LINK, which the presenter grants where
+ * it has the display link ("auto" on macOS 14 and later). */
+enum { PC_SET_LEGACY = 0, PC_SET_AUTO, PC_SET_LOCK, PC_SET_TIMED, PC_SET_LINK };
 
-/* The setting's value from its text (legacy, auto; lock and timed force one
- * strategy, for experiments); PC_SET_LEGACY for NULL or anything else. */
+/* The setting's value from its text: legacy; auto and link ask for the
+ * display link (PC_SET_LINK; the presenter falls back to aimed where there
+ * is none); aimed is the per-display pick of 0.2.x (PC_SET_AUTO); lock and
+ * timed force one strategy, for experiments. PC_SET_LEGACY for NULL or
+ * anything else. */
 int pc_setting(const char *text);
 int pc_pick(const pc_display *d, int setting);
 const char *pc_strategy_name(int strategy);
@@ -103,6 +120,17 @@ const char *pc_strategy_name(int strategy);
 #define PC_LATES_RAISE    6              /* lates in the window that raise the lead */
 #define PC_LEAD_STEP_NS   2000000ull
 #define PC_LEAD_MAX_NS    33000000ull
+/* PC_TIMED*: a present holds its drawable from the commit until the system
+ * says it is on the glass, about the lead after its vblank, and the
+ * presenter lets PC_INFLIGHT of them be on their way at once (three
+ * drawables, one on the glass). Frames come every frame_ns (16.7 ms, 8.3
+ * under High refresh at 120 Hz), so a lead over PC_INFLIGHT frames less a
+ * margin starves the presenter: it then skips frames by its own rule (the
+ * #42 ProMotion report, 120 flips a second and about 96 on the glass). The
+ * lead is never raised past that, and comes down to it when frames come
+ * faster (BO-236). */
+#define PC_INFLIGHT       2
+#define PC_INFLIGHT_MARGIN_NS 3000000ull
 /* A raise is taken back, one step at a time, after this many frames on the
  * glass with no slip (no late frame) since the last raise or step back: a
  * shader-compile burst or a load early in a session no longer leaves the Mac
@@ -122,6 +150,7 @@ typedef struct {
     int      depth_max;    /* the most that keeps a frame inside PC_LATENCY_MAX_NS */
     int      grace;        /* frames still not counted */
     uint64_t lead_ns;      /* PC_TIMED*: present at the vblank plus this */
+    uint64_t frame_ns;     /* the time between the title's frames; 0 unknown (BO-236) */
     int      depth0;       /* what the setting asked: a raise decays back to these */
     uint64_t lead0_ns;
     int      calm;         /* frames since the last slip (late), raise or step back */
@@ -131,8 +160,12 @@ typedef struct {
     int      handover_half; /* frames came early: half a refresh before the frame's own instead */
     /* the window's counts */
     int      frames, slips, lates;
-    /* since pc_pacer_init */
-    uint32_t slips_all, lates_all, raised, lowered, earlies_all;
+    /* since pc_pacer_init. forced_all (PC_LOCK): frames shown a refresh
+     * late because the frame before them was shown late and took their
+     * refresh (one frame per refresh: a slip costs the next frame its
+     * refresh too, and the presenter a skip after that, BO-239). They are
+     * not slips of their own and do not count toward a raise. */
+    uint32_t slips_all, lates_all, raised, lowered, earlies_all, forced_all;
 } pc_pacer;
 
 /* What one present is aimed at. */
@@ -147,6 +180,10 @@ void pc_pacer_init(pc_pacer *p, int strategy, const pc_display *d,
 /* PC_LOCK: the hand-over after the refresh before a frame's own
  * (PC_HANDOVER_NS by default; at most half a refresh is used). */
 void pc_pacer_set_handover(pc_pacer *p, uint64_t handover_ns);
+/* PC_TIMED*: frames come every frame_ns (0 unknown): the lead's ceiling
+ * (pc_pacer_lead_max) follows, and a lead above it comes down at once. */
+void pc_pacer_set_frame(pc_pacer *p, uint64_t frame_ns);
+uint64_t pc_pacer_lead_max(const pc_pacer *p);
 /* The frame whose emulated vblank was vblank_ns, picked up at now_ns. */
 void pc_pacer_aim(const pc_pacer *p, uint64_t vblank_ns, uint64_t now_ns, pc_aim *out);
 /* The frame aimed with *aim reached the glass at glass_ns (0: never shown).
@@ -161,6 +198,100 @@ void pc_pacer_relearn(pc_pacer *p);
 /* PC_LOCK: the time to report to the vblank's display lock for an on-glass
  * time (a point `phase` before the display's grid); 0 for other strategies. */
 uint64_t pc_pacer_lock_report(const pc_pacer *p, uint64_t glass_ns);
+
+/* ── the display link (PC_LINK, BO-236) ── */
+
+#define PC_LINK_PHASE_NS     4000000ull  /* the vblank this long before a commit deadline */
+#define PC_LINK_GUARD_NS     1500000ull  /* a frame is taken until this long before it */
+#define PC_LINK_STEP_NS      1000000ull
+#define PC_LINK_MISSES_RAISE 4           /* misses in PC_SLIP_WINDOW frames that move the vblank earlier */
+
+#define PC_LINK_IV 16
+
+typedef struct {
+    uint64_t phase_ns, phase0_ns;  /* the vblank this long before a commit deadline */
+    uint64_t guard_ns;             /* the newest frame is taken until deadline - guard */
+    uint64_t slack_ns;             /* the deadline taken this much after the link's own (BO-236) */
+    uint64_t slack_eff_ns;         /* of it what the refresh named last left room for */
+    uint64_t period_ns;            /* the link's refresh period: the median of its last steps */
+    uint64_t last_tpt_ns;          /* the last refresh named */
+    uint64_t cur_tt_ns, prev_tt_ns; /* the deadline of the refresh named last, and of the one before */
+    int      prev_empty;           /* and whether it went without a new frame */
+    uint64_t iv[PC_LINK_IV];       /* the last steps between named refreshes */
+    int      n_iv, i_iv;
+    uint64_t ld[PC_LINK_IV];       /* the last leads of the link: deadline to glass (tpt - tt) */
+    int      n_ld, i_ld;
+    uint64_t lead_ns;              /* their median (the newest one before there are five) */
+    int      grace, frames, misses, calm, decay_frames, since_back;
+    uint32_t misses_all, raised, lowered, frames_all;
+} pc_link;
+
+void pc_link_init(pc_link *l, uint64_t phase_ns, uint64_t guard_ns);
+/* The phase's ceiling for the period: a frame must still have most of a
+ * refresh between its vblank and the one before. */
+uint64_t pc_link_phase_max(const pc_link *l);
+/* A callback: the refresh it names is on the glass at tpt_ns; its work
+ * must be committed by tt_ns. prev_empty: the refresh before went without a
+ * new frame. Returns the point on the display's grid to report to the
+ * vblank's lock (tt - phase), *period_ns the link's period (0 not known
+ * yet: the median of at least five steps). */
+uint64_t pc_link_tick(pc_link *l, uint64_t tt_ns, uint64_t tpt_ns, int prev_empty,
+                      uint64_t *period_ns);
+/* The link's rate changed (60 <-> 120: High refresh switched, the window on
+ * another display): the steps and leads learned are of the old rate, so they
+ * go, and no period is reported until five new steps agree (the kernel's
+ * lock is told to relearn by the presenter, xbox_VblankDisplayRelearn). The
+ * grace starts anew: frames are off the new grid until the lock has it. */
+void pc_link_reset(pc_link *l);
+/* The link's own commit deadline (targetTimestamp) is two refreshes of the
+ * display before the refresh it names, whatever the link's rate (measured,
+ * latency 1): 16.67 ms on a 120 Hz display at a link of 60 and of 120, 33.4
+ * ms on a 60 Hz display, where that is 37 ms from vblank to glass against
+ * 21.7 for presents aimed with a time. A slack takes the deadline later than
+ * the link's: the vblank, the take-until and the stale rule all move with it
+ * (pc_link_deadline), never closer than PC_LINK_SLACK_ROOM_NS to the refresh
+ * named. */
+#define PC_LINK_SLACK_ROOM_NS 2000000ull
+/* The slack by default (PC_LINK_SLACK_AUTO): the link's lead (deadline to
+ * glass, the median of its last callbacks) less PC_LINK_COMMIT_MIN_NS, none
+ * when the lead is no more than that. It is keyed to the room the link
+ * leaves, not to its rate (the Fable review of BO-236): on a 120 Hz display
+ * the lead is 16.67 ms at a link of 60 as at 120, so there is no slack and
+ * a frame is committed about 18 ms before the glass (take-until: deadline
+ * less the guard), as measured good (20.7 ms vblank to glass, 0.00 %
+ * uneven); on a 60 Hz display the lead is 33.4 ms and the slack about 16.4,
+ * the same 18 ms commit-to-glass and about 21 ms vblank to glass (37 with
+ * the link's own deadline). About one 60 Hz refresh, a little over 16.67 so
+ * a 120 Hz display's lead never yields a sliver of slack. */
+#define PC_LINK_COMMIT_MIN_NS 17000000ull
+#define PC_LINK_SLACK_AUTO    UINT64_MAX
+/* slack_ns: a fixed slack (RECOMP_PRESENT_LINK_SLACK), or PC_LINK_SLACK_AUTO
+ * (the default after pc_link_init). */
+void pc_link_set_slack(pc_link *l, uint64_t slack_ns);
+/* The deadline used for the refresh named last: tt + the slack it allowed. */
+uint64_t pc_link_deadline(const pc_link *l);
+/* The newest frame may be taken until this time for the refresh of tt_ns. */
+uint64_t pc_link_take_until(const pc_link *l, uint64_t tt_ns);
+/* A frame of emulated vblank vblank_ns is stale for the refresh named last:
+ * it was in time for the one before (its vblank before that refresh's
+ * take-until). Presented now it would sit a refresh behind its vblank, and
+ * so would every frame after it, each one taking the refresh the next was
+ * meant for (seen at 120 Hz: 29 ms vblank to glass for minutes instead of
+ * 20.7). The presenter waits for the newer frame instead, until the
+ * take-until, and drops the stale one: one frame for the refresh of latency. */
+int pc_link_stale(const pc_link *l, uint64_t vblank_ns);
+/* A new frame of emulated vblank vblank_ns goes into the refresh named last
+ * (pc_link_tick), or was dropped as stale for it (a newer one came in time).
+ * A miss: the frame is stale (its vblank was in time for the refresh before,
+ * pc_link_stale), and either the refresh before went without a new frame or
+ * the vblank follows the link (locked: the kernel's lock is on its grid).
+ * The second counts the steady "one refresh behind" state (every frame a
+ * little after its take-until, each shown a refresh late while every
+ * refresh still gets one), which moving the vblank earlier is for. While
+ * the lock is still settling a stale frame says nothing about the phase and
+ * is not counted unless its refresh went empty. Returns 1 when the phase was
+ * raised, -1 when a raise was taken back. *missed: this frame missed. */
+int pc_link_frame(pc_link *l, uint64_t vblank_ns, int locked, int *missed);
 
 /* ── the statistics ── */
 

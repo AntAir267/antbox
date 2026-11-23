@@ -52,7 +52,7 @@ def test_a_recorded_site_is_guarded_with_the_generic_path_as_fallback():
     # block the post-pass opens for it must be closed: the first build of
     # this spelling failed on "function definition is not allowed here"
     # because the closing brace was keyed on the old macro name.
-    assert "_icall_esp = g_esp" in c, c
+    assert "_icall_esp = esp" in c, c
     assert c.count("{") == c.count("}"), c
 
 
@@ -61,7 +61,7 @@ def test_an_unrecorded_site_names_itself_and_nothing_else():
     c = FunctionTranslator(img, db).translate_function(BASE, db[BASE])
     assert f"RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, 0x{SITE:08X}u)" in c, c
     assert "RECOMP_ICALL_GUARD_HIT" not in c, c
-    assert "_icall_esp = g_esp" in c, c
+    assert "_icall_esp = esp" in c, c
     assert c.count("{") == c.count("}"), c
 
 

@@ -343,9 +343,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL boot_vkCreateDevice(
                                       : VK_ERROR_INITIALIZATION_FAILED;
     if (r != VK_SUCCESS || !xr_vkGetDeviceProcAddr)
         return r;
+    /* Every device-level command from the device itself (BO-282.7, G1):
+     * what the instance handed out for them are the loader's trampolines,
+     * which look the device's dispatch table up again at every call. WPR on
+     * Windows (AMD, the driver store's loader, RTSS/OBS/Sunshine implicit
+     * layers present) put that at ~0.33 ms of the render thread a picture.
+     * The device answers NULL for instance-level names, which keep theirs. */
 #define XR_VK_FILL(name) \
-    if (!xr_##name) \
-        xr_##name = (PFN_##name)xr_vkGetDeviceProcAddr(*device, #name);
+    { \
+        PFN_vkVoidFunction p_ = xr_vkGetDeviceProcAddr(*device, #name); \
+        if (p_) \
+            xr_##name = (PFN_##name)p_; \
+    }
     XR_VK_FUNCS(XR_VK_FILL)
 #undef XR_VK_FILL
     if (!xr_vkCmdBeginRenderingKHR) xr_vkCmdBeginRenderingKHR = xr_vkCmdBeginRendering;

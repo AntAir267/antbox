@@ -95,7 +95,7 @@ def test_direct_manual_call_saves_esp_before_argument_pushes():
     ]
 
     fixed = _fixup_icall_esp_save(lines)
-    save = next(i for i, line in enumerate(fixed) if "_icall_esp = g_esp" in line)
+    save = next(i for i, line in enumerate(fixed) if "_icall_esp = esp" in line)
     argument = next(i for i, line in enumerate(fixed) if line.strip() == "PUSH32(esp, ecx);")
 
     assert save < argument

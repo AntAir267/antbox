@@ -25,11 +25,17 @@ set(KERNEL_SOURCES
     xbox_autoplay.c
     kernel_frametime.c
     kernel_xbox.c
+    xnet_hle.c
+    xnet_route.c
+    xnet_netsim.c
+    xnet_lobby.c
+    xnet_upnp.c
     kernel_ob.c
     kernel_io.c
     kernel_crypto.c
     kernel_console_keys.c
     kernel_save_import.c
+    kernel_ps2save.c
     kernel_thunks.c
     kernel_bridge.c
     xbox_gamma.c
@@ -42,14 +48,49 @@ set(KERNEL_SOURCES
     nv2a_pb_exec.c
     nv2a_backend_common.c
     nv2a_texrep.c
+    nv2a_texpack.c
+    nv2a_texpack_img.c
     nv2a_texscale.c
     nv2a_texscale_store.c
     nv2a_texup.c
+    nv2a_filmup.c
     nv2a_vsh_cpu.c
+    nv2a_wide_lines.c
     nv2a_combiner.c
 )
 
+# miniupnpc (BSD 3-Clause, third_party/miniupnpc): xnet_upnp.c opens the
+# online race port on the router.
+set(MINIUPNPC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/miniupnpc)
+foreach(f addr_is_reserved connecthostport igd_desc_parse minisoap minissdpc miniupnpc
+          miniwget minixml portlistingparse receivedata upnpcommands upnpdev upnperrors upnpreplyparse)
+    list(APPEND KERNEL_SOURCES ${MINIUPNPC_DIR}/src/${f}.c)
+endforeach()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+target_compile_definitions(xbox_kernel PRIVATE MINIUPNP_STATICLIB)
+target_include_directories(xbox_kernel PRIVATE ${MINIUPNPC_DIR}/include ${MINIUPNPC_DIR}/src)
+
+# The client's lobby additions (xnet_lobby.c): ctest xnet_lobby.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_lobby
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_lobby)
+
+# The online peers' address choice (xnet_route.c): ctest xnet_route.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_route
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_route)
+
+# The debug switch's delay, jitter and loss (xnet_netsim.c): ctest xnet_netsim.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_netsim
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_netsim)
+
+# The title's sockets against a stand-in lobby (xnet_hle.c, POSIX): ctest xnet_hle.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/xnet_hle
+                 ${CMAKE_CURRENT_BINARY_DIR}/xnet_hle)
+
+# xnet_hle.c: the title's XNet sockets are host sockets (opt-in online play).
+if(WIN32)
+    target_link_libraries(xbox_kernel PUBLIC ws2_32 iphlpapi)
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

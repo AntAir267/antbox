@@ -111,6 +111,11 @@ int nv2a_texrep_variant(void)
     return atomic_load_explicit(&s_variant, memory_order_relaxed);
 }
 
+void nv2a_texrep_refresh(void)
+{
+    gen_next();
+}
+
 uint32_t nv2a_texrep_generation(void)
 {
     return atomic_load_explicit(&s_gen, memory_order_relaxed);
@@ -531,85 +536,6 @@ const struct nv2a_texrep_hdr_gain *nv2a_texrep_hdr_gain(const uint8_t *guest, ui
     return NULL;
 }
 
-/* ── the dump ─────────────────────────────────────────────────────────── */
-
-#define DUMP_SEEN 4096
-static uint64_t s_seen[DUMP_SEEN];
-static unsigned s_n_seen;
-
-static void tga_write(const char *path, uint32_t w, uint32_t h, const uint32_t *texels)
-{
-    uint8_t hdr[18] = { 0 };
-    FILE *f = fopen(path, "wb");
-
-    if (!f)
-        return;
-    hdr[2] = 2;                        /* true colour */
-    hdr[12] = (uint8_t)w; hdr[13] = (uint8_t)(w >> 8);
-    hdr[14] = (uint8_t)h; hdr[15] = (uint8_t)(h >> 8);
-    hdr[16] = 32;
-    hdr[17] = 0x28;                    /* top-left origin, 8 alpha bits */
-    fwrite(hdr, 1, sizeof hdr, f);
-    fwrite(texels, 4, (size_t)w * h, f);   /* A8R8G8B8 words: B G R A bytes */
-    fclose(f);
-}
-
-static void dump(uint64_t hash, uint32_t color, uint32_t w, uint32_t h, uint32_t levels,
-                 const uint32_t *texels)
-{
-    static const char *dir;
-    static int init, mips;
-    char path[1200];
-    unsigned i;
-    uint32_t l;
-    FILE *f;
-
-    if (!init) {
-        init = 1;
-        dir = recomp_env(RENV_TEXREP_DUMP);
-        if (dir && !*dir)
-            dir = NULL;
-        mips = recomp_env(RENV_TEXREP_DUMP_MIPS) != NULL;
-        if (dir)
-            fprintf(stderr, LOGP "dumping every uploaded texture to %s\n", dir);
-    }
-    if (!dir || !hash || w > 4096 || h > 4096)
-        return;
-    for (i = 0; i < s_n_seen; i++)
-        if (s_seen[i] == hash)
-            return;
-    if (s_n_seen < DUMP_SEEN)
-        s_seen[s_n_seen++] = hash;
-    snprintf(path, sizeof path, "%s/%016llx_%ux%u_f%02x.tga", dir,
-             (unsigned long long)hash, w, h, color & 0xFFu);
-    tga_write(path, w, h, texels);
-    /* texrep_dump_mips: the title's own levels below it too, as decoded
-     * (BO-171 compares them with levels made from level 0). */
-    for (l = 1; mips && l < levels; l++) {
-        texels += (size_t)nv2a_tex_level_dim(w, l - 1) * nv2a_tex_level_dim(h, l - 1);
-        snprintf(path, sizeof path, "%s/%016llx_%ux%u_f%02x_m%u.tga", dir,
-                 (unsigned long long)hash, w, h, color & 0xFFu, l);
-        tga_write(path, nv2a_tex_level_dim(w, l), nv2a_tex_level_dim(h, l), texels);
-    }
-    snprintf(path, sizeof path, "%s/index.tsv", dir);
-    f = fopen(path, "ab");
-    if (f) {
-        fprintf(f, "%016llx\t%u\t%u\t0x%02x\n", (unsigned long long)hash, w, h,
-                color & 0xFFu);
-        fclose(f);
-    }
-}
-
-static int dump_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *d = recomp_env(RENV_TEXREP_DUMP);
-        on = d && *d;
-    }
-    return on;
-}
-
 /* ── apply ────────────────────────────────────────────────────────────── */
 
 static uint32_t box4(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
@@ -690,12 +616,10 @@ uint32_t nv2a_texrep_apply(const uint8_t *guest, uint32_t color, uint32_t w,
     for (i = 0; i < hn; i++)
         if (s_ht[i].color == color && s_ht[i].width == w && s_ht[i].height == h)
             cand = 1;
-    if (!cand && !dump_on())
+    if (!cand)
         return 0;
     hash = nv2a_texrep_hash(guest, color, w, h, pitch);
-    if (dump_on())
-        dump(hash, color, w, h, levels, texels);
-    if (!cand || !hash)
+    if (!hash)
         return 0;
     atomic_fetch_add_explicit(&s_hashed, 1, memory_order_relaxed);
     for (i = 0; i < n && !t; i++)

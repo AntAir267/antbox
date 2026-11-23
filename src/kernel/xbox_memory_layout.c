@@ -2208,7 +2208,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) =
-            GetTickCount() + (uint32_t)(xbox_GuestSkewNs() / 1000000u);
+            xbox_GuestTickCount() + (uint32_t)(xbox_GuestSkewNs() / 1000000u);
 
         /* Sleep, don't yield. Sleep(0) is sched_yield on macOS and under
          * Wine, and it returns at once when a core is free, so this loop
@@ -2232,6 +2232,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             volatile uint32_t *kr =
                 (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
             uint32_t put0 = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            /* BO-282.7: with the frame-time trace on, this wait's time split
+             * by whether a guest thread sat in xbox_SpinWait meanwhile. */
+            const int idle_split = xbox_FrametimeOn();
+            uint64_t idle_prev = t0;
             (void)put0;
             for (;;) {
                 uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -2246,6 +2250,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *kr &= ~NV2A_KICK_BIT;
                     kick_cleared(now);
                     last_active = now;
+                }
+                /* BO-282.7: whose turn the wait is (the frame-time trace's
+                 * idle split; a few loads and an add). */
+                if (idle_split) {
+                    if (now > idle_prev)
+                        xbox_IdleSplitAdd(now - idle_prev, g_xbox_spin_waiters > 0,
+                                          g_xbox_spin_wait_va);
+                    idle_prev = now;
                 }
                 if (now - t0 >= 1000000ull)
                     break;
@@ -3391,12 +3403,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * otherwise run to 0xE8000000 and hold 0x80000000 against it. */
         if (g_span_size > XBOX_CONTIG_BASE)
             g_span_size = XBOX_CONTIG_BASE;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
         {
             /* The whole 4 GB guest window, held as a placeholder that the
              * fixed views replace (win32_compat.c, xbox_compat_guest_window):
              * a Vulkan device made before this (a windowed native build) had
-             * mapped at base + 2 GB, where the contiguous window goes. */
+             * mapped at base + 2 GB, where the contiguous window goes; on
+             * macOS the Metal presenter's fullscreen 4K drawables once sat at
+             * base + 0xFD000000, where the NV2A aperture goes (BO-236). */
             extern void xbox_compat_guest_window(void *lo, size_t size);
             const size_t win = (size_t)1 << 32;
             g_span_base = VirtualAlloc(NULL, win, MEM_RESERVE, PAGE_NOACCESS);
@@ -3552,6 +3566,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
+        /* The utility drive's cluster size lives in the init flags; the
+         * file layer reports it for the cache partitions. */
+        if (xbe_size >= 0x128)
+            xbox_file_set_init_flags(*(const DWORD *)(xbe + 0x0124));
     }
 
     /*
@@ -4617,8 +4635,8 @@ uint32_t xbox_AllocThreadTib(void)
 {
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
-    const uint32_t tib_size = 0x40;
-    uint32_t tib, block, thread_data, total;
+    const uint32_t tib_size = XBOX_TIB_SIZE;
+    uint32_t tib, block, thread_data, total, obj;
 
     if (!g_tls_total)
         return 0;                    /* image has no TLS; nothing to copy */
@@ -4631,14 +4649,44 @@ uint32_t xbox_AllocThreadTib(void)
     thread_data = block + total;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
-     * in are inherited, then the two that must not be. */
-    memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
+     * in are inherited, then the ones that must not be. Only the first 0x40
+     * bytes: the KPRCB fields past them -- DpcRoutineActive at fs:[0x58] --
+     * start at zero. At 0x40 bytes the TLS template began right there, and
+     * fs:[0x58] on every thread but the main one read template bytes: D3D
+     * and DirectSound branch on it. */
+    memset(TIB_VA(tib), 0, tib_size);
+    memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), 0x40);
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+    *(uint32_t *)TIB_VA(tib + 0x18) = tib;           /* NtTib.Self       */
+    /* KPCR.Irql: the new thread is at PASSIVE (g_current_irql starts at 0),
+     * not at whatever the main thread was raised to when this was copied;
+     * the byte is otherwise only written at this thread's first change. */
+    *(uint8_t  *)TIB_VA(tib + 0x24) = 0;
+
+    /* fs:[0x28] names the calling thread's own KTHREAD stand-in: a spawned
+     * guest thread's object, or a fresh one for a host thread that runs
+     * guest code (the timer/DPC thread, the APU frame thread, the OHCI
+     * thread). Copying the main thread's made every DPC and ISR "the main
+     * thread" to XAPI's GetCurrentThreadId ([fs:[0x28]+0x12C]) and to any
+     * owner check a title's own lock makes, and aliased the main thread's
+     * TLS through KTHREAD.TlsData ([fs:[0x28]+0x28]). TlsData is this
+     * thread's own block, the dword [fs:[4] + index*4] also reaches; a
+     * spawned thread's startup may move it (bridge_layout_tls). */
+    obj = xbox_ThreadObjectForTib();
+    if (obj) {
+        *(uint32_t *)TIB_VA(tib + 0x28) = obj;
+        if (!*(uint32_t *)TIB_VA(obj + 0x28))
+            *(uint32_t *)TIB_VA(obj + 0x28) = block;
+    } else {
+        fprintf(stderr, "  [KERNEL] no thread object for a new TIB: this"
+                        " thread shares the main thread's identity\n");
+        fflush(stderr);
+    }
 
     return tib;
     #undef TIB_VA
@@ -4997,6 +5045,50 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va)
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable.
  * Never decreases, so a freed-and-reused texture stays addressable. */
+/* A heap page's physical number in the first RAM mirror (upstream 80d40d9).
+ *
+ * MmGetPhysicalAddress used to return the identity for RAM, and the
+ * contiguous window hands out the same numbers below 64 MB, so one physical
+ * number could mean two pages. The per-page record (kernel_memory.c,
+ * g_phys_owner) answers for whichever form was translated last, which a
+ * device then reads; when a heap block and a live window buffer sit on the
+ * same numbers, one of them reads the other's bytes. Upstream's Def Jam: Fight
+ * for NY crackled that way (a music stream in the window, a named heap page
+ * over its numbers); MA2's logs carry the same collision ("[MM] physical page
+ * 0x018xxxxx translated from 0x818xxxxx, earlier from 0x018xxxxx").
+ *
+ * So a heap page below 64 MB is named va + the RAM size, where the first
+ * mirror shows the same bytes and the console's memory controller wraps such
+ * an address back onto the page. The window keeps every number below 64 MB to
+ * itself. Each device reads the right copy: the APU and the OHCI fold the
+ * alias back (mcpx_apu_phys, bus_resolve), and the NV2A executor, finding it
+ * above the window's high-water mark, reads it as a guest address in the
+ * mirror, which is mapped there. With no first mirror (a map too large for
+ * one) or RECOMP_PHYS_RAM_ALIAS=0 the name is the identity, as before. */
+uint32_t xbox_PhysRamAlias(void)
+{
+    static int alias = -1;
+    if (alias < 0) {
+        const char *e = recomp_env(RENV_PHYS_RAM_ALIAS);
+        alias = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        if (alias)
+            fprintf(stderr, "  Physical names: heap pages below 64 MB alias"
+                            " into the first RAM mirror\n");
+    }
+    return alias && g_mirror_views[0] && g_memory_size >= XBOX_CONTIG_SIZE &&
+           g_memory_size <= 2u * XBOX_CONTIG_SIZE ? (uint32_t)g_memory_size : 0;
+}
+
+uint32_t xbox_PhysRamName(uint32_t va)
+{
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        uint32_t alias = xbox_PhysRamAlias();
+        if (alias)
+            return va + alias;
+    }
+    return va;
+}
+
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_high;
@@ -5022,6 +5114,38 @@ uint32_t xbox_ContiguousInUseBytes(void)
     return g_contig_pages_in_use * CONTIG_PAGE;
 }
 
+
+/* Shrink block i to `keep` bytes and record what follows it as a free block
+ * of its own, in the next slot: an empty slot there (a neighbour merged away)
+ * is reused, else the table above moves up one. The remainder merges with a
+ * free block right after it. Index order stays address order, which the
+ * coalescing in heap_free_unlocked relies on. A full table leaves block i
+ * whole. Caller holds the heap lock. */
+static void heap_split_after(int i, uint32_t keep)
+{
+    uint32_t rest_addr = g_heap_blocks[i].addr + keep;
+    uint32_t rest = g_heap_blocks[i].size - keep;
+    int j = i + 1;
+
+    if (j < g_heap_block_count && g_heap_blocks[j].free && g_heap_blocks[j].size
+            && g_heap_blocks[j].addr == rest_addr + rest) {
+        g_heap_blocks[j].addr = rest_addr;           /* grow the free neighbour down */
+        g_heap_blocks[j].size += rest;
+        g_heap_blocks[i].size = keep;
+        return;
+    }
+    if (!(j < g_heap_block_count && g_heap_blocks[j].free && !g_heap_blocks[j].size)) {
+        if (g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS)
+            return;
+        memmove(&g_heap_blocks[j + 1], &g_heap_blocks[j],
+                (size_t)(g_heap_block_count - j) * sizeof g_heap_blocks[0]);
+        g_heap_block_count++;
+    }
+    g_heap_blocks[j].addr = rest_addr;
+    g_heap_blocks[j].size = rest;
+    g_heap_blocks[j].free = 1;
+    g_heap_blocks[i].size = keep;
+}
 
 static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
 {
@@ -5051,6 +5175,32 @@ static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
         }
         g_heap_blocks[i].free = 0;
         result = g_heap_blocks[i].addr;
+        /* A freed block far bigger than the request is split, not handed out
+         * whole (upstream 9d65200). Kung Fu Chaos frees a level's 6.8 MB
+         * buffers when it leaves a match load with B; the next small requests
+         * each took one of them whole, and reloading the menu then found no
+         * room for its own 6.8 MB buffer: malloc returned 0 and the game
+         * crashed. Small slack keeps the old behaviour, so most reuse is
+         * unchanged.
+         *
+         * Opt-in here (RECOMP_HEAP_SPLIT=1), unlike upstream: with it on,
+         * Wreckless's attract demo dies at flip ~880 on a divide by zero in
+         * DSOUND (sub_0012C86C, `div esi` with esi = [this+0x64], 0), just
+         * after loading data/car01/car.mps, every run; off, it plays on
+         * (2026-11-23). The split leaves the rest of a reused block as a
+         * free block of its own, and the next allocation there is zeroed;
+         * handed out whole, those bytes kept what they held. Why DSOUND
+         * reads them is not known yet [guess: stale memory it still uses]. */
+        {
+            static int split = -1;
+            uint32_t want = (size + 15u) & ~15u;
+            if (split < 0) {
+                const char *e = recomp_env(RENV_HEAP_SPLIT);
+                split = e && e[0] == '1';
+            }
+            if (split && g_heap_blocks[i].size - want >= 0x10000u)
+                heap_split_after(i, want);
+        }
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
         return result;
     }

@@ -2,6 +2,9 @@
  * nv2a_pcache.c - the on-disk pipeline-key list; see nv2a_pcache.h.
  */
 #include "nv2a_pcache.h"
+#if defined(_WIN32) || defined(__linux__)
+#include "platform/recomp_exe_dir.h"
+#endif
 
 #include <errno.h>
 #include <stdio.h>
@@ -358,12 +361,22 @@ int nv2a_pcache_dir(const char *dir, const char *app, char *out, size_t n)
             return 0;
         w = snprintf(out, n, "%s/Library/Caches/%s", home, app);
 #elif defined(_WIN32)
+        char portable[1024];
         const char *la = getenv("LOCALAPPDATA");
-        if (!la)
+        if (recomp_portable_root(portable, sizeof portable))
+            w = snprintf(out, n, "%s/cache", portable);   /* portable mode (recomp_exe_dir.h) */
+        else if (!la)
             return 0;
-        w = snprintf(out, n, "%s\\%s\\cache", la, app);
+        else
+            w = snprintf(out, n, "%s\\%s\\cache", la, app);
 #else
         const char *xdg = getenv("XDG_CACHE_HOME");
+#if defined(__linux__) && !defined(__ANDROID__)
+        char portable[1024];
+        if (recomp_portable_root(portable, sizeof portable))
+            w = snprintf(out, n, "%s/cache", portable);   /* portable mode (recomp_exe_dir.h) */
+        else
+#endif
         if (xdg && *xdg)
             w = snprintf(out, n, "%s/%s", xdg, app);
         else if (home)

@@ -81,7 +81,7 @@ void xr_log_announce(void)
     if (g_xr_log_diag)
         XR_NOTICE("[LOG] diagnostic logging is on (%s)\n", s_source);
     else
-        XR_NOTICE("[LOG] diagnostic logging is off: errors and the start-up facts only (%s)."
-                  " Advanced > Diagnostic logging in the overlay, or RECOMP_LOG_DIAG=1,"
+        XR_NOTICE("[LOG] diagnostic logging is off: errors, the start-up facts and a few online lines (%s)."
+                  " System > Diagnostic logging in the overlay, or RECOMP_LOG_DIAG=1,"
                   " writes the full log\n", s_source);
 }

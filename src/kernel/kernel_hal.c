@@ -15,6 +15,7 @@
 #include "recomp_exit_hook.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
+#include "kernel_wake.h"
 #include "recomp_env.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include "xbox_crash.h"
@@ -290,14 +291,18 @@ void xbox_DispatchGateEnter(void)
 
 static void irq_release_point(void);
 
+static void wake_release_point(void);
+
 /* The release is a safe point: what was posted while this thread held the
  * gate runs here, before anyone else can take it. */
 void xbox_DispatchGateLeave(void)
 {
     xbox_IrqSafePoint();
     gate_leave_raw();
-    if (t_gate_depth == 0)
+    if (t_gate_depth == 0) {
         irq_release_point();
+        wake_release_point();
+    }
 }
 
 /* ============================================================================
@@ -331,6 +336,15 @@ volatile int g_xbox_irq_pending;
 static void (*volatile s_irq_run[XBOX_IRQ_LINES])(void);
 static uint64_t s_irq_post_ns[XBOX_IRQ_LINES]; /* when the bit went up */
 static XBOX_THREAD_LOCAL int t_in_isr;
+
+/* Below DISPATCH_LEVEL with the gate let go: a woken guest thread of higher
+ * priority that this one signalled while raised runs first now
+ * (kernel_wake.c), as it would at the lower on the console. */
+static void wake_release_point(void)
+{
+    if (!t_gate_depth && !t_in_isr && g_current_irql < DISPATCH_LEVEL)
+        xbox_WakeIrqlLowered();
+}
 static void (*s_irq_post_hook)(int line);
 static void (*s_irq_release_hook)(void);   /* tests: the lower's window */
 static int s_irq_mode = -1;                    /* irq_safe_points */
@@ -636,6 +650,7 @@ static void irql_release_due(void)
 {
     t_release_due = 0;
     irq_release_point();
+    wake_release_point();
 }
 
 /* The holder has reached no safe point for irq_safe_ms with something
@@ -986,10 +1001,48 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 
 volatile ULONG xbox_KeTickCount = 0;
 
+/* RECOMP_DEBUG=detseed=1, a test switch: the guest's clocks start from fixed
+ * values when the process starts, instead of the host's (its uptime, its
+ * wall clock), so two runs of a scripted scene boot on the same numbers and
+ * anything a title seeds from them is the same in both. Each clock still
+ * advances in real time from there. Off unless set. */
+#define DETSEED_TICK0     100000u                  /* KeTickCount, ms */
+#define DETSEED_FILETIME0 127391328000000000ll     /* 2004-09-08 00:00 UTC, 100 ns since 1601 */
+
+int xbox_DetSeed(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = recomp_env_on(RENV_DETSEED);
+        if (on)
+            fprintf(stderr, "[DETSEED] on: the guest's clocks start from fixed values\n");
+    }
+    return on;
+}
+
+/* Host ns since the first clock the guest read, with detseed. */
+static uint64_t detseed_elapsed_ns(void)
+{
+    static volatile uint64_t origin;
+    uint64_t now = xbox_HostNowNs();
+    if (!origin)
+        __sync_val_compare_and_swap(&origin, 0, now);
+    return now - origin;
+}
+
+/* KeTickCount as the guest sees it: the host's GetTickCount, or with
+ * detseed DETSEED_TICK0 plus the ms since the process started. */
+uint32_t xbox_GuestTickCount(void)
+{
+    if (xbox_DetSeed())
+        return DETSEED_TICK0 + (uint32_t)(detseed_elapsed_ns() / 1000000u);
+    return GetTickCount();
+}
+
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = xbox_GuestTickCount();
 }
 
 /* ============================================================================
@@ -1004,6 +1057,13 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
     LARGE_INTEGER counter;
     uint64_t skew = xbox_GuestSkewNs();     /* the guest's clock (host_time.h) */
     QueryPerformanceCounter(&counter);
+    if (xbox_DetSeed()) {
+        LARGE_INTEGER freq;
+        uint64_t e = detseed_elapsed_ns();
+        QueryPerformanceFrequency(&freq);
+        counter.QuadPart = (LONGLONG)(e / 1000000000ull) * freq.QuadPart
+            + (LONGLONG)(e % 1000000000ull) * freq.QuadPart / 1000000000ll;
+    }
     if (skew) {
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
@@ -1042,6 +1102,8 @@ static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx
     QueryPerformanceCounter(&now);
     s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
     s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    if (xbox_DetSeed())
+        s_time_anchor_100ns = DETSEED_FILETIME0;
     s_time_anchor_counts = now.QuadPart;
     return TRUE;
 }
@@ -1741,6 +1803,8 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
      * scale by 10,000. Resolution is coarser than the real kernel's, but it is
      * monotonic, which is the property callers actually depend on.
      */
+    if (xbox_DetSeed())
+        return detseed_elapsed_ns() / 100u + xbox_GuestSkewNs() / 100u;
     return (ULONGLONG)GetTickCount64() * 10000ULL + xbox_GuestSkewNs() / 100u;
 }
 

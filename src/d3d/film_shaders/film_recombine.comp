@@ -1,0 +1,27 @@
+// A film frame's 2x colour from its 2x luma (BO-136, Cheap; own code, MIT):
+// the bilinear 2x of the (deblocked) frame, moved by the filter's luma minus
+// its own (BT.709), as the texture upscaler's recombine does; alpha the
+// frame's, nearest. source: the frame (binding 0), luma2x (binding 1) the
+// 2x luma; size: the frame's.
+#include "common.glsl"
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D luma2x;
+layout(set = 0, binding = 4, rgba8) writeonly uniform image2D destination;
+
+vec4 src(ivec2 p) { return texelFetch(source, edge(p, pc.size), 0); }
+
+void main()
+{
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(q, pc.size * 2)))
+        return;
+    float ym = imageLoad(luma2x, q).x;
+    vec2 f = (vec2(q) + 0.5) * 0.5 - 0.5;
+    ivec2 i0 = ivec2(floor(f));
+    vec2 t = f - vec2(i0);
+    vec3 rgb = mix(mix(src(i0).rgb, src(i0 + ivec2(1, 0)).rgb, t.x),
+                   mix(src(i0 + ivec2(0, 1)).rgb, src(i0 + ivec2(1, 1)).rgb, t.x), t.y);
+    float yb = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    rgb = clamp(rgb + (clamp(ym, 0.0, 1.0) - yb), 0.0, 1.0);
+    imageStore(destination, q, vec4(rgb, src(q >> 1).a));
+}

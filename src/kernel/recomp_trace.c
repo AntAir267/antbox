@@ -270,3 +270,21 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
         fputc('\n', stderr);
     fflush(stderr);
 }
+
+/* --reg-verify (tools/recomp, _localize_registers): a write-back skipped a
+ * register whose local should still have equalled its global, and it did
+ * not. Each one is a hole in the translator's write analysis, so the first
+ * ones are said with the function and line of the generated C; the total
+ * goes on counting. */
+void recomp_regs_mismatch(const char *reg, const char *func, int line,
+                          uint32_t local, uint32_t global)
+{
+    static long count;              /* a diagnostic: a lost count is fine */
+    long n = ++count;
+    if (n <= 32 || (n & (n - 1)) == 0) {
+        fprintf(stderr, "[REGS] mismatch %ld: %s in %s (generated line %d): local 0x%08X,"
+                        " global 0x%08X\n", n, reg, func, line,
+                (unsigned)local, (unsigned)global);
+        fflush(stderr);
+    }
+}

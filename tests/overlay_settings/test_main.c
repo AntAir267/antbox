@@ -82,6 +82,10 @@ void nv2a_texup_set_scale(unsigned s) { st_texup_scale = s; }
 void nv2a_texup_set_roads(int on) { st_texup_roads = on; }
 static int st_texup_preload = -1;
 void nv2a_texup_set_preload(int on) { st_texup_preload = on; }
+/* BO-136: graphics.film_upscale; the stub's machine default is Best. */
+static int st_filmup = -1;
+void nv2a_filmup_set_mode(int m) { st_filmup = m; }
+int  nv2a_filmup_default(void) { return 2; }
 #if !defined(_WIN32)
 /* The file writer's one-at-a-time flag (src/platform/win32_compat.c). */
 int32_t InterlockedExchange(volatile int32_t *p, int32_t v)
@@ -145,8 +149,9 @@ static void test_restart_flags(void)
     for (i = 0; i < XS_COUNT; i++) {
         const xs_setting *s = xbox_SettingGet((xs_id)i);
         int want = i == XS_DISPLAY_ASPECT || i == XS_GRAPHICS_RENDER_SCALE || i == XS_AUDIO_SPEAKERS
-                   || i == XS_GRAPHICS_SOFTBODY || i == XS_GAME_LANGUAGE || i == XS_GRAPHICS_RENDERER
-                   || (xbox_SettingsTitleOf((xs_id)i) && xbox_SettingsTitleOf((xs_id)i)->restart);
+                || i == XS_GAME_LANGUAGE || i == XS_GRAPHICS_SOFTBODY || i == XS_ONLINE_MODE
+                || i == XS_ONLINE_REACTIONS || i == XS_GRAPHICS_RENDERER
+                || (xbox_SettingsTitleOf((xs_id)i) && xbox_SettingsTitleOf((xs_id)i)->restart);
 #if defined(__ANDROID__)
         want = want || i == XS_INPUT_VIBRATION;
 #endif
@@ -162,6 +167,102 @@ static void test_restart_flags(void)
 /* Every setting has its row in the table: the table is indexed by the
  * enum (designated), so a setting added to the enum without one would be a
  * row of zeros. Each key once. */
+/* BO-327: the overlay's pages were rearranged, and settings.toml must read
+ * as before: every key, and every choice's spelling in its order (the file
+ * stores the spelling, the overlay the index), stays as it was. A change
+ * here is a change of the file format, not of the menu. */
+static void test_keys_frozen(void)
+{
+    static const struct { xs_id id; const char *key; const char *choices; } k[] = {
+        { XS_DISPLAY_FULLSCREEN, "display.fullscreen", "" },
+        { XS_DISPLAY_ASPECT, "display.aspect", "4:3|16:9|16:10" },
+        { XS_DISPLAY_FILTER, "display.filter", "nearest|linear|integer" },
+        { XS_DISPLAY_OVERSCAN, "display.overscan", "off|crop|fill" },
+        { XS_DISPLAY_FIT, "display.fit", "letterbox|fill16x10" },
+        { XS_GRAPHICS_RENDER_SCALE, "graphics.render_scale", "" },
+        { XS_GRAPHICS_ANISO, "graphics.aniso", "off|2x|4x|8x|16x" },
+        { XS_GRAPHICS_AA, "graphics.aa", "off|fxaa|smaa" },
+        { XS_GRAPHICS_SHARPEN, "graphics.sharpen", "" },
+        { XS_AUDIO_VOLUME, "audio.volume", "" },
+        { XS_AUDIO_MUTE, "audio.mute", "" },
+        { XS_AUDIO_MUTE_BG, "audio.mute_background", "" },
+        { XS_AUDIO_SPEAKERS, "audio.speakers", "auto|stereo|5.1" },
+        { XS_AUDIO_FX_LEVEL, "audio.fx_level", "" },
+        { XS_AUDIO_MIXER, "audio.mixer", "" },
+        { XS_INPUT_DEADZONE, "input.deadzone", "" },
+        { XS_INPUT_TRIGGER_DEADZONE, "input.trigger_deadzone", "" },
+        { XS_INPUT_RUMBLE, "input.rumble", "" },
+        { XS_INPUT_FACE_LAYOUT, "input.face_layout", "xbox|nintendo" },
+        { XS_INPUT_CONTROL_SCHEME, "input.control_scheme", "xbox|ps2" },
+        { XS_POWER_MODE, "power.mode", "stock|performance|battery|auto" },
+        { XS_ADVANCED_PERF, "advanced.perf_overlay", "" },
+        { XS_GAME_SPEED_UNITS, "game.speed_units", "mph|kmh" },
+        { XS_DISPLAY_HUD_FIX, "display.hud_fix", "" },
+        { XS_DISPLAY_ULTRAWIDE, "display.ultrawide", "off|21:9|32:9|window" },
+        { XS_GRAPHICS_BLOOM, "graphics.bloom", "" },
+        { XS_GRAPHICS_MOTION_BLUR, "graphics.motion_blur", "" },
+        { XS_GRAPHICS_CRASH_60FPS, "graphics.crash_60fps", "" },
+        { XS_GRAPHICS_SPLIT_60FPS, "graphics.split_60fps", "" },
+        { XS_GRAPHICS_HIGH_REFRESH, "graphics.high_refresh", "" },
+        { XS_AUDIO_SPLIT_MUSIC, "audio.split_music", "" },
+        { XS_GRAPHICS_LOD_BIAS, "graphics.lod_bias", "off|auto|-0.5|-1|-1.5" },
+        { XS_GRAPHICS_DITHER, "graphics.dither", "" },
+        { XS_GRAPHICS_VEHICLE_DETAIL, "graphics.vehicle_detail", "original|far|farthest" },
+        { XS_GRAPHICS_SCENERY_DETAIL, "graphics.scenery_detail", "original|far" },
+        { XS_INPUT_GLYPHS, "input.glyphs", "auto|xbox|xbox_modern|playstation|playstation5|nintendo|steam|positional|keyboard" },
+        { XS_AUDIO_LFE_LOWPASS, "audio.lfe_lowpass", "off|80|100|120" },
+        { XS_DISPLAY_PRESENT_TIMING, "display.present_timing", "legacy|auto|aimed" },
+        { XS_ADVANCED_PERF_STEPS, "advanced.perf_steps", "" },
+        { XS_ADVANCED_DIAG_LOG, "advanced.diagnostic_log", "" },
+        { XS_GRAPHICS_UI_SCALE, "graphics.ui_scale", "off|2x|4x" },
+        { XS_INTERFACE_MENU_ENTRY, "interface.menu_entry", "" },
+        { XS_AUDIO_CUSTOM_LEVEL, "audio.custom_music_level", "off|quieter|match|louder" },
+        { XS_DISPLAY_SCORE_BOARD, "display.score_board", "original|smooth" },
+        { XS_DISPLAY_RIVAL_MARKER, "display.rival_marker", "original|farther" },
+        { XS_DISPLAY_CRASHNAV_MAP, "display.crashnav_map", "stretched|native" },
+        { XS_DISPLAY_PICTURES, "display.pictures", "stretch|blur|black" },
+        { XS_AUDIO_MENU_SOUNDS, "audio.menu_sounds", "" },
+        { XS_GRAPHICS_HDR, "graphics.hdr", "" },
+        { XS_GRAPHICS_HDR_PEAK, "graphics.hdr_peak", "" },
+        { XS_GRAPHICS_HDR_PAPER, "graphics.hdr_paper_white", "" },
+        { XS_GRAPHICS_HDR_HUD, "graphics.hdr_hud", "" },
+        { XS_GRAPHICS_HDR_SHADOWS, "graphics.hdr_shadows", "" },
+        { XS_GRAPHICS_HDR_HIGHLIGHTS, "graphics.hdr_highlights", "" },
+        { XS_GRAPHICS_HDR_DECODE, "graphics.hdr_decode", "2.2|srgb" },
+        { XS_DISPLAY_FRAME_PACING, "display.frame_pacing", "auto|low_latency|smooth" },
+        { XS_GRAPHICS_TEXUP, "graphics.texture_upscale", "off|fsrcnnx|nnedi3" },
+        { XS_GRAPHICS_TEXUP_SCALE, "graphics.texture_upscale_scale", "2x|4x" },
+        { XS_GRAPHICS_TEXUP_ROADS, "graphics.texup_roads", "" },
+        { XS_GRAPHICS_TEXUP_PRELOAD, "graphics.texture_upscale_preload", "" },
+        { XS_GRAPHICS_FILMUP, "graphics.film_upscale", "off|cheap|best" },
+        { XS_GAME_RACE_CLOCK, "game.race_clock", "" },
+        { XS_AUDIO_CUSTOM_AT_START, "audio.custom_music_at_start", "" },
+        { XS_ONLINE_MODE, "online.mode", "off|internet|lan" },
+        { XS_ONLINE_REACTIONS, "online.reactions", "" },
+        { XS_GAME_LANGUAGE, "game.language", "english|japanese|german|french|spanish|italian|korean|chinese|portuguese|dutch|swedish" },
+        { XS_GRAPHICS_SOFTBODY, "graphics.softbody", "" },
+        { XS_INPUT_FIRST_PAD, "input.first_pad", "player1|player2" },
+        { XS_GRAPHICS_RENDERER, "graphics.renderer", "standard|native" },
+    };
+    /* The title slots have no key of their own (test_title_settings). */
+    CHECK(sizeof k / sizeof k[0] == XS_COUNT - (XS_TITLE_LAST - XS_TITLE_0 + 1)
+#if defined(__ANDROID__)
+          - 5
+#endif
+          );
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        const xs_setting *s = xbox_SettingGet(k[i].id);
+        char got[200] = "";
+        size_t at = 0;
+        CHECK(s && s->key && !strcmp(s->key, k[i].key));
+        for (int c = 0; s && s->type == XS_CHOICE && s->choices && s->choices[c]; c++)
+            at += (size_t)snprintf(got + at, sizeof got - at, "%s%s", c ? "|" : "", s->choices[c]);
+        if (strcmp(got, k[i].choices))
+            (fprintf)(stderr, "FAIL %s: choices %s, were %s\n", k[i].key, got, k[i].choices);
+        CHECK(!strcmp(got, k[i].choices));
+    }
+}
+
 static void test_table_whole(void)
 {
     int i, j;
@@ -203,6 +304,7 @@ int main(void)
         "# a user's file\n"
         "mystery.key = 7\n"
         "[display]\n"
+        "present_timing = \"legacy\"\n"   /* BO-236: 0.2.x's, no rev: moved to auto on macOS 14+ */
         "overscan = \"crop\"\n"
         "filter = 3\n"                 /* the wrong type: ignored */
         "[audio]\n"
@@ -243,6 +345,7 @@ int main(void)
     set_env("RECOMP_GFX_SCENERY_DETAIL", NULL);
     set_env("RECOMP_GFX_RIVAL_MARKER", NULL);
     set_env("RECOMP_DISPLAY_CRASHNAV_MAP", NULL);
+    set_env("RECOMP_DISPLAY_PICTURES", NULL);
     set_env("RECOMP_GAME_RACE_CLOCK", NULL);
 
     /* A release build, nothing in the environment: quiet until the file says. */
@@ -264,6 +367,7 @@ int main(void)
     CHECK(g_xr_log_diag == 1 && !xr_log_forced() && !strcmp(xr_log_source(), "setting"));
     test_restart_flags();
     test_table_whole();
+    test_keys_frozen();
     /* A text setting: into its variable, readable, not "unknown". */
     CHECK(getenv("RECOMP_AUDIO_MUSIC_DIR")
           && !strcmp(getenv("RECOMP_AUDIO_MUSIC_DIR"), "/music/My \"Best\" \xC5\x90szi \xC5\xB1r"));
@@ -289,6 +393,24 @@ int main(void)
     /* The second [display] table was read, not refused (the whole file would
      * have been ignored): its key is the user's own. */
     CHECK(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->user && xbox_SettingValue(XS_DISPLAY_HUD_FIX) == 0);
+#if defined(__APPLE__)
+    /* BO-236: the stored legacy (0.2.x: no rev) moved to auto once, and the
+     * file was written with the rev and without the timing; legacy chosen
+     * now is kept (the rev stays in the file). */
+    CHECK(xbox_SettingValue(XS_DISPLAY_PRESENT_TIMING) == 1
+          && !xbox_SettingGet(XS_DISPLAY_PRESENT_TIMING)->user && !getenv("RECOMP_PRESENT_TIMING"));
+    CHECK(xbox_SettingsTextIsSet("display.present_timing_rev")
+          && !strcmp(xbox_SettingsText("display.present_timing_rev", NULL), "2"));
+    {
+        FILE *f = fopen(path, "rb");
+        char buf[8192];
+        size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+        if (f)
+            fclose(f);
+        buf[n] = 0;
+        CHECK(strstr(buf, "present_timing_rev = \"2\"") && !strstr(buf, "present_timing = "));
+    }
+#endif
 
     /* The host's defaults: setenv without replacing, then told. */
     setenv("RECOMP_PRESENT_OVERSCAN", "crop", 0); xbox_SettingsGameDefault("RECOMP_PRESENT_OVERSCAN", "crop");
@@ -442,6 +564,26 @@ int main(void)
         xbox_SettingReset(XS_DISPLAY_CRASHNAV_MAP);
         e = recomp_env(RENV_DISPLAY_CRASHNAV_MAP);
         CHECK(!e || !*e || !strcmp(e, "stretched"));
+    }
+    {
+        /* The 4:3 pictures with the widescreen HUD (BO-315): blurred sides
+         * by default (unset reads as blur), stretch kept when chosen, black,
+         * live, and back. */
+        const char *e = recomp_env(RENV_DISPLAY_PICTURES);
+        CHECK(xbox_SettingValue(XS_DISPLAY_PICTURES) == 1 && !xbox_SettingGet(XS_DISPLAY_PICTURES)->user);
+        CHECK(!e || !*e || !strcmp(e, "blur"));
+        CHECK(!strcmp(xbox_SettingGet(XS_DISPLAY_PICTURES)->key, "display.pictures"));
+        xbox_SettingSet(XS_DISPLAY_PICTURES, 0);
+        e = recomp_env(RENV_DISPLAY_PICTURES);
+        CHECK(e && !strcmp(e, "stretch"));
+        xbox_SettingSet(XS_DISPLAY_PICTURES, 2);
+        e = recomp_env(RENV_DISPLAY_PICTURES);
+        CHECK(e && !strcmp(e, "black"));
+        CHECK(!xbox_SettingsNeedRestart());          /* live */
+        xbox_SettingReset(XS_DISPLAY_PICTURES);
+        e = recomp_env(RENV_DISPLAY_PICTURES);
+        CHECK(xbox_SettingValue(XS_DISPLAY_PICTURES) == 1);
+        CHECK(!e || !*e || !strcmp(e, "blur"));
     }
     {
         /* The score board (a host hook, BO-165): original untouched, a
@@ -653,6 +795,16 @@ int main(void)
     CHECK(st_texup_preload == 1);
     xbox_SettingSet(XS_GRAPHICS_TEXUP, 0);
     CHECK(st_texup == 0);
+    /* BO-136: the films: the machine's default (Best here), live. */
+    CHECK(!strcmp(xbox_SettingGet(XS_GRAPHICS_FILMUP)->key, "graphics.film_upscale"));
+    CHECK(xbox_SettingValue(XS_GRAPHICS_FILMUP) == 2);
+    xbox_SettingSet(XS_GRAPHICS_FILMUP, 1);
+    CHECK(st_filmup == 1);
+    CHECK(recomp_env(RENV_GFX_FILMUP) && !strcmp(recomp_env(RENV_GFX_FILMUP), "cheap"));
+    xbox_SettingSet(XS_GRAPHICS_FILMUP, 0);
+    CHECK(st_filmup == 0);
+    xbox_SettingSet(XS_GRAPHICS_FILMUP, 2);
+    CHECK(st_filmup == 2);
     xbox_SettingSet(XS_GRAPHICS_AA, 1);
     xbox_SettingSet(XS_GRAPHICS_SHARPEN, 0.4);
     CHECK(st_aa == 1 && st_sharpen > 0.39f && st_sharpen < 0.41f);

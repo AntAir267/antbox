@@ -236,6 +236,36 @@ MIT - Super-xBR (2D art scaler)
   THE SOFTWARE.
 
 
+MIT - AMD FidelityFX Super Resolution 1 (film upscaler, BO-136)
+---------------------------------------------------------------
+
+  EASU and RCAS of AMD's FSR 1.0.2, as agyild's mpv port runs them on one
+  plane (MIT, https://gist.github.com/agyild), written here as compute
+  passes in src/d3d/film_shaders (film_easu.comp, film_rcas.comp) and
+  compiled into the program through src/d3d/nv2a_filmup_shaders.h. Used by
+  graphics.film_upscale's Cheap mode. The notice, which this file carries
+  with every binary:
+
+  Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
 Public domain - dr_libs and stb_vorbis (music decoders)
 -------------------------------------------------------
 
@@ -306,3 +336,15 @@ LGPL-3.0-or-later — texture upscaler shaders (third_party/upscale_shaders)
   compiled into any binary. Provenance, hashes, changes and how to replace
   them: third_party/upscale_shaders/NOTICE.md; licence texts:
   third_party/upscale_shaders/COPYING.LESSER and COPYING.
+  graphics.film_upscale's Best mode (BO-136) runs the same FSRCNNX files
+  on the films' frames.
+
+
+BSD-3-Clause — miniupnpc (third_party/miniupnpc)
+------------------------------------------------
+
+  miniupnpc 2.2.8, Copyright (c) 2005-2024, Thomas BERNARD
+  (https://github.com/miniupnp/miniupnp). The library's sources, unchanged,
+  with miniupnpcstrings.h written from its template. Used by
+  src/kernel/xnet_upnp.c to forward the online race port on the router.
+  Licence text: third_party/miniupnpc/LICENSE.

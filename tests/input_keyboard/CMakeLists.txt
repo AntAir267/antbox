@@ -18,3 +18,8 @@ configure_file(${INPUT_SRC}/README.md ${CMAKE_CURRENT_BINARY_DIR}/input_README.m
 enable_testing()
 add_test(NAME input_keyboard COMMAND input_keyboard_test input_README.md
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+# The keys the environment (settings.toml's input.keys) gives, from the first use.
+add_test(NAME input_keyboard_env COMMAND input_keyboard_test input_README.md env
+         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(input_keyboard_env PROPERTIES
+    ENVIRONMENT "RECOMP_KEYBOARD_KEYS=boost=Z\;look_back=Space")

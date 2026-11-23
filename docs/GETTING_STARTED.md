@@ -2,7 +2,7 @@
 
 This guide walks you through recompiling your first Xbox game, from extracting the XBE to getting the game running on Windows.
 
-> **On antbox:** this guide comes from xboxrecomp. The ports built on antbox run on Linux
+> **On AntBox:** this guide comes from xboxrecomp. The ports built on AntBox run on Linux
 > with Vulkan, not the D3D11 and OpenGL backends the table below describes. See the
 > [main README](../README.md#platforms).
 

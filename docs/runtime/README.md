@@ -30,6 +30,11 @@ See: [../technical/d3d-translation.md](../technical/d3d-translation.md)
 
 Map Xbox controller input to Windows XInput. This is usually the simplest piece — Xbox controllers on Windows are nearly 1:1.
 
+### Threads and CPUs
+
+How many host CPUs the title's threads may use at once, and the
+`guest_cpus` A/B switch: [guest-cpus.md](guest-cpus.md).
+
 ## Build System
 
 We recommend CMake with MSVC. Structure your project as static libraries:

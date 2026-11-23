@@ -21,6 +21,7 @@ add_library(xbox_apu STATIC
     apu_gp.c
     apu_dsp56k.c
     apu_oracle_cap.c
+    apu_dump.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

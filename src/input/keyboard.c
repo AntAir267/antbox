@@ -6,8 +6,9 @@
  * The whole point of a recompilation is to be able to look at the thing
  * running, and a build nobody can press a button in cannot be looked at.
  *
- * On by default (not on Android), with a fixed map; RECOMP_KEYBOARD=0 turns
- * it off, =1 on. It only ever answers for port 0, and is merged on top of a
+ * On by default (not on Android), with the map below as its defaults, which
+ * the player can change (the rebinding section of keyboard.h);
+ * RECOMP_KEYBOARD=0 turns it off, =1 on. It only ever answers for port 0, and is merged on top of a
  * pad connected there (input_core.c), so a real controller keeps working
  * beside it.
  *
@@ -57,7 +58,7 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
-/* The one map, on every host, fixed (no remapping). Driving is on the
+/* The defaults of the one map, on every host. Driving is on the
  * letters and the arrows both: W and Up the accelerator (right trigger), S
  * and Down the brake (left trigger), A D and Left Right the left stick. The
  * arrows are also the d-pad, so they move through the menus; a menu takes
@@ -86,10 +87,46 @@ const xbox_key_row xbox_key_map[] = {
 };
 const size_t xbox_key_map_count = sizeof xbox_key_map / sizeof xbox_key_map[0];
 
+/* ── the keys now (the defaults, then the player's) ─────────────────── */
+
+#define KEY_ROWS 16
+#define KEY_ACT_ROW0 4          /* xbox_key_map[4..15] are the twelve actions */
+static volatile unsigned char s_vk[KEY_ROWS][XBOX_KEY_SLOTS];
+static int s_ready;             /* 0 not yet, 1 being made, 2 made */
+
+static void keys_defaults(void)
+{
+    for (size_t i = 0; i < KEY_ROWS && i < xbox_key_map_count; i++) {
+        s_vk[i][0] = xbox_key_map[i].vk[0];
+        s_vk[i][1] = xbox_key_map[i].vk[1];
+    }
+}
+
+static void keys_ensure(void)
+{
+    int zero = 0;
+
+    if (__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE) == 2)
+        return;
+    if (__atomic_compare_exchange_n(&s_ready, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        const char *v;
+
+        keys_defaults();
+        v = recomp_env(RENV_KEYBOARD_KEYS);
+        if (v && *v)
+            xbox_InputKeyBindingsParse(v);
+        __atomic_store_n(&s_ready, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE) != 2)
+            ;
+    }
+}
+
 static int vk_mapped(int vk)
 {
-    for (size_t i = 0; i < xbox_key_map_count; i++)
-        if (xbox_key_map[i].vk[0] == vk || (xbox_key_map[i].vk[1] && xbox_key_map[i].vk[1] == vk))
+    keys_ensure();
+    for (size_t i = 0; i < xbox_key_map_count && i < KEY_ROWS; i++)
+        if (vk && (s_vk[i][0] == vk || s_vk[i][1] == vk))
             return 1;
     return 0;
 }
@@ -113,12 +150,17 @@ static int is_arrow(int vk)
     return vk == XBOX_VK_UP || vk == XBOX_VK_DOWN || vk == XBOX_VK_LEFT || vk == XBOX_VK_RIGHT;
 }
 
-static int row_held(const xbox_key_row *r)
+/* Row i's keys, a d-pad row's arrows aside under RECOMP_KEYBOARD_ARROWS=dpad. */
+static int row_held(size_t i)
 {
-    int second = r->vk[1] && !(r->kind != XBOX_KEY_BUTTON && arrows_dpad_only()
-                               && is_arrow(r->vk[1]));
-    return xbox_FramebufferKeyDown(r->vk[0])
-        || (second && xbox_FramebufferKeyDown(r->vk[1]));
+    int k, held = 0;
+    for (k = 0; k < XBOX_KEY_SLOTS && !held; k++) {
+        int vk = s_vk[i][k];
+        if (!vk || (xbox_key_map[i].kind != XBOX_KEY_BUTTON && arrows_dpad_only() && is_arrow(vk)))
+            continue;
+        held = xbox_FramebufferKeyDown(vk);
+    }
+    return held;
 }
 
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
@@ -129,9 +171,10 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
     int pos[4] = { 0, 0, 0, 0 }, neg[4] = { 0, 0, 0, 0 }, axis[4];
 
     memset(out, 0, sizeof *out);
-    for (size_t i = 0; i < xbox_key_map_count; i++) {
+    keys_ensure();
+    for (size_t i = 0; i < xbox_key_map_count && i < KEY_ROWS; i++) {
         const xbox_key_row *r = &xbox_key_map[i];
-        if (!row_held(r))
+        if (!row_held(i))
             continue;
         switch (r->kind) {
         case XBOX_KEY_BUTTON:
@@ -201,4 +244,342 @@ size_t xbox_InputKeyMapReadmeRow(size_t i, char *buf, size_t size)
     else
         return 0;
     return n > 0 ? (size_t)n : 0;
+}
+
+/* ── rebinding (keyboard.h) ──────────────────────────────────────────── */
+
+static const struct { const char *id, *name; } k_action[XBOX_KEYACT_COUNT] = {
+    { "start",        "Start (pause, select)" },
+    { "back",         "Back (back, pause while driving)" },
+    { "boost",        "Boost, select (A)" },
+    { "crashbreaker", "Crashbreaker, back (B)" },
+    { "look_back",    "Look back (X)" },
+    { "change_view",  "Change view (Y)" },
+    { "white",        "White" },
+    { "black",        "Next music track (Black)" },
+    { "accelerate",   "Accelerate" },
+    { "brake",        "Brake, reverse" },
+    { "steer_left",   "Steer left" },
+    { "steer_right",  "Steer right" },
+};
+
+/* The keys that have a name, and the names (files and menus): letters and
+ * digits are themselves. */
+static const struct { int vk; const char *name; } k_key[] = {
+    { XBOX_VK_UP, "Up" }, { XBOX_VK_DOWN, "Down" }, { XBOX_VK_LEFT, "Left" }, { XBOX_VK_RIGHT, "Right" },
+    { XBOX_VK_SPACE, "Space" }, { XBOX_VK_RETURN, "Enter" }, { XBOX_VK_ESCAPE, "Esc" },
+    { XBOX_VK_BACK, "Backspace" }, { XBOX_VK_SHIFT, "Shift" }, { XBOX_VK_CONTROL, "Ctrl" },
+    { XBOX_VK_TAB, "Tab" }, { 0x21, "PageUp" }, { 0x22, "PageDown" }, { 0x23, "End" }, { 0x24, "Home" },
+    { 0x2D, "Insert" },
+    { 0xBA, "Semicolon" }, { 0xBB, "Equals" }, { 0xBC, "Comma" }, { 0xBD, "Minus" }, { 0xBE, "Period" },
+    { 0xBF, "Slash" }, { 0xC0, "Backquote" }, { 0xDB, "LeftBracket" }, { 0xDC, "Backslash" },
+    { 0xDD, "RightBracket" }, { 0xDE, "Quote" },
+};
+#define K_KEYS ((int)(sizeof k_key / sizeof k_key[0]))
+
+const char *xbox_InputKeyActionName(int a)
+{
+    return (unsigned)a < XBOX_KEYACT_COUNT ? k_action[a].name : "";
+}
+
+const char *xbox_InputKeyActionId(int a)
+{
+    return (unsigned)a < XBOX_KEYACT_COUNT ? k_action[a].id : "";
+}
+
+const char *xbox_InputKeyName(int vk)
+{
+    static _Thread_local char buf[8][8];
+    static _Thread_local int n;
+    char *o;
+
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        o = buf[n++ & 7];
+        o[0] = (char)vk;
+        o[1] = 0;
+        return o;
+    }
+    for (int i = 0; i < K_KEYS; i++)
+        if (k_key[i].vk == vk)
+            return k_key[i].name;
+    return "";
+}
+
+static int ci_eq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        int x = *a, y = *b;
+        if (x >= 'a' && x <= 'z') x -= 32;
+        if (y >= 'a' && y <= 'z') y -= 32;
+        if (x != y)
+            return 0;
+    }
+    return !*a && !*b;
+}
+
+int xbox_InputKeyFromName(const char *name)
+{
+    if (!name || !*name)
+        return 0;
+    if (!name[1]) {
+        int c = name[0];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+            return c;
+        return 0;
+    }
+    for (int i = 0; i < K_KEYS; i++)
+        if (ci_eq(name, k_key[i].name))
+            return k_key[i].vk;
+    return 0;
+}
+
+int xbox_InputKeyBindable(int vk)
+{
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+        return 1;
+    for (int i = 0; i < K_KEYS; i++)
+        if (k_key[i].vk == vk)
+            return 1;
+    return 0;
+}
+
+int xbox_InputKeyDefault(int a, int slot)
+{
+    if ((unsigned)a >= XBOX_KEYACT_COUNT || (unsigned)slot >= XBOX_KEY_SLOTS)
+        return 0;
+    return xbox_key_map[KEY_ACT_ROW0 + a].vk[slot];
+}
+
+int xbox_InputKeyBinding(int a, int slot)
+{
+    if ((unsigned)a >= XBOX_KEYACT_COUNT || (unsigned)slot >= XBOX_KEY_SLOTS)
+        return 0;
+    keys_ensure();
+    return s_vk[KEY_ACT_ROW0 + a][slot];
+}
+
+int xbox_InputKeyActionHeld(int a)
+{
+    if ((unsigned)a >= XBOX_KEYACT_COUNT)
+        return 0;
+    keys_ensure();
+    return row_held((size_t)(KEY_ACT_ROW0 + a));
+}
+
+int xbox_InputKeyOwner(int vk)
+{
+    keys_ensure();
+    for (int a = 0; a < XBOX_KEYACT_COUNT; a++)
+        for (int s = 0; s < XBOX_KEY_SLOTS; s++)
+            if (vk && s_vk[KEY_ACT_ROW0 + a][s] == vk)
+                return a;
+    return -1;
+}
+
+static void (*volatile s_listener)(void);
+
+void xbox_InputKeyBindingsSetListener(void (*fn)(void))
+{
+    s_listener = fn;
+}
+
+static void listener_call(void)
+{
+    void (*fn)(void) = s_listener;
+    if (fn && __atomic_load_n(&s_ready, __ATOMIC_ACQUIRE) == 2)
+        fn();
+}
+
+/* The binding itself, for what runs inside keys_ensure too. */
+static int key_bind(int a, int slot, int vk, int *other)
+{
+    if ((unsigned)a >= XBOX_KEYACT_COUNT || (unsigned)slot >= XBOX_KEY_SLOTS)
+        return -1;
+    if (!vk) {
+        s_vk[KEY_ACT_ROW0 + a][slot] = 0;
+        return 0;
+    }
+    if (!xbox_InputKeyBindable(vk))
+        return -1;
+    for (int b = 0; b < XBOX_KEYACT_COUNT; b++)
+        for (int s = 0; s < XBOX_KEY_SLOTS; s++) {
+            if (b == a && s == slot)
+                continue;
+            if (s_vk[KEY_ACT_ROW0 + b][s] == vk) {
+                if (other)
+                    *other = b;
+                return -2;
+            }
+        }
+    s_vk[KEY_ACT_ROW0 + a][slot] = (unsigned char)vk;
+    return 0;
+}
+
+int xbox_InputKeyBind(int a, int slot, int vk, int *other)
+{
+    int r, was;
+
+    keys_ensure();
+    was = (unsigned)a < XBOX_KEYACT_COUNT && (unsigned)slot < XBOX_KEY_SLOTS ? s_vk[KEY_ACT_ROW0 + a][slot] : -1;
+    r = key_bind(a, slot, vk, other);
+    if (r == 0 && was != (int)s_vk[KEY_ACT_ROW0 + a][slot])
+        listener_call();
+    return r;
+}
+
+void xbox_InputKeyBindingsReset(void)
+{
+    keys_ensure();
+    keys_defaults();
+    listener_call();
+}
+
+/* The slots of an action, the empty ones last. */
+static void act_keys(int a, int out[XBOX_KEY_SLOTS])
+{
+    int n = 0;
+
+    out[0] = out[1] = 0;
+    for (int s = 0; s < XBOX_KEY_SLOTS; s++)
+        if (s_vk[KEY_ACT_ROW0 + a][s])
+            out[n++] = s_vk[KEY_ACT_ROW0 + a][s];
+}
+
+static int act_is_default(int a)
+{
+    int now[XBOX_KEY_SLOTS], def[XBOX_KEY_SLOTS], n = 0;
+
+    act_keys(a, now);
+    def[0] = def[1] = 0;
+    for (int s = 0; s < XBOX_KEY_SLOTS; s++)
+        if (xbox_key_map[KEY_ACT_ROW0 + a].vk[s])
+            def[n++] = xbox_key_map[KEY_ACT_ROW0 + a].vk[s];
+    return now[0] == def[0] && now[1] == def[1];
+}
+
+int xbox_InputKeyBindingsAreDefault(void)
+{
+    keys_ensure();
+    for (int a = 0; a < XBOX_KEYACT_COUNT; a++)
+        if (!act_is_default(a))
+            return 0;
+    return 1;
+}
+
+size_t xbox_InputKeyBindingsFormat(char *buf, size_t size)
+{
+    size_t at = 0;
+    char tmp[512];
+
+    keys_ensure();
+    tmp[0] = 0;
+    for (int a = 0; a < XBOX_KEYACT_COUNT; a++) {
+        int k[XBOX_KEY_SLOTS], w;
+
+        if (act_is_default(a))
+            continue;
+        act_keys(a, k);
+        w = snprintf(tmp + at, sizeof tmp - at, "%s%s=%s%s%s", at ? ";" : "", k_action[a].id,
+                     k[0] ? xbox_InputKeyName(k[0]) : "", k[1] ? "," : "",
+                     k[1] ? xbox_InputKeyName(k[1]) : "");
+        if (w < 0 || (size_t)w >= sizeof tmp - at)
+            break;
+        at += (size_t)w;
+    }
+    if (buf && size)
+        snprintf(buf, size, "%s", tmp);
+    return at;
+}
+
+int xbox_InputKeyBindingsParse(const char *text)
+{
+    /* Two passes: the actions the text names are emptied first, so that a
+     * swap (boost=Shift;look_back=Space) does not meet the old owner of a
+     * key halfway. */
+    int set = 0;
+    const char *p;
+
+    if (__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE) == 0)
+        keys_ensure();               /* the environment's text, then this one over it */
+    keys_defaults();
+    if (!text || !*text) {
+        listener_call();
+        return 0;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (p = text; *p;) {
+            const char *e = p, *eq = NULL;
+            char id[32];
+            int a = -1;
+
+            while (*e && *e != ';') {
+                if (*e == '=' && !eq)
+                    eq = e;
+                e++;
+            }
+            if (eq && (size_t)(eq - p) < sizeof id) {
+                size_t n = (size_t)(eq - p);
+                while (n && (p[0] == ' ')) { p++; n--; }
+                while (n && p[n - 1] == ' ') n--;
+                memcpy(id, p, n);
+                id[n] = 0;
+                for (int i = 0; i < XBOX_KEYACT_COUNT; i++)
+                    if (ci_eq(id, k_action[i].id))
+                        a = i;
+            }
+            if (a >= 0) {
+                if (pass == 0) {
+                    s_vk[KEY_ACT_ROW0 + a][0] = s_vk[KEY_ACT_ROW0 + a][1] = 0;
+                } else {
+                    const char *k = eq + 1;
+                    int slot = 0;
+
+                    set++;
+                    while (k < e && slot < XBOX_KEY_SLOTS) {
+                        const char *ke = k;
+                        char name[24];
+                        size_t n;
+                        int vk;
+
+                        while (ke < e && *ke != ',')
+                            ke++;
+                        n = (size_t)(ke - k);
+                        while (n && *k == ' ') { k++; n--; }
+                        while (n && k[n - 1] == ' ') n--;
+                        if (n && n < sizeof name) {
+                            memcpy(name, k, n);
+                            name[n] = 0;
+                            vk = xbox_InputKeyFromName(name);
+                            if (vk && key_bind(a, slot, vk, NULL) == 0)
+                                slot++;
+                        }
+                        k = ke < e ? ke + 1 : e;
+                    }
+                }
+            }
+            p = *e ? e + 1 : e;
+        }
+    }
+    listener_call();
+    return set;
+}
+
+void xbox_InputKeyActionKeys(int a, char *out, size_t size)
+{
+    int k[XBOX_KEY_SLOTS];
+
+    if (!out || !size)
+        return;
+    out[0] = 0;
+    if ((unsigned)a >= XBOX_KEYACT_COUNT)
+        return;
+    keys_ensure();
+    act_keys(a, k);
+    if (!k[0])
+        snprintf(out, size, "none");
+    else if (!k[1])
+        snprintf(out, size, "%s", xbox_InputKeyName(k[0]));
+    else
+        snprintf(out, size, "%s, %s", xbox_InputKeyName(k[0]), xbox_InputKeyName(k[1]));
 }

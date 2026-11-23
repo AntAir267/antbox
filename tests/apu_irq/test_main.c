@@ -32,6 +32,64 @@ static uint32_t reg(MCPXAPUState *d, uint32_t r) { return d->regs[r]; }
 static int line(MCPXAPUState *d) { return !!(reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_GINTSTS); }
 static void settle(MCPXAPUState *d) { mcpx_apu_mmio_write(d, NV_PAPU_ISTS, 0, 4); }
 
+/* 6. BO-351: the ISR's ack against a new trap on the frame thread.
+ *
+ * The ack's update_irq has found nothing pending and is about to lower the
+ * line (mcpx_apu_irq_lower_hook). Right there the frame thread takes a trap
+ * and runs its own update: a new idle voice traps the front end and the line
+ * goes up. Without d->lock around the ack that all happens inside the ack's
+ * window, the ack then lowers the line over the new trap, and nothing raises
+ * it again: FETINTSTS set, GINTSTS clear, set_irq spent (the int044 Dee1
+ * dump: ISTS=00000010 IEN=000000D9 line=down set_irq=0, front end trapped).
+ * With it, the frame thread waits for the ack and raises the line after it.
+ * The hook gives the frame thread 300 ms; it only ever finishes inside the
+ * window when nothing keeps it out. */
+static volatile LONG s_frame_done;
+static QemuThread s_frame;
+
+static void *frame_thread(void *arg)
+{
+    MCPXAPUState *d = (MCPXAPUState *)arg;
+    qemu_mutex_lock(&d->lock);
+    mcpx_apu_mmio_write(d, VP(SE2FE_IDLE_VOICE), 73, 4);   /* the trap */
+    mcpx_apu_frame_irq(d);                                 /* the line */
+    qemu_mutex_unlock(&d->lock);
+    InterlockedExchange(&s_frame_done, 1);
+    return NULL;
+}
+
+static void lower_hook(MCPXAPUState *d)
+{
+    int i;
+    mcpx_apu_irq_lower_hook = NULL;   /* once */
+    qemu_thread_create(&s_frame, "frame", frame_thread, d, 0);
+    for (i = 0; i < 300 && !InterlockedCompareExchange(&s_frame_done, 0, 0); i++)
+        Sleep(1);
+}
+
+static void race_ack_vs_trap(MCPXAPUState *d)
+{
+    /* armed, resumed, nothing pending */
+    mcpx_apu_mmio_write(d, NV_PAPU_FECTL, NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING, 4);
+    mcpx_apu_mmio_write(d, NV_PAPU_IEN, 0xD9, 4);
+    mcpx_apu_mmio_write(d, NV_PAPU_FETFORCE1, NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE, 4);
+    mcpx_apu_mmio_write(d, NV_PAPU_ISTS, 0xFFFFFFFFu, 4);
+    d->set_irq = false;   /* the earlier steps' traps, as the frame thread spends it */
+    CHECK("race: quiet before", reg(d, NV_PAPU_ISTS) == 0 && !d->set_irq);
+
+    s_frame_done = 0;
+    mcpx_apu_irq_lower_hook = lower_hook;
+    mcpx_apu_mmio_write(d, NV_PAPU_ISTS, NV_PAPU_ISTS_FEVINTSTS, 4);   /* the ack */
+    qemu_thread_join(&s_frame);
+    mcpx_apu_irq_lower_hook = NULL;
+
+    CHECK("race: the new trap is pending",
+          (reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_FETINTSTS)
+              && (reg(d, NV_PAPU_FECTL) & NV_PAPU_FECTL_FEMETHMODE)
+                     == NV_PAPU_FECTL_FEMETHMODE_TRAPPED);
+    CHECK("race: the line is up for it", line(d));
+}
+
 int main(void)
 {
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
@@ -112,6 +170,8 @@ int main(void)
           (reg(d, NV_PAPU_FECTL) & NV_PAPU_FECTL_FEMETHMODE)
               == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING);
     CHECK("unarmed: line low", !line(d));
+
+    race_ack_vs_trap(d);
 
     if (failures) { printf("apu_irq: %d failure(s)\n", failures); return 1; }
     printf("apu_irq: all passed\n");

@@ -83,6 +83,9 @@ typedef struct {
     int      swz;               /* guest memory holds it swizzled */
     uint32_t cfmt;              /* SET_SURFACE_FORMAT's colour field, last drawn as */
     struct nv2a_rt_own own;     /* is the guest memory under it still its own */
+    struct nvk_image gim;       /* BO-178: im area-averaged to w x h (rt_reduced) */
+    uint64_t ggen;              /* the gen gim was made at */
+    int      gopaque;           /* gim made with alpha 1 */
     VkImageView opaque, gb;     /* views: alpha read as 1; G8B8 as the console stores it */
 } NvrTarget;
 
@@ -136,6 +139,7 @@ static void retire_image(struct nvk_image *im);
 static void view_garbage(VkImageView v);
 static void occ_query_begin(void);
 static void occ_init(void);
+static void gpu_time_end(VkCommandBuffer cb);
 static int draw_init_all(void);
 static void occ_pass_end(void);
 struct NvrOccQuery;
@@ -206,6 +210,73 @@ static int init(void)
     return 1;
 }
 
+/* ---- GPU time a flip, for RECOMP_TRACE=frametime's gpu_ms (the benchmark) ----
+ *
+ * A timestamp where a flip's first command buffer starts and one where its
+ * last ends, both on the one queue; read back a few flips later without a
+ * wait, and handed to xbox_FrametimeGpu. */
+#define NVR_GPU_T 4
+static VkQueryPool s_tq;
+static int         s_tq_on = -1;
+static uint32_t    s_tq_flip, s_tq_begun, s_tq_wrote[NVR_GPU_T];
+
+void xbox_FrametimeGpu(double gpu_ms, double tu_ms, double tu_pred);
+
+static void gpu_time_begin(VkCommandBuffer cb)
+{
+    uint32_t q = (s_tq_flip % NVR_GPU_T) * 2u;
+    if (s_tq_on < 0) {
+        VkQueryPoolCreateInfo qi;
+        memset(&qi, 0, sizeof qi);
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = NVR_GPU_T * 2u;
+        s_tq_on = C->props.limits.timestampPeriod > 0.0f
+                  && vkCreateQueryPool(s_dev, &qi, NULL, &s_tq) == VK_SUCCESS;
+        if (s_tq_on)
+            vkResetQueryPool(s_dev, s_tq, 0, NVR_GPU_T * 2u);
+    }
+    if (!s_tq_on || s_tq_begun == s_tq_flip + 1u)
+        return;
+    s_tq_begun = s_tq_flip + 1u;
+    if (s_tq_wrote[s_tq_flip % NVR_GPU_T])
+        return;                                     /* not read back yet: skipped */
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_tq, q);
+}
+
+/* Before the flip's last submit (outside a pass): its end. */
+static void gpu_time_end(VkCommandBuffer cb)
+{
+    uint32_t slot = s_tq_flip % NVR_GPU_T;
+    if (s_tq_on > 0 && cb && s_tq_begun == s_tq_flip + 1u && !s_tq_wrote[slot]) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_tq, slot * 2u + 1u);
+        s_tq_wrote[slot] = s_tq_flip + 1u;
+    }
+}
+
+/* At the flip: the next one begins, and the oldest is read back. */
+static void gpu_time_flip(void)
+{
+    uint32_t old;
+    uint64_t ts[2];
+
+    if (s_tq_on <= 0)
+        return;
+    s_tq_flip++;
+    old = s_tq_flip % NVR_GPU_T;        /* the oldest, next to be written */
+    if (s_tq_wrote[old]
+            && vkGetQueryPoolResults(s_dev, s_tq, old * 2u, 2, sizeof ts, ts, 8,
+                                     VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        double ms = (double)(ts[1] - ts[0]) * C->props.limits.timestampPeriod / 1e6;
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "GPU time a flip: first reading %.3f ms\n", ms);
+        xbox_FrametimeGpu(ms, 0.0, 0.0);
+        vkResetQueryPool(s_dev, s_tq, old * 2u, 2);
+        s_tq_wrote[old] = 0;
+    }
+}
+
 /* The frame's command buffer, open for recording; waits for the slot's last
  * submit first (two frames in flight). */
 static VkCommandBuffer frame_cb(void)
@@ -248,6 +319,7 @@ static VkCommandBuffer frame_cb(void)
     }
     s_rec = 1;
     s_frame_id++;
+    gpu_time_begin(fr->cb);
     return fr->cb;
 }
 
@@ -432,6 +504,7 @@ static void target_free(NvrTarget *t)
     view_garbage(t->opaque);
     view_garbage(t->gb);
     retire_image(&t->im);
+    retire_image(&t->gim);
     memset(t, 0, sizeof *t);
 }
 
@@ -1450,6 +1523,20 @@ static void *ring_take(int r, VkDeviceSize n, VkDeviceSize align, VkDeviceSize *
 #define NVR_VS_CACHE 512
 static struct { uint32_t hash, len; uint16_t inputs; VkShaderModule m; } s_vs[NVR_VS_CACHE];
 
+/* BO-332, as the old backend: depth is clamped, not clipped at the near and far
+ * planes, and the vertex programs cull window z outside the title's
+ * SET_CLIP_MIN/MAX themselves (D3D8_GLSL_CLIP_RANGE). Off without the device's
+ * depthClamp and shaderClipDistance, or with RECOMP_DEBUG=zclamp=0. */
+static int clip_range_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_ZCLAMP);
+        on = C && C->depth_clamp && !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /* The tables below are shared with the pre-warm thread (see "the saved list"):
  * looked up and filled under this lock, built outside it. */
 static pthread_mutex_t s_sh_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1479,7 +1566,8 @@ static VkShaderModule vs_build(const uint32_t *slots, uint32_t len, uint32_t has
 
     d3d8_vsh_parse(slots, (int)len, parsed);
     snprintf(what, sizeof what, "program %08X", hash);
-    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, 65536) <= 0)
+    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE | (clip_range_on() ? D3D8_GLSL_CLIP_RANGE : 0u),
+                               glsl, 65536) <= 0)
         return VK_NULL_HANDLE;
     if (!(m = module_from_glsl(NVK_STAGE_VERTEX, glsl, what)))
         return VK_NULL_HANDLE;
@@ -1647,6 +1735,26 @@ static VkShaderModule fs_build(const uint32_t *key, uint32_t h, const NV2ACombin
 /* The draw's fragment module: the combiners the registers program, or the
  * basic one. As the old backend's fs_select, less what slice 2a lacks
  * (cube maps, shadow maps, HDR, the debug views). */
+/* A fragment key says all of the state: registers, then what stages and clips do. */
+static void fs_state_from_key(const uint32_t *key, NV2ACombinerState *st)
+{
+    int n;
+
+    memset(st, 0, sizeof *st);
+    d3d8_combiners_from_regs(key, key + 8, key + 16, key + 24, key[32], key[33], key[34], key[35], st);
+    st->fog_input = 1;
+    for (n = 0; n < 4; n++) {
+        st->tex_signed[n] = (uint8_t)((key[36] >> (4 * n)) & 0xFu);
+        st->clip_mode[n] = (uint8_t)((key[38] >> (4 * n)) & 0xFu);
+        st->tex_shadow[n] = (uint8_t)(key[40] >> (8 * n));
+        st->dot_map[n] = n ? (uint8_t)((key[37] >> (4 * (n - 1))) & 0xFu) : 0;
+    }
+    st->alpha_kill = (uint8_t)(key[38] >> 16);
+    st->wbuffer = (uint8_t)(key[39] >> 16);
+    st->input_tex[2] = (uint8_t)((key[37] >> 16) & 0xFu);
+    st->input_tex[3] = (uint8_t)((key[37] >> 20) & 0xFu);
+}
+
 static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
 {
     static char glsl[65536];
@@ -1713,20 +1821,7 @@ static VkShaderModule fs_select(const struct nv2a_pb_vsh *v)
         return have;
     }
     pthread_mutex_unlock(&s_sh_mu);
-    memset(&st, 0, sizeof st);
-    d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw, v->rc_ctl,
-                             v->rc_fcw0, v->rc_fcw1, modes, &st);
-    st.fog_input = 1;
-    for (n = 0; n < 4; n++) {
-        st.tex_signed[n] = (uint8_t)((signs >> (4 * n)) & 0xFu);
-        st.clip_mode[n] = (uint8_t)((v->clip_plane_mode >> (4 * n)) & 0xFu);
-        st.tex_shadow[n] = (uint8_t)(shadows >> (8 * n));
-        st.dot_map[n] = n ? (uint8_t)((v->shader_ctl >> (4 * (n - 1))) & 0xFu) : 0;
-    }
-    st.alpha_kill = (uint8_t)nv2a_alpha_kill_mask(s_stage, nv2a_pb_gpu_state()->flips);
-    st.wbuffer = (uint8_t)wbuf;
-    st.input_tex[2] = (uint8_t)((v->shader_ctl >> 16) & 0xFu);
-    st.input_tex[3] = (uint8_t)((v->shader_ctl >> 20) & 0xFu);
+    fs_state_from_key(key, &st);
     t0 = mono_ns();
     m = fs_build(key, h, &st, glsl);
     if (m) {
@@ -1844,6 +1939,7 @@ static VkPipeline pipeline_new(const NvrPsoKey *k)
     memset(&rs, 0, sizeof rs);
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.depthClampEnable = clip_range_on() ? VK_TRUE : VK_FALSE;   /* BO-332 */
     rs.lineWidth = 1.0f;
     memset(&ms, 0, sizeof ms);
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -2083,7 +2179,10 @@ static void blob_save(int wait)
         pthread_detach(th);
 }
 
-static int s_warm_stop, s_warm_running;
+static const char *s_pre_list, *s_pre_xbe;
+static int s_pre_rc;
+static int s_warm_stop, s_warm_running, s_warm_finished;
+static unsigned s_warm_done, s_warm_total;
 static pthread_t s_warm_th;
 
 /* Builds everything on the list. A draw that gets there first just wins. */
@@ -2103,6 +2202,8 @@ static void *prewarm_main(void *arg)
             const void *d;
             if (!nv2a_pcache_get(s_pcf, i, &type, &d, &len))
                 break;
+            if ((pass == 0) == (type != NVR_PC_PSO))
+                __atomic_fetch_add(&s_warm_done, 1, __ATOMIC_RELAXED);
             if (pass == 0 && type == NVR_PC_VS && len >= 16 && len % 16 == 0
                     && len <= NV2A_VSH_SLOTS * 16u) {
                 uint32_t hash = 2166136261u, k;
@@ -2157,7 +2258,139 @@ static void *prewarm_main(void *arg)
             " %llu ms\n", (unsigned long long)s_warm_n[0], (unsigned long long)s_warm_n[1],
             (unsigned long long)s_warm_n[2], (unsigned long long)s_warm_ms);
     __atomic_fetch_add(&s_pso_new, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_warm_finished, 1, __ATOMIC_RELEASE);
     return NULL;
+}
+
+/* ---- a shipped list: where the shaders are in the player's own executable ----
+ *
+ * Repositories and releases hold no compiled shaders and no game code. A list
+ * (tools/nvr_replay/list_make.py) names each word of a vertex program and each
+ * combiner register by its offset in one exact XBE, with a hash of the result, and
+ * adds the state around them, so the player's machine reads the words from their own
+ * copy and builds them on their GPU. Another XBE, or a word that doesn't check, is
+ * skipped: those shaders just build during play.
+ *
+ * File, little endian: "NVRPTR1" with its NUL, u32 xbe size, u64 fnv64 of the xbe, u32 counts of
+ * vertex, fragment and pipeline records. Vertex: u32 slots, u64 fnv64 of the slots,
+ * u32 offset[slots * 4], 0xFFFFFFFF for a zero word. Fragment: u64 fnv64 of the 35
+ * registers, u32 offset[35], u32 state[6] (key[35..40]). Pipeline: an NvrPsoDisk. */
+#define NVR_LIST_ZERO 0xFFFFFFFFu
+
+static uint8_t *file_read(const char *path, size_t *n)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *b = NULL;
+    long sz;
+
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) == 0 && (sz = ftell(f)) > 0 && fseek(f, 0, SEEK_SET) == 0
+            && (b = (uint8_t *)malloc((size_t)sz)) != NULL) {
+        if (fread(b, 1, (size_t)sz, f) == (size_t)sz) {
+            *n = (size_t)sz;
+        } else {
+            free(b);
+            b = NULL;
+        }
+    }
+    fclose(f);
+    return b;
+}
+
+static int word_at(const uint8_t *xbe, size_t xn, uint32_t off, uint32_t *w)
+{
+    if (off == NVR_LIST_ZERO) {
+        *w = 0;
+        return 1;
+    }
+    if ((size_t)off + 4 > xn)
+        return 0;
+    memcpy(w, xbe + off, 4);
+    return 1;
+}
+
+/* The list's records into the key list. How many it holds and how many checked in *got. */
+static int list_apply(const char *list, const char *xbe_path, unsigned *got)
+{
+    size_t ln = 0, xn = 0, at = 28;
+    uint8_t *l = file_read(list, &ln), *x = file_read(xbe_path, &xn);
+    uint32_t nv = 0, nf = 0, np = 0, xs = 0, i;
+    uint64_t xh = 0;
+    unsigned ok = 0, bad = 0;
+    int rc = -1;
+
+#define TAKE(p, sz) do { if (at + (sz) > ln) goto out; memcpy((p), l + at, (sz)); at += (sz); } while (0)
+    if (!l || !x || ln < 28 || memcmp(l, "NVRPTR1", 8)) {
+        fprintf(stderr, LOGP "shader list: can't read %s or %s\n", list, xbe_path);
+        goto out;
+    }
+    memcpy(&xs, l + 8, 4);
+    memcpy(&xh, l + 12, 8);
+    memcpy(&nv, l + 20, 4);
+    memcpy(&nf, l + 24, 4);
+    at = 28;
+    TAKE(&np, 4);
+    if (xs != xn || xh != nv2a_fnv64(x, xn, NV2A_FNV64_INIT)) {
+        fprintf(stderr, LOGP "shader list: %s isn't for this executable; shaders build during play\n", list);
+        rc = -2;
+        goto out;
+    }
+    for (i = 0; i < nv; i++) {
+        static uint32_t w[NV2A_VSH_SLOTS * 4];
+        uint32_t slots = 0, k, off, good = 1;
+        uint64_t h = 0;
+        TAKE(&slots, 4);
+        TAKE(&h, 8);
+        if (!slots || slots > NV2A_VSH_SLOTS)
+            goto out;
+        for (k = 0; k < slots * 4; k++) {
+            TAKE(&off, 4);
+            if (!word_at(x, xn, off, &w[k]))
+                good = 0;
+        }
+        if (good && nv2a_fnv64(w, slots * 16u, NV2A_FNV64_INIT) == h) {
+            pc_put(NVR_PC_VS, w, slots * 16u);
+            ok++;
+        } else {
+            bad++;
+        }
+    }
+    for (i = 0; i < nf; i++) {
+        NvrFsDisk dk;
+        uint32_t k, off, good = 1;
+        uint64_t h = 0;
+        memset(&dk, 0, sizeof dk);
+        TAKE(&h, 8);
+        for (k = 0; k < 35; k++) {
+            TAKE(&off, 4);
+            if (!word_at(x, xn, off, &dk.key[k]))
+                good = 0;
+        }
+        TAKE(&dk.key[35], 6 * 4);
+        if (good && nv2a_fnv64(dk.key, 35 * 4, NV2A_FNV64_INIT) == h) {
+            fs_state_from_key(dk.key, &dk.st);
+            pc_put(NVR_PC_FS, &dk, sizeof dk);
+            ok++;
+        } else {
+            bad++;
+        }
+    }
+    for (i = 0; i < np; i++) {
+        NvrPsoDisk dk;
+        TAKE(&dk, sizeof dk);
+        pc_put(NVR_PC_PSO, &dk, sizeof dk);
+        ok++;
+    }
+#undef TAKE
+    fprintf(stderr, LOGP "shader list: %u records from %s, %u didn't check\n", ok, list, bad);
+    if (got)
+        *got = ok;
+    rc = 0;
+out:
+    free(l);
+    free(x);
+    return rc;
 }
 
 /* The way out: no thread in Vulkan when the driver's own exit runs. */
@@ -2193,8 +2426,18 @@ static void pc_start(void)
              sizeof(NvrPsoDisk), sizeof(NvrFsDisk), (int)NV2A_VSH_SLOTS);
     s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
     fprintf(stderr, LOGP "pipeline list: %s: %s\n", path, msg);
-    if (s_pcf && nv2a_pcache_count(s_pcf)
-            && pthread_create(&s_warm_th, NULL, prewarm_main, NULL) == 0)
+    {
+        const char *l = s_pre_list ? s_pre_list : getenv("RECOMP_NVR_SHADER_LIST");
+        const char *x = s_pre_xbe ? s_pre_xbe : getenv("RECOMP_NVR_SHADER_XBE");
+        if (s_pcf && l && *l && x && *x) {
+            s_pre_rc = list_apply(l, x, NULL);
+            /* What was put is only read back at open. */
+            nv2a_pcache_close(s_pcf);
+            s_pcf = nv2a_pcache_open(path, ver, msg, sizeof msg);
+        }
+    }
+    s_warm_total = s_pcf ? (unsigned)nv2a_pcache_count(s_pcf) : 0;
+    if (s_warm_total && pthread_create(&s_warm_th, NULL, prewarm_main, NULL) == 0)
         s_warm_running = 1;
     atexit(pc_stop);
 }
@@ -2387,6 +2630,21 @@ static int tex_upload(const struct nv2a_stage *t, uint8_t sgn, uint32_t cut, Nvr
     return 1;
 }
 
+/* When a cached texture's bytes are hashed again: once a flip, and again
+ * after the 2D engine has copied into guest memory (nv2a_pb_blit_generation),
+ * so a picture a title builds by copies is seen the frame it is built in. */
+static uint32_t tex_check_stamp(void)
+{
+    static uint32_t flips = ~0u, blits = ~0u, stamp;
+    uint32_t f = nv2a_pb_gpu_state()->flips, b = nv2a_pb_blit_generation();
+    if (f != flips || b != blits) {
+        flips = f;
+        blits = b;
+        stamp++;
+    }
+    return stamp;
+}
+
 /* The stage's texture as an image view: cached by where and how it is laid
  * out, its bytes hashed again once a flip. A target drawn over those bytes
  * since its last write-back is written back first. */
@@ -2447,11 +2705,11 @@ static VkImageView tex_bind(const struct nv2a_stage *t, uint8_t sgn, uint32_t cu
             cut = e->cut;
         stale = e->cut != cut || (e->rep && e->rep != nv2a_texrep_generation());
         e->last_use = s_tick;
-        if (e->checked == g->flips && !stale) {
+        if (e->checked == tex_check_stamp() && !stale) {
             s_bind_scale = e->up_scale;
             return e->im.view;
         }
-        e->checked = g->flips;
+        e->checked = tex_check_stamp();
         h = tex_hash(mem, t, bytes);
         if (h == e->hash && !stale) {
             s_bind_scale = e->up_scale;
@@ -2479,7 +2737,7 @@ static VkImageView tex_bind(const struct nv2a_stage *t, uint8_t sgn, uint32_t cu
     e->sgn = sgn;
     e->cut = (uint8_t)cut;
     e->hash = h;
-    e->checked = g->flips;
+    e->checked = tex_check_stamp();
     e->last_use = s_tick;
     s_bind_scale = e->up_scale;
     return e->im.view;
@@ -2647,7 +2905,7 @@ static VkImageView cube_bind(const struct nv2a_stage *t)
     }
     if (e->side != side)
         fresh = 1;
-    if (!all && (fresh || e->checked != g->flips)) {
+    if (!all && (fresh || e->checked != tex_check_stamp())) {
         uint64_t h = NV2A_TEX_HASH_SEED;
         for (f = 0; f < 6; f++)
             if (!frt[f])
@@ -2655,7 +2913,7 @@ static VkImageView cube_bind(const struct nv2a_stage *t)
                                             NV2A_TEX_HASH_SEED);
         if (pal)
             h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
-        e->checked = g->flips;
+        e->checked = tex_check_stamp();
         if (h != e->hash)
             fresh = 1;
         e->hash = h;
@@ -2863,6 +3121,224 @@ static NvrTarget *rt_texture(const struct nv2a_stage *st, NvrTarget *cur, VkImag
     *sw = self->w;
     *sh = self->h;
     return self;
+}
+
+/* ---- BO-178: reductions read a title-size copy, as the old backend ---------
+ *
+ * A draw that reads a scaled target into a smaller one (nv2a_rt_reduce_draw)
+ * samples its area average at its guest size: one full-screen triangle into
+ * src->gim, made again only when src was drawn since. */
+static const char s_vs_reduce_glsl[] =
+    "#version 450\n"
+    "void main() {\n"
+    "    vec2 t = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+    "    gl_Position = vec4(t * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+/* q.xy host texels per guest texel, a part-covered one counted by its share;
+ * q.z: alpha reads 1. */
+static const char s_fs_reduce_glsl[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(push_constant) uniform Q { vec4 q; } pq;\n"
+    "layout(location = 0) out vec4 o_color;\n"
+    "void main() {\n"
+    "    vec2 r = pq.q.xy, p0 = floor(gl_FragCoord.xy) * r, p1 = p0 + r;\n"
+    "    ivec2 a = ivec2(floor(p0)), b = ivec2(ceil(p1)) - 1;\n"
+    "    vec4 sum = vec4(0.0);\n"
+    "    float ws = 0.0;\n"
+    "    for (int y = a.y; y <= b.y; y++) {\n"
+    "        float wy = min(p1.y, float(y + 1)) - max(p0.y, float(y));\n"
+    "        for (int x = a.x; x <= b.x; x++) {\n"
+    "            float w = wy * (min(p1.x, float(x + 1)) - max(p0.x, float(x)));\n"
+    "            sum += texelFetch(src, ivec2(x, y), 0) * w;\n"
+    "            ws += w;\n"
+    "        }\n"
+    "    }\n"
+    "    sum = ws > 0.0 ? sum / ws : vec4(0.0);\n"
+    "    if (pq.q.z != 0.0) sum.a = 1.0;\n"
+    "    o_color = sum;\n"
+    "}\n";
+static VkDescriptorSet texture_set(const VkImageView view[4], const VkSampler smp[4]);
+static VkPipelineLayout s_reduce_layout;
+static VkPipeline       s_reduce_pso;
+static uint64_t         s_reduce_binds, s_reduce_made;
+
+static int reduce_pipeline(void)
+{
+    static int failed;
+    VkShaderModule vs, fs;
+    VkPipelineLayoutCreateInfo pl;
+    VkPushConstantRange pcr;
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineDepthStencilStateCreateInfo ds;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineDynamicStateCreateInfo dy;
+    VkPipelineRenderingCreateInfo pr;
+    VkGraphicsPipelineCreateInfo gp;
+    VkFormat cf = VK_FORMAT_B8G8R8A8_UNORM;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+
+    if (s_reduce_pso || failed)
+        return s_reduce_pso != VK_NULL_HANDLE;
+    failed = 1;
+    vs = module_from_glsl(NVK_STAGE_VERTEX, s_vs_reduce_glsl, "vs_reduce");
+    fs = module_from_glsl(NVK_STAGE_FRAGMENT, s_fs_reduce_glsl, "fs_reduce");
+    if (!vs || !fs)
+        return 0;
+    memset(&pcr, 0, sizeof pcr);
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.size = 16;
+    memset(&pl, 0, sizeof pl);
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &s_dsl[1];
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(s_dev, &pl, NULL, &s_reduce_layout) != VK_SUCCESS)
+        return 0;
+    memset(ss, 0, sizeof ss);
+    ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    ss[0].module = vs;
+    ss[0].pName = "main";
+    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ss[1].module = fs;
+    ss[1].pName = "main";
+    memset(&vi, 0, sizeof vi);
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    memset(&ia, 0, sizeof ia);
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    memset(&vp, 0, sizeof vp);
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    memset(&rs, 0, sizeof rs);
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    memset(&ms, 0, sizeof ms);
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&ds, 0, sizeof ds);
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    memset(&cba, 0, sizeof cba);
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    memset(&cb, 0, sizeof cb);
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    memset(&dy, 0, sizeof dy);
+    dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    memset(&pr, 0, sizeof pr);
+    pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &cf;
+    memset(&gp, 0, sizeof gp);
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext = &pr;
+    gp.stageCount = 2;
+    gp.pStages = ss;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dy;
+    gp.layout = s_reduce_layout;
+    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gp, NULL, &s_reduce_pso) != VK_SUCCESS)
+        s_reduce_pso = VK_NULL_HANDLE;
+    vkDestroyShaderModule(s_dev, vs, NULL);
+    vkDestroyShaderModule(s_dev, fs, NULL);
+    failed = s_reduce_pso == VK_NULL_HANDLE;
+    return !failed;
+}
+
+static VkImageView rt_reduced(NvrTarget *src, int opaque, VkSampler smp)
+{
+    VkRenderingAttachmentInfo ca;
+    VkRenderingInfo ri;
+    VkImageView v[4];
+    VkSampler sm[4];
+    VkDescriptorSet set;
+    VkCommandBuffer cb;
+    VkViewport vpt;
+    VkRect2D sc;
+    float q[4];
+    int k;
+
+    if (!reduce_pipeline())
+        return VK_NULL_HANDLE;
+    if (src->gim.img && (src->gim.w != src->w || src->gim.h != src->h))
+        retire_image(&src->gim);                    /* grown since */
+    if (src->gim.img && src->ggen == src->gen && src->gopaque == opaque)
+        return src->gim.view;
+    if (!src->gim.img
+            && !nvk_image_new(&src->gim, VK_FORMAT_B8G8R8A8_UNORM, src->w, src->h, 1,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) {
+        memset(&src->gim, 0, sizeof src->gim);
+        return VK_NULL_HANDLE;
+    }
+    for (k = 0; k < 4; k++) {
+        v[k] = k ? s_black.view : src->im.view;
+        sm[k] = smp;
+    }
+    to_sampled(&src->im);
+    if (!(set = texture_set(v, sm)) || !(cb = frame_cb()))
+        return VK_NULL_HANDLE;
+    pass_end();
+    nvk_image_to(cb, &src->gim, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    memset(&ca, 0, sizeof ca);
+    ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    ca.imageView = src->gim.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    memset(&ri, 0, sizeof ri);
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea.extent.width = src->w;
+    ri.renderArea.extent.height = src->h;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_reduce_pso);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_reduce_layout, 0, 1, &set, 0, NULL);
+    q[0] = (float)src->im.w / (float)src->w;
+    q[1] = (float)src->im.h / (float)src->h;
+    q[2] = opaque ? 1.0f : 0.0f;
+    q[3] = 0.0f;
+    vkCmdPushConstants(cb, s_reduce_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, q);
+    memset(&vpt, 0, sizeof vpt);
+    vpt.width = (float)src->w;
+    vpt.height = (float)src->h;
+    vpt.maxDepth = 1.0f;
+    vkCmdSetViewport(cb, 0, 1, &vpt);
+    memset(&sc, 0, sizeof sc);
+    sc.extent.width = src->w;
+    sc.extent.height = src->h;
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    nvk_image_to(cb, &src->gim, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    s_dyn_valid = 0;            /* another pipeline, viewport and scissor bound */
+    src->ggen = src->gen;
+    src->gopaque = opaque;
+    s_reduce_made++;
+    return src->gim.view;
 }
 
 #define NVR_SMP 128
@@ -3077,6 +3553,8 @@ static int draw_scissor(const struct nv2a_pb_gpu *g, const NvrTarget *t, VkRect2
 
 static void nvr_on_draw(const struct nv2a_pb_draw *d)
 {
+    int wide = 0;                 /* BO-385: a line list drawn as quads (vs_pass) */
+    NvrDepth *sampled_dt;
     float host_bias;
     static uint32_t *idx;
     static uint32_t idx_cap;
@@ -3148,7 +3626,14 @@ static void nvr_on_draw(const struct nv2a_pb_draw *d)
         const uint32_t *tr = nv2a_pb_tex_regs();
         for (k = 0; k < 4; k++) {
             const uint32_t *r = &tr[(0x40u * k + 0x28u) / 4];
-            memcpy(pc.bump_mat[k], r, 16);
+            /* The method's words are 00, 01, 11, 10 (xemu pgraph.c
+             * SET_TEXTURE_SET_BUMP_ENV_MAT's swizzle into NV_PGRAPH_BUMPMAT*);
+             * the shaders take 00, 01, 10, 11, as xemu's psh.c uploads bumpMat
+             * (takedawn's BO-332, as the old backend). */
+            memcpy(&pc.bump_mat[k][0], &r[0], 4);
+            memcpy(&pc.bump_mat[k][1], &r[1], 4);
+            memcpy(&pc.bump_mat[k][2], &r[3], 4);
+            memcpy(&pc.bump_mat[k][3], &r[2], 4);
             memcpy(&pc.bump_lum[k][0], &r[4], 4);
             memcpy(&pc.bump_lum[k][1], &r[5], 4);
         }
@@ -3178,6 +3663,16 @@ static void nvr_on_draw(const struct nv2a_pb_draw *d)
         else if (v->cull_face == 0x404) cull = 2;
         else if (v->cull_face == 0x408) cull_all = 1;
     }
+    /* BO-385, as the old backend: a line one guest pixel wide at any render
+     * scale, as two triangles a segment through vs_pass (nv2a_lines_expand). */
+    if (nv2a_wide_lines(v, topo, t->w, t->im.w)) {
+        wide = 1;
+        vmod = s_vs_pass;
+        nf4 = NV2A_WL_F4;
+        topo = NV2A_TOPO_TRIANGLES;
+        count = 2u * nidx;            /* four corners a segment */
+        cull = 0;
+    }
     if (cull_all && topo == NV2A_TOPO_TRIANGLES)
         return;
     nv2a_vp_consts_fill(v, g->format, t->w, t->h, &vc);
@@ -3196,6 +3691,8 @@ static void nvr_on_draw(const struct nv2a_pb_draw *d)
         if (dz)
             t->dt = dz;
     }
+    /* The depth buffer this draw samples: not attached while it does. */
+    sampled_dt = NULL;
     {
         /* Textures first: an upload or a write-back is outside a pass, and a
          * write-back submits the frame, so nothing of the draw is placed in
@@ -3224,19 +3721,35 @@ static void nvr_on_draw(const struct nv2a_pb_draw *d)
                 NvrDepth *sd = dt_for_texture(st);
                 to_sampled(&sd->im);
                 view[k] = sd->sview;
+                if (sd == t->dt)
+                    sampled_dt = sd;
                 continue;
             }
             if (fmod != s_fs_basic && st->raw_mode == 1 && dt_for_zcolor(st) != NULL) {
                 NvrDepth *sd = dt_for_zcolor(st);
                 to_sampled(&sd->im);
                 view[k] = sd->sview;
+                if (sd == t->dt)
+                    sampled_dt = sd;
                 pc.b.tex_scale[k][0] = 1.0f / (float)sd->w;
                 pc.b.tex_scale[k][1] = 1.0f / (float)sd->h;
                 continue;
             }
             {
                 uint32_t sw, sh;
-                if ((st->mode == 3 || !sgn) && rt_texture(st, t, &view[k], &sw, &sh) != NULL) {
+                NvrTarget *src;
+                if ((st->mode == 3 || !sgn) && (src = rt_texture(st, t, &view[k], &sw, &sh)) != NULL) {
+                    /* BO-178: a reduction reads the title-size copy; the
+                     * coordinates below are the same for it. */
+                    if (src->im.img && view[k] != s_self.view
+                            && nv2a_rt_reduce_draw(src->w, src->h, src->im.w, src->im.h, t->w, t->h)
+                            && nv2a_rt_reduce_on(nv2a_pb_gpu_state()->flips)) {
+                        VkImageView gv = rt_reduced(src, view[k] == src->opaque, smp[k]);
+                        if (gv) {
+                            view[k] = gv;
+                            s_reduce_binds++;
+                        }
+                    }
                     if (!nv2a_tex_size_from_format(st->color)) {
                         pc.b.tex_scale[k][0] = 1.0f / (float)sw;
                         pc.b.tex_scale[k][1] = 1.0f / (float)sh;
@@ -3261,8 +3774,9 @@ static void nvr_on_draw(const struct nv2a_pb_draw *d)
     for (tries = 0; tries < 2; tries++) {
         void *u0 = NULL, *u1, *u2;
         vf = (float *)ring_take(NVR_RING_VB, vbytes, 16, &vb_off);
-        ip = vf ? (uint32_t *)ring_take(NVR_RING_IB, (VkDeviceSize)nidx * 4u, 16, &ib_off) : NULL;
-        if (ip && d->program && !(u0 = ring_take(NVR_RING_UB, NVR_VS_C_BYTES, s_ub_align, &uo[0])))
+        ip = vf ? (uint32_t *)ring_take(NVR_RING_IB, (VkDeviceSize)(wide ? 3u * nidx : nidx) * 4u, 16,
+                                        &ib_off) : NULL;
+        if (ip && d->program && !wide && !(u0 = ring_take(NVR_RING_UB, NVR_VS_C_BYTES, s_ub_align, &uo[0])))
             ip = NULL;
         u1 = ip ? ring_take(NVR_RING_UB, NVR_VP_C_BYTES, s_ub_align, &uo[1]) : NULL;
         u2 = u1 ? ring_take(NVR_RING_UB, NVR_PS_C_BYTES, s_ub_align, &uo[2]) : NULL;
@@ -3282,12 +3796,29 @@ static void nvr_on_draw(const struct nv2a_pb_draw *d)
         s_draw_skips[SKIP_RING]++;
         return;
     }
-    if (!hud_squeeze(d, slot, (int)nf4, lo, count, v->inl, idx, nidx, (int)topo, vf))
-        nv2a_vtx_gather(d, slot, (int)nf4, lo, count, v->inl,
-                        (const uint8_t *)xbox_GetMemoryOffset(), vf);
-    memcpy(ip, idx, (size_t)nidx * 4u);
-    if (!pass_begin(t))
-        return;
+    if (wide) {
+        nidx = nv2a_lines_expand(d, v, idx, nidx, lo, hi - lo + 1,
+                                 (const uint8_t *)xbox_GetMemoryOffset(), vf, ip);
+        if (!nidx) {
+            s_draw_skips[SKIP_NO_PRIM]++;
+            return;
+        }
+    } else {
+        if (!hud_squeeze(d, slot, (int)nf4, lo, count, v->inl, idx, nidx, (int)topo, vf))
+            nv2a_vtx_gather(d, slot, (int)nf4, lo, count, v->inl,
+                            (const uint8_t *)xbox_GetMemoryOffset(), vf);
+        memcpy(ip, idx, (size_t)nidx * 4u);
+    }
+    {
+        NvrDepth *keep = t->dt;
+        int began;
+        if (sampled_dt)
+            t->dt = NULL;
+        began = pass_begin(t);
+        t->dt = keep;
+        if (!began)
+            return;
+    }
     cb = s_frame[s_slot].cb;
     if (!(pso = pipeline(vmod, fmod, nf4, topo))) {
         s_draw_skips[SKIP_PSO]++;
@@ -3735,6 +4266,7 @@ static int present_to_slot(NvrTarget *t, uint32_t hcw, uint32_t hch)
     ic.extent.depth = 1;
     vkCmdCopyImage(cb, t->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    slot->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+    gpu_time_end(cb);
     frame_submit(0, "nvr flip");
     xbox_FramebufferWindowPublishTexture();
     return 1;
@@ -3772,7 +4304,12 @@ static void nvr_on_flip(uint32_t surface_offset, uint32_t pitch)
         layer = win && xbox_FramebufferWindowVulkan() && present_to_slot(t, hcw, hch);
         if (win && !layer)
             hpx = readback(t);
+        if (s_rec) {
+            pass_end();
+            gpu_time_end(s_frame[s_slot].cb);
+        }
         frame_submit(0, "nvr flip");
+        gpu_time_flip();
         if (s_flips % 300 == 299)
             blob_save(0);
         if (++s_flips % 300 == 0)
@@ -3814,8 +4351,13 @@ static void nvr_on_flip(uint32_t surface_offset, uint32_t pitch)
  * executor holds for the vblank. */
 static void nvr_on_flip_ready(void)
 {
-    if (s_ready)
-        frame_submit(0, "nvr flip ready");
+    if (!s_ready)
+        return;
+    if (s_rec) {
+        pass_end();
+        gpu_time_end(s_frame[s_slot].cb);   /* the frame's work ends here */
+    }
+    frame_submit(0, "nvr flip ready");
 }
 
 static NvrTarget *target_at(uint32_t offset, uint32_t w, uint32_t h)
@@ -3860,6 +4402,38 @@ static const struct nv2a_pb_backend s_nvr = {
     nvr_sync_guest,
     nvr_on_flip_ready,
 };
+
+int nvr_precache_main(const char *list, const char *xbe,
+                      void (*progress)(unsigned done, unsigned total, void *ctx), void *ctx)
+{
+    unsigned last = ~0u;
+    const char *be = recomp_env(RENV_PB_BACKEND);
+
+    if (!be || strcasecmp(be, "native"))
+        return 4;
+    s_pre_list = list;
+    s_pre_xbe = xbe;
+    if (!init()) {
+        fprintf(stderr, LOGP "precache: no Vulkan device\n");
+        return 3;
+    }
+    if (s_pre_rc == -2)
+        return 2;
+    if (s_pre_rc < 0)
+        return 1;
+    while (s_warm_running && !__atomic_load_n(&s_warm_finished, __ATOMIC_ACQUIRE)) {
+        struct timespec ts = { 0, 50000000 };
+        unsigned d = __atomic_load_n(&s_warm_done, __ATOMIC_RELAXED);
+        if (d != last && progress)
+            progress(d, s_warm_total, ctx);
+        last = d;
+        nanosleep(&ts, NULL);
+    }
+    if (progress)
+        progress(s_warm_total, s_warm_total, ctx);
+    pc_stop();
+    return 0;
+}
 
 const struct nv2a_pb_backend *nvr_backend(void)
 {

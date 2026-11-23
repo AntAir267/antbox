@@ -137,6 +137,8 @@ typedef struct {
 
 static int s_state = -1;            /* -1 unread, 0 off, 1 on */
 static FILE *s_out;
+static uint32_t *s_fcount;          /* samples a lifted function (func_count) */
+static uint64_t  s_fsamples;
 
 /* The rows reach the file from a thread of their own (BO-245): the executor
  * only formats a row into this ring. Its own fflush every 64 flips was a
@@ -367,6 +369,8 @@ static void build_table(void)
         }
     }
     qsort(s_funcs, s_nfuncs, sizeof *s_funcs, cmp_func);
+    if (s_nfuncs)
+        s_fcount = (uint32_t *)calloc(s_nfuncs, sizeof *s_fcount);
 #if defined(__APPLE__)
     {
         unsigned long size = 0;
@@ -390,11 +394,12 @@ static void build_table(void)
             s_period_us);
 }
 
-static int bucket_of_pc(uintptr_t pc)
+/* The lifted function a host PC is in: its index in s_funcs, or -1. */
+static long func_of_pc(uintptr_t pc)
 {
     size_t lo = 0, hi = s_nfuncs;
     if (pc < s_code_lo || pc >= s_code_hi || !s_nfuncs || pc < s_funcs[0].host)
-        return B_HOST;
+        return -1;
     while (hi - lo > 1) {
         size_t mid = (lo + hi) / 2;
         if (s_funcs[mid].host <= pc)
@@ -402,7 +407,60 @@ static int bucket_of_pc(uintptr_t pc)
         else
             hi = mid;
     }
-    return s_funcs[lo].bucket;
+    return (long)lo;
+}
+
+static int bucket_of_pc(uintptr_t pc)
+{
+    long i = func_of_pc(pc);
+    return i < 0 ? B_HOST : s_funcs[i].bucket;
+}
+
+/* Per function, the samples a running guest thread was in it (recomp-kit's
+ * runtime/profile.cpp idea, MIT): RECOMP_TRACE=frametime writes the top of it to
+ * <file>.funcs at the exit, the guest address with its share of the running samples. */
+
+/* From a sampled thread's signal handler on Linux, so atomics and no allocation:
+ * the table is made with the function table (build_table). */
+static void func_count(uintptr_t pc)
+{
+    long i;
+    __atomic_add_fetch(&s_fsamples, 1, __ATOMIC_RELAXED);
+    if (s_fcount && (i = func_of_pc(pc)) >= 0)
+        __atomic_add_fetch(&s_fcount[i], 1, __ATOMIC_RELAXED);
+}
+
+static char s_funcs_path[1100];
+
+static int cmp_count_desc(const void *a, const void *b)
+{
+    uint32_t x = s_fcount[*(const size_t *)a], y = s_fcount[*(const size_t *)b];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void funcs_write(void)
+{
+    static const char *const bn[] = { "game", "d3d", "xdk", "spin", "host", "wait", "io" };
+    size_t *ord, i, n = 0;
+    FILE *f;
+
+    if (!s_fcount || !s_fsamples || !s_funcs_path[0] || !(f = fopen(s_funcs_path, "w")))
+        return;
+    ord = (size_t *)malloc(s_nfuncs * sizeof *ord);
+    if (ord) {
+        for (i = 0; i < s_nfuncs; i++)
+            if (s_fcount[i])
+                ord[n++] = i;
+        qsort(ord, n, sizeof *ord, cmp_count_desc);
+        fprintf(f, "# running samples %llu; per lifted function, top 200\n",
+                (unsigned long long)s_fsamples);
+        for (i = 0; i < n && i < 200; i++)
+            fprintf(f, "%6.2f%% %8u sub_%08X %s\n", 100.0 * s_fcount[ord[i]] / (double)s_fsamples,
+                    s_fcount[ord[i]], s_funcs[ord[i]].va,
+                    s_funcs[ord[i]].bucket < 7 ? bn[s_funcs[ord[i]].bucket] : "?");
+        free(ord);
+    }
+    fclose(f);
 }
 
 static void sample_once(void)
@@ -434,6 +492,7 @@ static void sample_once(void)
                 pc = (uintptr_t)st.__rip;
 #endif
             b = bucket_of_pc(pc);
+            func_count(pc);
             if (b == B_HOST && s_hout && i == s_main_slot) {
                 LONG k = InterlockedIncrement(&s_hs_n) - 1;
                 if (k < HS_MAX) {
@@ -483,6 +542,7 @@ static void sample_once(void)
             b = B_WAIT;
         else
             b = bucket_of_pc(pc);
+            func_count(pc);
         s_lastpc[i] = pc;
         s_cycles[i] = cyc;
 #elif defined(__linux__)
@@ -543,6 +603,7 @@ static void prof_handler(int sig, siginfo_t *si, void *ucv)
 #endif
     if (t_slot >= 0) {
         int b = bucket_of_pc(pc);
+        func_count(pc);
         count_sample(t_slot, b);
         if (b == B_HOST && s_hout && t_slot == s_main_slot) {
             LONG k = InterlockedIncrement(&s_hs_n) - 1;
@@ -608,6 +669,8 @@ static int frametime_on(void)
             fprintf(stderr, "  [FRAMETIME] cannot write %s\n", path);
             return 0;
         }
+        snprintf(s_funcs_path, sizeof s_funcs_path, "%s.funcs", path);
+        atexit(funcs_write);
         while (spin && *spin && s_nspin < FT_MAX_SPIN) {
             char *end;
             unsigned long v = strtoul(spin, &end, 16);
@@ -623,7 +686,7 @@ static int frametime_on(void)
         fprintf(s_out, "flip,t_ms,frame_ms,iv,late,ex_hold,ex_busy,ex_draw,ex_present,"
                 "ex_idle,g_game,g_d3d,g_xdk,g_spin,g_host,g_wait,g_threads,cpu_proc,"
                 "g_io,g_runq,m_game,m_d3d,m_xdk,m_spin,m_host,m_wait,m_io,m_runq,ex_cpu,"
-                "gpu_ms,tu_ms,tu_pred\n");
+                "gpu_ms,tu_ms,tu_pred,steps,idle_gwait,idle_grun,wait_va\n");
         fflush(s_out);
         ring_start();
         build_table();
@@ -835,7 +898,8 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
                         uint64_t scan, uint64_t draw, uint64_t present)
 {
     static uint64_t t0, last, p_hold, p_scan, p_draw, p_pres, p_cpu, p_self;
-    uint64_t now, cpu, self, frame, d_hold, d_scan;
+    uint64_t now, cpu, self, frame, d_hold, d_scan, ig, ir;
+    uint32_t iva;
     LONG c[B_COUNT], m[B_COUNT];
     int64_t rq, mrq;
     const double per = 1.0 / 1000.0;   /* the buckets hold microseconds */
@@ -866,11 +930,13 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
         return;
     }
     frame = now - last;
+    xbox_IdleSplitTake(&ig, &ir, &iva);
     d_hold = hold - p_hold;
     d_scan = scan - p_scan;
     n = snprintf(row, sizeof row, "%u,%.3f,%.3f,%u,%d,%.3f,%.3f,%.3f,%.3f,%.3f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%ld,%.3f,"
-            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+            "%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+            "%d,%.3f,%.3f,%08x\n",
             flip, (now - t0) / 1e6, frame / 1e6, iv, late,
             d_hold / 1e6, (double)(int64_t)(d_scan - d_hold) / 1e6,
             (draw - p_draw) / 1e6, (present - p_pres) / 1e6,
@@ -882,7 +948,8 @@ void xbox_FrametimeFlip(uint32_t flip, uint32_t iv, int late, uint64_t hold,
             m[B_GAME] * per, m[B_D3D] * per, m[B_XDK] * per, m[B_SPIN] * per,
             m[B_HOST] * per, m[B_WAIT] * per, m[B_IO] * per, mrq / 1e6,
             self > p_self && p_self ? (self - p_self) / 1e6 : 0.0,
-            b2d(s_gpu_bits), b2d(s_tu_bits), b2d(s_tup_bits));
+            b2d(s_gpu_bits), b2d(s_tu_bits), b2d(s_tup_bits),
+            xbox_PictureStepsCur(), ig / 1e6, ir / 1e6, iva);
     if (n > 0 && (size_t)n < sizeof row && !ring_put(row, (size_t)n, (flip & 63) == 0)) {
         fputs(row, s_out);
         if ((flip & 63) == 0)

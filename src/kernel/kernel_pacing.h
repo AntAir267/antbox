@@ -72,6 +72,30 @@ void xbox_SpinWait(uint32_t va);
  * when the mode is spin. */
 void xbox_SpinWake(void);
 
+/* BO-282.7 diagnostics. Threads inside xbox_SpinWait's sleeping wait now,
+ * and the loop VA of the last one to enter (the walker's idle split). */
+extern volatile int      g_xbox_spin_waiters;
+extern volatile uint32_t g_xbox_spin_wait_va;
+
+/* BO-282.6/.7: the simulation steps of each high-refresh picture, as the
+ * game decides them (hirefresh.c, one call a picture, before it renders),
+ * and the walker's view: xbox_PictureStepsFlip at each flip it executes,
+ * xbox_PictureStepsCur the steps of the picture it is executing (the next
+ * one pushed after the last flip; -1 when the game pushed none, as with
+ * high refresh off). Single producer, single consumer. */
+void xbox_PictureSteps(uint32_t steps);
+void xbox_PictureStepsFlip(void);
+int  xbox_PictureStepsCur(void);
+/* The ring's depth (pushed, not yet popped) at each pop: the largest seen
+ * since the last call, which zeroes it (BO-282.6 guard: 2 or less). */
+unsigned xbox_PictureStepsDepthMax(void);
+/* The walker's idle time while it waits for a new PUT, split by whether a
+ * guest thread sat in xbox_SpinWait meanwhile (and that loop's VA, the one
+ * with the most such time), added by the ack loop, taken (and zeroed) by
+ * the frame-time trace at each flip. */
+void xbox_IdleSplitAdd(uint64_t ns, int guest_waiting, uint32_t va);
+void xbox_IdleSplitTake(uint64_t *gwait_ns, uint64_t *grun_ns, uint32_t *va);
+
 /* Block until the vblank count reaches target, or timeout_ms passes; 1 when
  * it did, 0 on the timeout. Woken by xbox_VblankSignal, which the timer
  * thread calls after counting each vblank: a condition variable, as plume

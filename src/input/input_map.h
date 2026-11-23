@@ -114,7 +114,7 @@ extern const size_t xbox_input_map_count;
 
 /* Map one host pad to the guest gamepad (every field of *out is written).
  * Sticks go through xbox_InputApplyDeadzone() with xbox_InputDeadzone(). */
-/* The face buttons' layout (input.face_layout, the overlay's Input page):
+/* The face buttons' layout (input.face_layout, the overlay's Controls page):
  * a pad printed the Nintendo way has A on the right and B below, X above and
  * Y on the left, where the Xbox layout has B, A, Y and X. With the Nintendo
  * layout on, A and B and X and Y change places as the host pad is read, so
@@ -125,7 +125,7 @@ int  xbox_InputFaceLayoutNintendo(void);
 void xbox_InputMirrorFaceXInput(XBOX_HOST_XINPUT_GAMEPAD *pad);
 void xbox_InputMirrorFaceSdl(XBOX_HOST_SDL_GAMEPAD *pad);
 
-/* The driving controls (input.control_scheme, the overlay's Input page):
+/* The driving controls (input.control_scheme, the overlay's Controls page):
  * 0 is the title's own layout, 1 an alternative the title's host code
  * provides (the layout of another console's version of the game). The
  * toolkit only keeps the choice: what the alternative is, and when it holds

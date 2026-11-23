@@ -36,6 +36,21 @@ extern "C" {
     "    float  fog [[user(fog)]];\n" \
     "    float  psize [[point_size]];\n" \
     "};\n"
+/** VOut with two clip distances, the vertex programs' with
+ * D3D8_MSL_CLIP_RANGE; the fragment functions take VOut (BO-332). */
+#define D3D8_MSL_VOUT_CLIP \
+    "struct VOutC {\n" \
+    "    float4 pos [[position]];\n" \
+    "    float4 d0  [[user(d0)]];\n" \
+    "    float4 d1  [[user(d1)]];\n" \
+    "    float4 t0  [[user(t0)]];\n" \
+    "    float4 t1  [[user(t1)]];\n" \
+    "    float4 t2  [[user(t2)]];\n" \
+    "    float4 t3  [[user(t3)]];\n" \
+    "    float  fog [[user(fog)]];\n" \
+    "    float  psize [[point_size]];\n" \
+    "    float  cd [[clip_distance]] [2];\n" \
+    "};\n"
 
 /** The fragment constants: struct nv2a_ps_consts (nv2a_backend_common.h)
  * declared in float4/uint4 only, then Metal's own tex_bias (stage k's mip
@@ -67,6 +82,15 @@ extern "C" {
  * uint4 fog_ctl and uint4 spec_ctl.
  */
 #define D3D8_MSL_SCREEN_SPACE 0x1
+/**
+ * With D3D8_MSL_CLIP_RANGE (and SCREEN_SPACE), as D3D8_GLSL_CLIP_RANGE
+ * (d3d8_glsl.h): two clip distances keep window z inside [vp_off.z,
+ * vp_off.w] (SET_CLIP_MIN/MAX as normalised depth) when spec_ctl.z is 1
+ * (ZCLAMP_EN CULL); the backend clamps depth (MTLDepthClipModeClamp)
+ * instead of clipping at the near and far planes, as xemu (BO-332). The
+ * function returns VOutC (D3D8_MSL_VOUT_CLIP).
+ */
+#define D3D8_MSL_CLIP_RANGE   0x2
 
 int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
                           char *buf, int bufsize);

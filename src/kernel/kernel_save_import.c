@@ -2,6 +2,7 @@
 #include "kernel_save_import.h"
 #include "kernel.h"
 #include "kernel_console_keys.h"
+#include "kernel_ps2save.h"
 #include "recomp_save_dir.h"
 
 #include <ctype.h>
@@ -339,6 +340,13 @@ static int inf_dynamic(Inf *s)
 }
 
 /* 1 when `in` inflates to exactly `outlen` bytes. */
+static int inflate_raw(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen);
+
+int xbox_SaveImportInflate(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen)
+{
+    return inflate_raw(in, inlen, out, outlen);
+}
+
 static int inflate_raw(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen)
 {
     Inf s;
@@ -744,8 +752,8 @@ static int prepare_source(const char *input, const char *title_id, const char *w
         return 0;
     }
     if (!ends_with_ci(input, ".zip")) {
-        si_err(err, err_size, "%s is not a folder or a .zip file.", input);
-        return 0;
+        snprintf(root, root_n, "%s", input);     /* a PS2 save file or card image, or nothing */
+        return 2;
     }
     snprintf(unz, sizeof unz, "%s/unzip", work);
     recomp_fs_rm_tree(unz);
@@ -754,6 +762,21 @@ static int prepare_source(const char *input, const char *title_id, const char *w
         return 0;
     snprintf(root, root_n, "%s", unz);
     return 1;
+}
+
+static int ps2_spent(void *ctx)
+{
+    return lim_spent((Lim *)ctx);
+}
+
+static int ps2_shallow(const char *dir, void *ctx)
+{
+    Lim *b = (Lim *)ctx;
+    if (b->l && b->l->shallow && b->l->shallow(dir, b->l->ctx)) {
+        b->skipped = 1;
+        return 1;
+    }
+    return 0;
 }
 
 int xbox_SaveImportCheckBounded(const char *path, const char *title_id, const xbox_save_check_limits *lim)
@@ -769,6 +792,19 @@ int xbox_SaveImportCheckBounded(const char *path, const char *title_id, const xb
     b.deadline = si_now_ms() + (uint64_t)(lim && lim->max_ms > 0 ? lim->max_ms : SI_CHECK_MS);
     if (locate(path, title_id, save, sizeof save, &have, NULL, 0, &b))
         return 1;
+    if (!b.out) {
+        /* A PS2 save (BO-323): its files have to be read, within the same bound. */
+        ps2save_bound pb;
+        ps2save_b3 *ps = (ps2save_b3 *)malloc(sizeof *ps);
+        int r;
+        pb.spent = ps2_spent;
+        pb.shallow = ps2_shallow;
+        pb.ctx = &b;
+        r = ps ? ps2save_find(path, 2, &pb, ps, NULL, 0) : 0;
+        free(ps);
+        if (r > 0)
+            return 2;
+    }
     return b.out || b.skipped ? -1 : 0;
 }
 
@@ -784,16 +820,200 @@ void xbox_SaveImportCleanup(const char *work_root)
     recomp_fs_rm_tree(w);
 }
 
+/* ── a PS2 save (BO-323) ──────────────────────────────────────────── */
+
+static const char k_save_id[] = "57BD267AFF58";   /* the folder the title gives "Profile 1" */
+
+/* A UTF-16 text file as the title's *.xbx metadata are: the byte order
+ * mark, then `text` (ASCII) widened. */
+static int write_meta(const char *path, const char *text)
+{
+    uint8_t b[256];
+    size_t n = 2, i;
+    b[0] = 0xFF;
+    b[1] = 0xFE;
+    for (i = 0; text[i] && n + 2 <= sizeof b; i++) {
+        b[n++] = (uint8_t)text[i];
+        b[n++] = 0;
+    }
+    return write_file(path, b, n);
+}
+
+typedef struct {
+    const char *udir;
+    char save[SI_PATH];             /* the save folder whose profile was taken */
+    uint8_t settings[PS2SAVE_SETTINGS_LEN];
+    int have;
+} KeepScan;
+
+static int keep_cb(const char *dir, const char *name, int dir_entry, void *vctx)
+{
+    KeepScan *k = (KeepScan *)vctx;
+    char sd[SI_PATH], p[SI_PATH];
+    uint8_t *d;
+    size_t n = 0;
+    if (!dir_entry || name[0] == '.' || strlen(dir) + strlen(name) + 16 >= sizeof sd)
+        return 1;
+    snprintf(sd, sizeof sd, "%s/%s", dir, name);
+    if (!find_named(sd, k_profile, 0, p, sizeof p) || !(d = read_file(p, &n, PS2SAVE_XBOX_SIZE)))
+        return 1;
+    if (n == PS2SAVE_XBOX_SIZE && rd32(d) == 0x10 && ps2save_sum(d, 0xE810) == rd32(d + 0xE810)) {
+        memcpy(k->settings, d + PS2SAVE_SETTINGS, PS2SAVE_SETTINGS_LEN);
+        snprintf(k->save, sizeof k->save, "%s", sd);
+        k->have = 1;
+    }
+    free(d);
+    return !k->have;
+}
+
+/* The settings of the save in use under `keep_root`, when there is one. */
+static int keep_settings(const char *keep_root, const char *title_id, KeepScan *k)
+{
+    char ku[SI_PATH], kd[SI_PATH];
+    memset(k, 0, sizeof *k);
+    if (!keep_root || !find_named(keep_root, "UDATA", 1, ku, sizeof ku) || !find_named(ku, title_id, 1, kd, sizeof kd))
+        return 0;
+    recomp_fs_each(kd, keep_cb, k);
+    return k->have;
+}
+
+static void choice_fill(const ps2save_b3 *ps, xbox_ps2_choice *c)
+{
+    int i;
+    memset(c, 0, sizeof *c);
+    for (i = 0; i < PS2SAVE_SLOTS; i++) {
+        const ps2save_profile *q = &ps->prof[i];
+        if (!q->used)
+            continue;
+        c->slot[c->count] = i + 1;
+        snprintf(c->line[c->count], sizeof c->line[c->count], "%s, %d gold medals, %.1f hours",
+                 q->name[0] ? q->name : "(no name)", q->gold, q->hours);
+        c->count++;
+    }
+}
+
+static int prepare_ps2(const ps2save_b3 *ps, int ps2_slot, xbox_ps2_choice *choice, const char *title_id,
+                       const char *keep_root, const char *work, char *out, unsigned out_size,
+                       char *info, unsigned info_size, char *err, unsigned err_size)
+{
+    xbox_ps2_choice c;
+    KeepScan keep;
+    uint8_t zero[16] = { 0 }, hd[16], prof[PS2SAVE_XBOX_SIZE];
+    char dst[SI_PATH], dsave[SI_PATH], q[SI_PATH], src[SI_PATH];
+    int slot = -1, i, keyed;
+    FILE *f;
+
+    choice_fill(ps, &c);
+    if (choice)
+        *choice = c;
+    if (ps2_slot >= 1 && ps2_slot <= PS2SAVE_SLOTS) {
+        if (!ps->prof[ps2_slot - 1].used) {
+            si_err(err, err_size, "Profile %d of the PS2 save %s is empty.", ps2_slot, ps->dir);
+            return 0;
+        }
+        slot = ps2_slot - 1;
+    } else if (c.count == 1) {
+        slot = c.slot[0] - 1;
+    } else {
+        char list[400] = "";
+        for (i = 0; i < c.count; i++) {
+            size_t l = strlen(list);
+            snprintf(list + l, sizeof list - l, "%s%d: %s", i ? "; " : "", c.slot[i], c.line[i]);
+        }
+        si_err(err, err_size, "The PS2 save %s holds %d profiles (%s). Choose the one to import.", ps->dir,
+               c.count, list);
+        return 0;
+    }
+
+    keep_settings(keep_root, title_id, &keep);
+    if (!ps2save_to_xbox(ps->data, slot, keep.have ? keep.settings : NULL, prof)) {
+        si_err(err, err_size, "Profile %d of the PS2 save %s could not be converted.", slot + 1, ps->dir);
+        return 0;
+    }
+    /* Signed with the port's own (zero) keys; a console key, when one is
+     * set, belongs to saves made on that console. */
+    keyed = xbox_ConsoleKeyLoad(hd);
+    sign_profile(prof, sizeof prof, zero, zero);
+
+    snprintf(dst, sizeof dst, "%s/out/UDATA/%s", work, title_id);
+    snprintf(dsave, sizeof dsave, "%s/%s", dst, k_save_id);
+    recomp_fs_mkdir_p(dsave);
+    snprintf(q, sizeof q, "%s/%s", dsave, k_profile);
+    if (!write_file(q, prof, sizeof prof)) {
+        si_err(err, err_size, "The save could not be written under %s.", work);
+        return 0;
+    }
+    snprintf(q, sizeof q, "%s/%s", dsave, k_meta);
+    if (!write_meta(q, "Name=Profile 1\r\nNoCopy=1\r\n")) {
+        si_err(err, err_size, "The save could not be written under %s.", work);
+        return 0;
+    }
+    /* The save's picture from the save in use, when there is one. */
+    if (keep.have && find_named(keep.save, "SaveImage.xbx", 0, src, sizeof src)) {
+        size_t n2 = 0;
+        uint8_t *d = read_file(src, &n2, 4u << 20);
+        if (d) {
+            snprintf(q, sizeof q, "%s/SaveImage.xbx", dsave);
+            write_file(q, d, n2);
+            free(d);
+        }
+    }
+    /* The title's own files from the save root in use; the title's name
+     * written when there is none. */
+    for (i = 0; i < 3; i++) {
+        char kd[SI_PATH], ku[SI_PATH];
+        size_t n2 = 0;
+        uint8_t *d = NULL;
+        if (keep_root && find_named(keep_root, "UDATA", 1, ku, sizeof ku) && find_named(ku, title_id, 1, kd, sizeof kd) &&
+            find_named(kd, k_title_files[i], 0, src, sizeof src))
+            d = read_file(src, &n2, 4u << 20);
+        snprintf(q, sizeof q, "%s/%s", dst, k_title_files[i]);
+        if (d) {
+            write_file(q, d, n2);
+            free(d);
+        } else if (i == 0) {
+            write_meta(q, "TitleName=Burnout 3\r\n");
+        }
+    }
+    snprintf(q, sizeof q, "%s/out/save-export.txt", work);
+    f = fopen(q, "w");
+    if (f) {
+        fprintf(f, "title %s\nmade %lld\nConverted from a PlayStation 2 save (%s, profile %d).\n", title_id,
+                (long long)time(NULL), ps->dir, slot + 1);
+        fclose(f);
+    }
+    snprintf(out, out_size, "%s/out", work);
+    if (!recomp_save_export_check(out, title_id, err, err_size))
+        return 0;
+    if (info && info_size)
+        snprintf(info, info_size, "PS2 save %s (%s): profile %s, %d gold medals, %.1f hours. %s%s", ps->dir, ps->kind,
+                 ps->prof[slot].name[0] ? ps->prof[slot].name : "(no name)", ps->prof[slot].gold,
+                 ps->prof[slot].hours,
+                 keep.have ? "Your current game settings are kept." : "Settings taken from the PS2 save.",
+                 keyed ? " Signed for this port's own keys: it shows as unusable while a console key is set"
+                         " (System page)." : "");
+    return 1;
+}
+
 int xbox_SaveImportPrepare(const char *input, const char *title_id, const char *keep_root,
                            const char *work_root, char *out, unsigned out_size,
                            char *info, unsigned info_size, char *err, unsigned err_size)
+{
+    return xbox_SaveImportPrepareSlot(input, title_id, keep_root, work_root, 0, NULL, out, out_size, info,
+                                      info_size, err, err_size);
+}
+
+int xbox_SaveImportPrepareSlot(const char *input, const char *title_id, const char *keep_root,
+                               const char *work_root, int ps2_slot, xbox_ps2_choice *choice,
+                               char *out, unsigned out_size, char *info, unsigned info_size,
+                               char *err, unsigned err_size)
 {
     char work[SI_PATH], root[SI_PATH], save[SI_PATH], parent[SI_PATH], id[SI_PATH];
     char dst[SI_PATH], dsave[SI_PATH], p[SI_PATH], q[SI_PATH], name[40], extra[8] = "";
     uint8_t zero[16] = { 0 }, hd[16];
     uint8_t *prof;
     size_t pn = 0;
-    int have_tid, nfiles = 0, resign = 1, i;
+    int have_tid, nfiles = 0, resign = 1, i, kind;
     FILE *f;
 
     if (out && out_size)
@@ -802,6 +1022,8 @@ int xbox_SaveImportPrepare(const char *input, const char *title_id, const char *
         info[0] = 0;
     if (err && err_size)
         err[0] = 0;
+    if (choice)
+        memset(choice, 0, sizeof *choice);
     snprintf(work, sizeof work, "%s/" SI_WORK, work_root);
     recomp_fs_rm_tree(work);
     recomp_fs_mkdir_p(work);
@@ -809,10 +1031,37 @@ int xbox_SaveImportPrepare(const char *input, const char *title_id, const char *
         si_err(err, err_size, "Nothing can be written in %s.", work_root);
         return 0;
     }
-    if (!prepare_source(input, title_id, work, root, sizeof root, err, err_size))
+    if (!(kind = prepare_source(input, title_id, work, root, sizeof root, err, err_size)))
         goto fail;
-    if (!locate(root, title_id, save, sizeof save, &have_tid, err, err_size, NULL))
+    if (kind == 2 || !locate(root, title_id, save, sizeof save, &have_tid, err, err_size, NULL)) {
+        /* Not an Xbox save: a PS2 one? (BO-323) */
+        char perr[600] = "";
+        ps2save_b3 *ps = (ps2save_b3 *)malloc(sizeof *ps);
+        int r = ps ? ps2save_find(root, 4, NULL, ps, perr, sizeof perr) : 0;
+        if (r > 0) {
+            int ok = prepare_ps2(ps, ps2_slot, choice, title_id, keep_root, work, out, out_size, info, info_size,
+                                 err, err_size);
+            free(ps);
+            if (!ok)
+                goto fail;
+            snprintf(p, sizeof p, "%s/unzip", work);
+            recomp_fs_rm_tree(p);
+            return 1;
+        }
+        free(ps);
+        if (kind == 2) {
+            si_err(err, err_size, "%s", perr[0] ? perr : "Not a save.");
+        } else if (strncmp(err, "This save belongs", 17) != 0) {
+            if (perr[0] && strncmp(perr, "No Burnout 3 PS2 save", 21) != 0)
+                si_err(err, err_size, "%s", perr);       /* a PS2 save, damaged */
+            else
+                si_err(err, err_size, "No Burnout 3 save in %s. Expected an Xbox save folder (SaveMeta.xbx and"
+                       " \"Profile 1\" in it, UDATA/%s/<save id>/ on the Xbox) or a PS2 save (a memory card"
+                       " image, a .psu, .max, .cbs, .xps, .sps or .psv file, or a BASLUS-21050 style folder),"
+                       " or a folder or zip that holds one.", input, title_id);
+        }
         goto fail;
+    }
     parent_copy(save, parent, sizeof parent);
     leaf_copy(save, id, sizeof id);
     {
@@ -839,7 +1088,7 @@ int xbox_SaveImportPrepare(const char *input, const char *title_id, const char *
     }
     profile_name(prof, pn, name, sizeof name);
     if (xbox_ConsoleKeyLoad(hd)) {
-        /* A console key is set (Advanced): the profile is signed for that
+        /* A console key is set (System page): the profile is signed for that
          * console, as it came. */
         resign = 0;
     } else {

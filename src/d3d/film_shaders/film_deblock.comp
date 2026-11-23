@@ -1,0 +1,56 @@
+// A light deblock of a film frame (BO-136; the WMV2 frames' 8x8 block
+// edges). Own code, MIT. Port of the BO-136 probe's deblock8.hook to the
+// decoded RGB frame: in YCbCr (BT.601, as the film was coded), the step
+// across a block edge is spread as a ramp over half a block on each side,
+// but only where the step is small and both sides are flat (a real edge is
+// left alone). Luma on the 8-texel grid with its own thresholds; chroma
+// (4:2:0, so one chroma texel is two of these) on the same grid with taps
+// one chroma texel apart and lower thresholds.
+// mode 0: vertical edges, source (binding 0) -> destination;
+// mode 1: horizontal edges, aux (binding 1) -> destination.
+#include "common.glsl"
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D aux;
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D destination;
+
+vec4 tap(ivec2 p)
+{
+    p = edge(p, pc.size);
+    return pc.mode == 0 ? texelFetch(source, p, 0) : imageLoad(aux, p);
+}
+
+const mat3 TO_YCC = mat3( 0.299,     -0.168736,  0.5,
+                          0.587,     -0.331264, -0.418688,
+                          0.114,      0.5,      -0.081312);
+const mat3 TO_RGB = mat3( 1.0,        1.0,       1.0,
+                          0.0,       -0.344136,  1.772,
+                          1.402,     -0.714136,  0.0);
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size)))
+        return;
+    ivec2 ax = pc.mode == 0 ? ivec2(1, 0) : ivec2(0, 1);
+    int r = (pc.mode == 0 ? p.x : p.y) & 7;
+    // e: from this texel to q0, the first texel past the nearest block edge.
+    int e;
+    float w;
+    if (r < 4) { e = -r;    w = -(1.0 - float(r) / 4.0) * 0.25; }
+    else       { e = 8 - r; w =  (1.0 - float(7 - r) / 4.0) * 0.25; }
+    vec4 c4 = tap(p);
+    vec3 c = TO_YCC * c4.rgb;
+    vec3 p0 = TO_YCC * tap(p + ax * (e - 1)).rgb;
+    vec3 q0 = TO_YCC * tap(p + ax * e).rgb;
+    vec3 p1 = TO_YCC * tap(p + ax * (e - 2)).rgb;
+    vec3 q1 = TO_YCC * tap(p + ax * (e + 1)).rgb;
+    vec3 p1c = TO_YCC * tap(p + ax * (e - 3)).rgb;
+    vec3 q1c = TO_YCC * tap(p + ax * (e + 2)).rgb;
+    vec3 d = q0 - p0;
+    if (abs(d.x) < 0.1 && abs(p1.x - p0.x) < 0.05 && abs(q1.x - q0.x) < 0.05)
+        c.x += d.x * w;
+    if (all(lessThan(abs(d.yz), vec2(0.06))) && all(lessThan(abs(p1c.yz - p0.yz), vec2(0.03)))
+            && all(lessThan(abs(q1c.yz - q0.yz), vec2(0.03))))
+        c.yz += d.yz * w;
+    imageStore(destination, p, vec4(clamp(TO_RGB * c, 0.0, 1.0), c4.a));
+}

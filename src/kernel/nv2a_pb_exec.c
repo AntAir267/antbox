@@ -46,6 +46,7 @@
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_pb_split.h"
 #if defined(__linux__)
 #include <errno.h>
 #include <unistd.h>
@@ -126,18 +127,23 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  * 8) starts at 0x2000, where [device+0x30] says D3D reads the fence, and
  * releases written at offset 0 from physical 0 left the fence unowned.
  * *ok = 0 when no entry is found: the caller keeps base 0. */
-static uint32_t dma_object_base(uint32_t handle, int *ok)
+/* The register aperture is plain memory at its Xbox address
+ * (xbox_memory_layout.c), mapped before the executor runs. PRAMIN (instance
+ * memory) is at +0x700000 in it. */
+static volatile uint32_t *pramin_words(void)
 {
-    /* The register aperture is plain memory at its Xbox address
-     * (xbox_memory_layout.c), mapped before the executor runs. */
-    uint8_t *regs = (uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u;
-    volatile uint32_t *ramht_reg = (volatile uint32_t *)(regs + 0x002210u);
-    volatile uint32_t *pramin = (volatile uint32_t *)(regs + 0x700000u);
-    uint32_t ramht, table, size, i, ctx = 0, inst, flags, frame;
-    int found = 0;
+    return (volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x700000u);
+}
 
-    *ok = 0;
-    ramht = *ramht_reg;
+/* A handle's object, as the byte offset of its instance in PRAMIN; 0 when
+ * the handle has no RAMHT entry or its instance is out of range. */
+static uint32_t ramht_instance(uint32_t handle)
+{
+    volatile uint32_t *ramht_reg = (volatile uint32_t *)
+        ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x002210u);
+    volatile uint32_t *pramin = pramin_words();
+    uint32_t ramht = *ramht_reg, table, size, i, inst;
+
     table = ((ramht >> 4) & 0x1Fu) << 12;
     size = 1u << (((ramht >> 16) & 3u) + 12);
     /* A scan, not xemu's hash: the table is at most 32 KB, this runs once per
@@ -145,20 +151,33 @@ static uint32_t dma_object_base(uint32_t handle, int *ok)
     for (i = 0; i + 8 <= size; i += 8) {
         if (pramin[(table + i) / 4] == handle
                 && (pramin[(table + i + 4) / 4] & 0x80000000u)) {
-            ctx = pramin[(table + i + 4) / 4];
-            found = 1;
-            break;
+            inst = (pramin[(table + i + 4) / 4] & 0xFFFFu) << 4;
+            return inst && inst + 12 <= 0x100000u ? inst : 0;
         }
     }
-    if (!found)
-        return 0;
-    inst = (ctx & 0xFFFFu) << 4;
-    if (inst + 12 > 0x100000u)
+    return 0;
+}
+
+static uint32_t dma_object_base(uint32_t handle, int *ok)
+{
+    uint32_t inst = ramht_instance(handle), flags, frame;
+    volatile uint32_t *pramin = pramin_words();
+
+    *ok = 0;
+    if (!inst)
         return 0;
     flags = pramin[inst / 4];
     frame = pramin[inst / 4 + 2];
     *ok = 1;
     return (frame & 0xFFFFF000u) | (flags >> 20);
+}
+
+/* A handle's object class (the low byte of its instance's first word, as
+ * PGRAPH reads it: xemu's GRCLASS); 0 when the handle has no entry. */
+static uint32_t object_class(uint32_t handle)
+{
+    uint32_t inst = ramht_instance(handle);
+    return inst ? pramin_words()[inst / 4] & 0xFFu : 0;
 }
 
 static uint32_t s_sema_dma_base;           /* the semaphore context's base */
@@ -1026,6 +1045,7 @@ static void dump_present_bmp(void)
  * by commas, spaces or newlines; append to the file rather than rewrite it
  * (a change is seen by its size or time). The file may not exist yet. */
 #include <sys/stat.h>
+static uint32_t s_dumping;      /* the listed flip being written, + 1 */
 static int s_dump_at_n = -1;
 static uint32_t s_dump_at_lo[64], s_dump_at_hi[64];
 static const char *s_dump_at_file;
@@ -1190,10 +1210,31 @@ static void dump_at_flip(uint32_t flip)
     if (!here || !prefix || !nv2a_pb_dump_at_listed(flip))
         return;
     snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
+    s_dumping = flip + 1u;
     if (!write_present_bmp(path))
         fprintf(stderr, "  [GPU] flip %u: fb_dump_at dump failed\n", flip);
     else if (s_dump_at_file)    /* a driver waits for this line */
         fprintf(stderr, "  [GPU] fb_dump_at: dumped %s\n", path);
+    s_dumping = 0;
+}
+
+/* RECOMP_DEBUG=fb_dump_host=1 (BO-385): while a listed flip is written, a
+ * backend that writes a scaled target back hands its host pixels here
+ * first, and they go out at their own size beside the guest-size dump, as
+ * <prefix>host_flip_NNNNN.bmp: what render.scale draws, which the 640-wide
+ * dump averages away. */
+void nv2a_pb_dump_host_px(const uint8_t *px, uint32_t hw, uint32_t hh)
+{
+    static int on = -1;
+    const char *prefix = recomp_env(RENV_FB_DUMP);
+    char path[512];
+
+    if (on < 0)
+        on = recomp_env_on(RENV_FB_DUMP_HOST);
+    if (!on || !s_dumping || !prefix || !px)
+        return;
+    snprintf(path, sizeof path, "%shost_flip_%05u.bmp", prefix, s_dumping - 1u);
+    write_bmp_at(path, px, hw * 4u, hw, hh, 4, 0);
 }
 
 /* Write the current surface out as a 24-bit BMP.
@@ -2257,8 +2298,6 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
     case 0x17F8: s_vsh.clip_plane_mode = param; return 1; /* SET_SHADER_CLIP_PLANE_MODE */
     case 0x1E6C: s_vsh.shadow_func = param; return 1;     /* SET_SHADOW_COMPARE_FUNC */
-    case 0x0394: s_vsh.clip_min = u2f(param); return 1;   /* SET_CLIP_MIN */
-    case 0x0398: s_vsh.clip_max = u2f(param); return 1;   /* SET_CLIP_MAX */
     default: break;
     }
     if (method >= NV097_SET_TRANSFORM_PROGRAM_M
@@ -2355,6 +2394,12 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.shader_ctl = (s_vsh.shader_ctl & ~0xFFFu) | (param & 0xFFFu); return 1;
     case 0x1E78:                        /* SET_SHADER_OTHER_STAGE_INPUT */
         s_vsh.shader_ctl = (s_vsh.shader_ctl & ~0xFFFF000u) | (param & 0xFFFF000u); return 1;
+    case 0x0394:                        /* SET_CLIP_MIN */
+        s_vsh.clip_min = u2f(param); s_vsh.clip_set = 1; return 1;
+    case 0x0398:                        /* SET_CLIP_MAX */
+        s_vsh.clip_max = u2f(param); s_vsh.clip_set = 1; return 1;
+    case 0x1D78:                        /* SET_ZMIN_MAX_CONTROL */
+        s_vsh.zminmax = param; return 1;
     case NV097_SET_FOG_ENABLE_M:        s_vsh.fog_enable = param != 0;  return 1;
     case NV097_SET_FOG_COLOR_M:         s_vsh.fog_color = param;        return 1;
     case NV097_SET_ALPHA_TEST_ENABLE_M: s_vsh.atest_enable = param != 0; return 1;
@@ -2583,8 +2628,13 @@ static void vsh_transform(uint32_t index, XfVert *xv)
      * already surface units): use w = 1, as the D3D11/Metal epilogues do and
      * as xemu's clampAwayZeroInf keeps such a vertex in front of the eye.
      * 1 rather than xemu's 2^-64: 1/w then cannot overflow the CPU LOD
-     * quotient, and the triangle keeps the unit-w fast path. */
-    if (xv->w == 0.0f)
+     * quotient, and the triangle keeps the unit-w fast path.
+     * +inf is the reciprocal of a pre-transformed vertex's 0 RHW (2D quads,
+     * movies) and is drawn at w = 1 too (upstream b43e8db): left infinite it
+     * failed the finite test below and the triangle was dropped. xemu clamps
+     * it to 2^64, the same result when a triangle's corners share one w; the
+     * GPU path clamps as xemu does (d3d8_vsh_glsl.c). */
+    if (xv->w == 0.0f || (isinf(xv->w) && xv->w > 0.0f))
         xv->w = 1.0f;
     for (k = 0; k < 4; k++) {
         float c = o.o[NV2A_VSH_O_D0][k], s = o.o[NV2A_VSH_O_D1][k];
@@ -2827,6 +2877,111 @@ void nv2a_pb_perf_scan_end(void)
     s_perf.scan += now - s_perf.scan_t0;
     s_perf.scan_all += now - s_perf.scan_t0;
     s_perf.scan_t0 = now;
+}
+
+/* RECOMP_TRACE=pb_split=<file>[:<n>] (nv2a_pb_split.h, BO-282.12): the
+ * walker's and the Vulkan backend's counters, one line a flip, written here
+ * where the frametime trace takes the executor's totals, so a line's flip is
+ * ft.csv's. Times are the sampled ticks as microseconds, unscaled: the
+ * analysis scales a class by its headers over its timed headers. */
+static FILE *s_split_out;
+static uint64_t s_split_tick0, s_split_ns0;
+
+static const char *const s_split_cls[PBS_N] = {
+    "state", "xconst", "xprog", "xff", "comb", "tex", "vfmt", "index", "inline", "begin",
+    "imm", "surf", "clear", "sync", "flip", "other"
+};
+static const char *const s_split_kind[PBD_N] = { "array", "inline", "imm" };
+static const char *const s_split_vk[VKS_N] = {
+    "vs", "surface", "stages", "fs", "prim", "vpc", "tex", "hdrz", "ubo", "gather",
+    "tset", "enc", "pso", "cmd"
+};
+static const char *const s_split_vkx[VKX_N] = { "texbind", "cube", "rttex", "sampler" };
+
+void nv2a_split_flip(uint32_t flip)
+{
+    static int tried;
+    struct nv2a_split *s = nv2a_split, keep;
+    uint64_t tick, ns;
+    double us;
+    int i;
+
+    if (!tried) {
+        const char *e = recomp_env(RENV_PB_SPLIT);
+        char path[1024];
+        const char *colon;
+        unsigned rate = 4;
+        tried = 1;
+        if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "1"))
+            return;
+        snprintf(path, sizeof path, "%s", e);
+        colon = strrchr(e, ':');
+        if (colon && colon[1] >= '0' && colon[1] <= '9' && !strchr(colon, '/')
+                && !strchr(colon, '\\')) {
+            rate = (unsigned)atoi(colon + 1);
+            path[colon - e] = 0;
+        }
+        s_split_out = fopen(path, "w");
+        s = (struct nv2a_split *)calloc(1, sizeof *s);
+        if (!s_split_out || !s) {
+            fprintf(stderr, "  [GPU] pb_split: cannot write %s\n", path);
+            free(s);
+            return;
+        }
+        s->rate = rate ? rate : 1;
+        s->rng = 0x9E3779B9u;
+        s_split_tick0 = nv2a_split_tick();
+        s_split_ns0 = rt_now();
+        fprintf(s_split_out, "flip,t_ms,ns_per_tick,rate");
+        for (i = 0; i < PBS_N; i++)
+            fprintf(s_split_out, ",h_%s,w_%s,ht_%s,us_%s", s_split_cls[i], s_split_cls[i],
+                    s_split_cls[i], s_split_cls[i]);
+        fprintf(s_split_out, ",draws,draws_timed");
+        for (i = 0; i < VKS_N; i++)
+            fprintf(s_split_out, ",vk_%s_us", s_split_vk[i]);
+        for (i = 0; i < VKX_N; i++)
+            fprintf(s_split_out, ",x_%s_n,x_%s_us", s_split_vkx[i], s_split_vkx[i]);
+        for (i = 0; i < PBD_N; i++)
+            fprintf(s_split_out, ",d_%s,v_%s,d_%s_us", s_split_kind[i], s_split_kind[i],
+                    s_split_kind[i]);
+        fprintf(s_split_out, ",rehash,rehash_kb,rehash_us,up,up_new,up_kb,up_us,own,own_kb,"
+                "own_us,cube_copies,syncs,sync_us\n");
+        fprintf(stderr, "  [GPU] pb_split: one line per flip into %s, 1 in %u timed\n",
+                path, s->rate);
+        nv2a_split = s;
+        return;             /* the first line is the next flip's */
+    }
+    if (!s)
+        return;
+    tick = nv2a_split_tick();
+    ns = rt_now();
+    us = tick > s_split_tick0 ? (double)(ns - s_split_ns0) / (double)(tick - s_split_tick0) / 1e3
+                              : 0.0;
+    fprintf(s_split_out, "%u,%.3f,%.6f,%u", flip, ns / 1e6, us * 1e3, s->rate);
+    for (i = 0; i < PBS_N; i++)
+        fprintf(s_split_out, ",%u,%u,%u,%.1f", s->hdr[i], s->words[i], s->hdr_timed[i],
+                (double)s->hdr_ticks[i] * us);
+    fprintf(s_split_out, ",%u,%u", s->draws, s->draws_timed);
+    for (i = 0; i < VKS_N; i++)
+        fprintf(s_split_out, ",%.1f", (double)s->vk_ticks[i] * us);
+    for (i = 0; i < VKX_N; i++)
+        fprintf(s_split_out, ",%u,%.1f", s->vkx_calls[i], (double)s->vkx_ticks[i] * us);
+    for (i = 0; i < PBD_N; i++)
+        fprintf(s_split_out, ",%u,%u,%.1f", s->kd[i], s->kv[i], (double)s->kd_ns[i] / 1e3);
+    fprintf(s_split_out, ",%u,%u,%.1f,%u,%u,%u,%.1f,%u,%u,%.1f,%u,%u,%.1f\n", s->rehash,
+            s->rehash_kb, (double)s->rehash_ticks * us, s->up, s->up_new, s->up_kb,
+            (double)s->up_ticks * us, s->own_hash, s->own_kb, (double)s->own_ticks * us,
+            s->cube_copies, s->syncs, (double)s->sync_ticks * us);
+    if ((flip & 63u) == 0)
+        fflush(s_split_out);
+    /* The open header (FLIP_STALL's, now) and the sampler carry over. */
+    keep = *s;
+    memset(s, 0, sizeof *s);
+    s->rate = keep.rate;
+    s->rng = keep.rng;
+    s->open_t0 = keep.open_t0;
+    s->open_cls = keep.open_cls;
+    s->draw_t = keep.draw_t;
 }
 
 /* ---- Texture stages and register combiners ----------------------------
@@ -5649,6 +5804,12 @@ static void draw_primitive(void)
             uint64_t d_ns = rt_now() - t0;
             s_perf.draw += d_ns;
             s_perf.draw_all += d_ns;
+            if (nv2a_split) {       /* RECOMP_TRACE=pb_split (BO-282.12) */
+                int k = !s_gpu.inline_active ? PBD_ARRAY : s_gpu.imm_count ? PBD_IMM : PBD_INLINE;
+                nv2a_split->kd[k]++;
+                nv2a_split->kv[k] += s_gpu.idx_count;
+                nv2a_split->kd_ns[k] += d_ns;
+            }
         }
         if (s_backend->writes_back)
             s_gpu_backend_batches++;
@@ -6645,12 +6806,331 @@ static inline void inline_array(uint32_t param)
                         " the rest is dropped\n", (unsigned)NV_MAX_INLINE);
 }
 
+static int s_exec_inited;   /* nv2a_pb_exec_method's first call has run */
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "nv2a_pb_exec_run copies ARRAY_ELEMENT16 words as their two 16-bit halves in memory order"
+#endif
+
+/* nv2a_pb_state.h: n parameter words of one non-incrementing header on
+ * subchannel 0, ARRAY_ELEMENT16 or INLINE_ARRAY, all at once: what n calls
+ * of nv2a_pb_exec_method would do with them (array_element16 and
+ * inline_array, word by word), as one copy and one limit check (BO-282:
+ * ARRAY_ELEMENT16 is half a race frame's words, and a call per word was
+ * most of the walker's time). */
+int nv2a_pb_exec_run(uint32_t method, const uint32_t *w, uint32_t n)
+{
+    uint32_t room, m;
+
+    if (!s_exec_inited
+            || (method != NV097_ARRAY_ELEMENT16 && method != NV097_INLINE_ARRAY))
+        return 0;
+    s_perf.methods += n;
+    if (!s_gpu.prim || !n)
+        return 1;
+    if (method == NV097_ARRAY_ELEMENT16) {
+        /* Two 16-bit indices a word, low half first: the words' bytes in
+         * order on a little-endian host. Whole words while two slots are
+         * left, then (one slot left) the first half of the next, and the
+         * batch is cut. */
+        room = NV_MAX_INDICES - s_gpu.idx_count;
+        m = n < room / 2u ? n : room / 2u;
+        memcpy(&s_gpu.idx[s_gpu.idx_count], w, (size_t)m * 4u);
+        s_gpu.idx_count += 2u * m;
+        if (m < n) {
+            if (s_gpu.idx_count < NV_MAX_INDICES)
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(w[m] & 0xFFFF);
+            note_idx_overflow();
+        }
+        return 1;
+    }
+    room = NV_MAX_INLINE - s_gpu.inline_count;
+    m = n < room ? n : room;
+    memcpy(&s_gpu.inline_buf[s_gpu.inline_count], w, (size_t)m * 4u);
+    s_gpu.inline_count += m;
+    if (m < n) {
+        if (!s_inline_overflow)
+            fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords:"
+                            " the rest is dropped\n", (unsigned)NV_MAX_INLINE);
+        s_inline_overflow += n - m;
+    }
+    return 1;
+}
+
+
+/* nv2a_pb_state.h (BO-282.12): an immediate-mode run from the walker. A
+ * spark shower or a debris cloud is drawn a vertex at a time, three or four
+ * headers a vertex (colour, texture coordinate, position), up to 165 000
+ * headers a picture; through nv2a_pb_exec_method each parameter word paid
+ * for the surface-trace tests, vsh_method's chain of ranges and the switch,
+ * none of which these methods ever match (~36 ns a header on a Ryzen 7700X,
+ * 3.5 ms of a crash camera's picture). Here each word does what the default
+ * case's two handlers, vsh_inline_attr then imm_vertex_method, do for it
+ * (imm_word): xemu's pgraph.c gives each method the same two steps, the
+ * attribute's inline value, then pgraph_finish_inline_buffer_vertex on the
+ * position's last component. The run stops at the end of the
+ * method range it starts in, so a header that runs on into other methods
+ * leaves those to the per-word path. RECOMP_DEBUG=pb_imm=0 is the A/B. */
+static int s_imm_fast = -1;             /* -1 unread; RECOMP_DEBUG=pb_imm=0 */
+
+static uint32_t imm_span(uint32_t method)
+{
+    uint32_t end;
+    if (method >= NV097_SET_VERTEX_DATA2F_M
+            && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16)
+        end = NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16;  /* 2F, 2S, 4UB, 4S, 4F */
+    else if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16)
+        end = NV097_SET_VERTEX4F + 16;
+    else if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12)
+        end = NV097_SET_VERTEX3F + 12;
+    else
+        return 0;
+    return (end - method) / 4u;
+}
+
+/* One parameter word of a method imm_span accepted: vsh_inline_attr's store
+ * and imm_vertex_method's test, the form found once by the 64-byte block
+ * of 0x1880..0x1AFF instead of by two chains of ranges. tests/nv2a_pb_walk
+ * holds it to the per-word path bit for bit. */
+static inline void imm_word(uint32_t method, uint32_t param)
+{
+    uint32_t off;
+    float *d;
+
+    if (method >= NV097_SET_VERTEX_DATA2F_M) {
+        off = method - NV097_SET_VERTEX_DATA2F_M;
+        switch (off >> 6) {
+        case 0: case 1:                         /* DATA2F: attribute off / 8 */
+            d = s_vsh.inl[off >> 3];
+            d[(off >> 2) & 1] = u2f(param);
+            d[2] = 0.0f; d[3] = 1.0f;
+            if (off == 4)
+                imm_emit_vertex();
+            return;
+        case 2:                                 /* DATA2S */
+            off -= NV097_SET_VERTEX_DATA2S_M - NV097_SET_VERTEX_DATA2F_M;
+            d = s_vsh.inl[off >> 2];
+            d[0] = (float)(int16_t)(param & 0xFFFF);
+            d[1] = (float)(int16_t)(param >> 16);
+            d[2] = 0.0f; d[3] = 1.0f;
+            if (off == 0)
+                imm_emit_vertex();
+            return;
+        case 3:                                 /* DATA4UB */
+            off -= NV097_SET_VERTEX_DATA4UB - NV097_SET_VERTEX_DATA2F_M;
+            d = s_vsh.inl[off >> 2];
+            d[0] = (float)( param        & 0xFF) / 255.0f;
+            d[1] = (float)((param >>  8) & 0xFF) / 255.0f;
+            d[2] = (float)((param >> 16) & 0xFF) / 255.0f;
+            d[3] = (float)( param >> 24        ) / 255.0f;
+            if (off == 0)
+                imm_emit_vertex();
+            return;
+        case 4: case 5:                         /* DATA4S */
+            off -= NV097_SET_VERTEX_DATA4S_M_M - NV097_SET_VERTEX_DATA2F_M;
+            d = s_vsh.inl[off >> 3];
+            d[((off >> 2) & 1) * 2]     = (float)(int16_t)(param & 0xFFFF);
+            d[((off >> 2) & 1) * 2 + 1] = (float)(int16_t)(param >> 16);
+            if (off == 4)
+                imm_emit_vertex();
+            return;
+        default:                                /* DATA4F, 0x1A00.. */
+            off -= NV097_SET_VERTEX_DATA4F_M - NV097_SET_VERTEX_DATA2F_M;
+            s_vsh.inl[off >> 4][(off >> 2) & 3] = u2f(param);
+            if (off == 12)
+                imm_emit_vertex();
+            return;
+        }
+    }
+    if (method >= NV097_SET_VERTEX4F) {         /* w completes it */
+        s_vsh.inl[0][(method - NV097_SET_VERTEX4F) / 4] = u2f(param);
+        if (method == NV097_SET_VERTEX4F + 12)
+            imm_emit_vertex();
+        return;
+    }
+    s_vsh.inl[0][(method - NV097_SET_VERTEX3F) / 4] = u2f(param);   /* z; w is 1 */
+    s_vsh.inl[0][3] = 1.0f;
+    if (method == NV097_SET_VERTEX3F + 8)
+        imm_emit_vertex();
+}
+
+uint32_t nv2a_pb_exec_imm(uint32_t method, const uint32_t *w, uint32_t n)
+{
+    uint32_t m, i;
+
+    if (s_imm_fast < 0) {
+        const char *e = recomp_env(RENV_PB_IMM);
+        s_imm_fast = !(e && e[0] == '0');
+    }
+    if (!s_exec_inited || !s_imm_fast)
+        return 0;
+    m = imm_span(method);
+    if (m > n)
+        m = n;
+    for (i = 0; i < m; i++, method += 4)
+        imm_word(method, w[i]);
+    s_perf.methods += m;
+    return m;
+}
+
+
+/* ---- The 2D engine: surfaces-2D (NV062) and image blit (NV09F) ----------
+ *
+ * Beside the 3D class the GPU has a 2D engine that copies rectangles between
+ * surfaces. A surfaces-2D object holds the two surfaces (colour format 0x300,
+ * the pitches 0x304 -- source low, destination high -- and the offsets
+ * 0x308/0x30C into the DMA objects bound at 0x184/0x188); an image-blit
+ * object holds the rectangle (source point 0x300, destination point 0x304)
+ * and starts the copy when its size, 0x308, arrives. Every one of those
+ * methods used to be dropped, so a copy simply never happened: Midtown
+ * Madness 3 builds its sun-visibility picture this way each frame, from 8x8
+ * pieces of the frame it just drew, and without them its flare never shows.
+ *
+ * Which subchannel holds which object is read from the object itself
+ * (SET_OBJECT's handle, its class in instance memory), not assumed; XDK D3D's
+ * binding (blit on 2, surfaces on 3) is only the fallback for a handle that
+ * cannot be looked up. A source the GPU drew into lives in the backend's
+ * render target, so the backend writes it back first (sync_guest; it waits
+ * only when the target was drawn since its last write-back). The copy runs
+ * in guest memory, and the textures over the destination are hashed again at
+ * their next bind (nv2a_pb_blit_generation). A destination that is itself a
+ * target the backend holds on the GPU is not refreshed there (no title known
+ * to need it). Only SRCCOPY is done; other operations are counted and
+ * dropped, as before. */
+#define NV_CLASS_SURFACES_2D 0x62
+#define NV_CLASS_IMAGE_BLIT  0x9F
+#define NV09F_SRCCOPY        3u
+static uint8_t s_subch_class[8];        /* bound object's class, 0 unknown */
+static uint32_t s_subch_handle[8];
+static struct {
+    uint32_t dma_src, dma_dst, format, pitch, src, dst;    /* surfaces-2D */
+    uint32_t op, point_in, point_out;                      /* image blit */
+} s_2d = { 0, 0, 0, 0, 0, 0, NV09F_SRCCOPY, 0, 0 };
+static uint32_t s_blits, s_blits_refused, s_blit_gen;
+
+uint32_t nv2a_pb_blit_generation(void) { return s_blit_gen; }
+
+static void blit_refused(const char *why, uint32_t a, uint32_t b)
+{
+    if (s_blits_refused++ < 4)
+        fprintf(stderr, "  [GPU] 2D blit refused: %s (0x%08X 0x%08X)\n", why, a, b);
+}
+
+static void blit_2d(uint32_t size)
+{
+    const uint32_t w = size & 0xFFFFu, h = size >> 16;
+    const uint32_t fmt = s_2d.format & 0xFFu;
+    /* NV062 colour formats: Y8 1 byte; X1R5G5B5 (2, 3), R5G6B5 (4) and Y16
+     * (5) 2; the X8R8G8B8, X1A7R8G8B8, A8R8G8B8 and Y32 forms (6..0xB) 4. */
+    const uint32_t bpp = fmt == 1u ? 1u : (fmt >= 2u && fmt <= 5u) ? 2u
+                       : (fmt >= 6u && fmt <= 0xBu) ? 4u : 0u;
+    const uint32_t sp = s_2d.pitch & 0xFFFFu, dp = s_2d.pitch >> 16;
+    const uint32_t sx = s_2d.point_in & 0xFFFFu, sy = s_2d.point_in >> 16;
+    const uint32_t dx = s_2d.point_out & 0xFFFFu, dy = s_2d.point_out >> 16;
+    const uint32_t ram = 0x08000000u;   /* 128 MB, a devkit's; physical */
+    uint32_t sbase, dbase, soff, doff, sres, dres, row;
+    uint8_t *mem, *s0, *d0;
+    int ok;
+
+    if (s_2d.op != NV09F_SRCCOPY) {
+        blit_refused("operation is not SRCCOPY", s_2d.op, size);
+        return;
+    }
+    if (!bpp) {
+        blit_refused("colour format", fmt, size);
+        return;
+    }
+    if (!w || !h)
+        return;
+    if (w > 4096u || h > 4096u || (sx + w) * bpp > sp || (dx + w) * bpp > dp) {
+        blit_refused("size or pitch", size, s_2d.pitch);
+        return;
+    }
+    sbase = dma_object_base(s_2d.dma_src, &ok);
+    if (!ok)
+        sbase = 0;
+    dbase = dma_object_base(s_2d.dma_dst, &ok);
+    if (!ok)
+        dbase = 0;
+    soff = sbase + s_2d.src;
+    doff = dbase + s_2d.dst;
+    if ((uint64_t)soff + (uint64_t)(sy + h) * sp > ram
+            || (uint64_t)doff + (uint64_t)(dy + h) * dp > ram) {
+        blit_refused("outside RAM", soff, doff);
+        return;
+    }
+    sres = dma_resolve(soff);
+    dres = dma_resolve(doff);
+    if (surface_write_refused(dres, (dy + h) * dp, "2D-blit into"))
+        return;
+    /* A source the GPU drew into: its pixels into guest memory first. */
+    if (s_backend->sync_guest)
+        s_backend->sync_guest(soff, sp, sx + w, sy + h);
+    mem = (uint8_t *)xbox_GetMemoryOffset();
+    s0 = mem + sres + (size_t)sy * sp + (size_t)sx * bpp;
+    d0 = mem + dres + (size_t)dy * dp + (size_t)dx * bpp;
+    /* Rows from the bottom when the destination overlaps lower in memory,
+     * so a copy within one surface reads each row before it is written. */
+    if (d0 > s0 && d0 < s0 + (size_t)h * sp) {
+        for (row = h; row-- > 0; )
+            memmove(d0 + (size_t)row * dp, s0 + (size_t)row * sp, (size_t)w * bpp);
+    } else {
+        for (row = 0; row < h; row++)
+            memmove(d0 + (size_t)row * dp, s0 + (size_t)row * sp, (size_t)w * bpp);
+    }
+    s_blit_gen++;
+    if (s_blits++ < 4)
+        fprintf(stderr, "  [GPU] 2D blit %ux%u fmt 0x%X 0x%08X (%u,%u) -> 0x%08X (%u,%u)\n",
+                w, h, fmt, soff, sx, sy, doff, dx, dy);
+}
+
+/* The class a subchannel's methods go to: the bound object's, else XDK D3D's
+ * binding for the 2D pair. */
+static uint32_t subch_class(uint32_t subch)
+{
+    if (s_subch_class[subch & 7])
+        return s_subch_class[subch & 7];
+    return subch == 2 ? NV_CLASS_IMAGE_BLIT : subch == 3 ? NV_CLASS_SURFACES_2D : 0;
+}
+
+/* A method on subchannels 1-7. 1 when it was acted on. */
+static int other_class_method(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (method == 0x0000) {                /* SET_OBJECT */
+        s_subch_handle[subch & 7] = param;
+        s_subch_class[subch & 7] = (uint8_t)object_class(param);
+        return 1;
+    }
+    switch (subch_class(subch)) {
+    case NV_CLASS_SURFACES_2D:
+        switch (method) {
+        case 0x0184: s_2d.dma_src = param; return 1;
+        case 0x0188: s_2d.dma_dst = param; return 1;
+        case 0x0300: s_2d.format = param;  return 1;
+        case 0x0304: s_2d.pitch = param;   return 1;
+        case 0x0308: s_2d.src = param;     return 1;
+        case 0x030C: s_2d.dst = param;     return 1;
+        default: return 0;
+        }
+    case NV_CLASS_IMAGE_BLIT:
+        switch (method) {
+        case 0x019C: return 1;             /* its surfaces-2D object: one here */
+        case 0x02FC: s_2d.op = param;        return 1;
+        case 0x0300: s_2d.point_in = param;  return 1;
+        case 0x0304: s_2d.point_out = param; return 1;
+        case 0x0308: blit_2d(param);         return 1;
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
-    if (!inited) {
+    if (!s_exec_inited) {
         int a;
-        inited = 1;
+        s_exec_inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
         /* An attribute no SET_VERTEX_DATA* ever wrote reads (0, 0, 0, 1),
@@ -6779,6 +7259,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_gpu.flips, method, param);
         }
     }
+    if (subch != 0 && other_class_method(subch, method, param))
+        return;
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         s_unhandled_subch[subch & 7]++;
         if (s_unhandled_subch[subch & 7] <= 24 && recomp_env(RENV_PB_UNHANDLED_ALL))
@@ -7081,6 +7563,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FrametimeFlip(s_gpu.flips, s_last_iv, s_last_late, s_hold_all,
                                s_perf.scan_all + (rt_now() - s_perf.scan_t0),
                                s_perf.draw_all, s_perf.flip_all);
+            nv2a_split_flip(s_gpu.flips); /* RECOMP_TRACE=pb_split (BO-282.12) */
+            xbox_PictureStepsFlip();      /* BO-282.6/.7: the next picture's steps */
             if (flip_pacing_on())
                 xbox_PacingFlipCadence(s_last_iv, s_last_late, s_hold_all,
                                        s_perf.scan_all + (rt_now() - s_perf.scan_t0));
@@ -7468,7 +7952,13 @@ void nv2a_pb_exec_report(void)
                     s_unhandled_subch[1], s_unhandled_subch[2], s_unhandled_subch[3],
                     s_unhandled_subch[4], s_unhandled_subch[5], s_unhandled_subch[6],
                     s_unhandled_subch[7]);
+        for (k = 1; k < 8; k++)
+            if (s_subch_handle[k])
+                fprintf(stderr, "[GPU]   subchannel %u: object 0x%08X, class 0x%02X\n",
+                        k, s_subch_handle[k], s_subch_class[k]);
     }
+    if (s_blits || s_blits_refused)
+        fprintf(stderr, "[GPU] 2D blits %u, refused %u\n", s_blits, s_blits_refused);
     if (s_reports)
         fprintf(stderr, "[GPU] visibility reports %u (%u with count 0)\n",
                 s_reports, s_reports_zero);

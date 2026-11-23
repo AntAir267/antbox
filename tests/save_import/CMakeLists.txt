@@ -9,8 +9,9 @@ project(save_import_test C)
 set(CMAKE_C_STANDARD 11)
 set(K ../../src/kernel)
 add_executable(save_import_test test_main.c
-    ${K}/kernel_save_import.c ${K}/kernel_console_keys.c ${K}/kernel_crypto.c
-    ../../src/platform/recomp_save_dir.c ../../src/platform/recomp_env.c)
+    ${K}/kernel_save_import.c ${K}/kernel_ps2save.c ${K}/kernel_console_keys.c ${K}/kernel_crypto.c
+    ../../src/platform/recomp_save_dir.c ../../src/platform/recomp_env.c
+    ../../src/platform/recomp_exe_dir.c)
 target_include_directories(save_import_test PRIVATE ../../src/platform ../../src/kernel ../../src)
 enable_testing()
 add_test(NAME save_import

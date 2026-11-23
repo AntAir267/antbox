@@ -1,0 +1,4 @@
+miniupnpc 2.2.8 (BSD 3-Clause, LICENSE here), from
+https://github.com/miniupnp/miniupnp tag miniupnpc_2_2_8, the library's
+sources only (no tools or tests); miniupnpcstrings.h written from its .in.
+Used by src/kernel/xnet_upnp.c to open the online race port on the router.

@@ -136,7 +136,8 @@ const char *const xbox_language_names[XC_LANGUAGE_COUNT + 1] = {
 };
 
 /* game.language: a name above or its number; English when unset or not
- * one of them. Read on each query: the title asks early in boot, and a
+ * one of them (the overlay's "dutch" and "swedish" too: no dashboard has
+ * them, a title that does picks them itself). Read on each query: the title asks early in boot, and a
  * title that lacks the language's files may set the variable back before
  * that (recomp_env_set). */
 ULONG xbox_GetLanguage(void)

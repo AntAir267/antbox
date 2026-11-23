@@ -169,6 +169,12 @@ target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(NOT WIN32)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_tex_cache
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_tex_cache)
+    # The walker's block path against the word-at-a-time one (BO-282).
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_pb_walk
+                     ${CMAKE_CURRENT_BINARY_DIR}/nv2a_pb_walk)
+    # The 2D engine's copies (nv2a_pb_exec.c, blit_2d).
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_blit2d
+                     ${CMAKE_CURRENT_BINARY_DIR}/nv2a_blit2d)
 endif()
 
 # The cut-out textures' levels (src/kernel/nv2a_texmip.c, BO-171) are the
@@ -195,11 +201,36 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texscale
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texup
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texup)
 
+# The films upscaled on the GPU (src/kernel/nv2a_filmup.c,
+# graphics.film_upscale, BO-136): the rule and the cost window (every
+# host); on macOS also the Metal film filters on a synthetic frame.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_filmup
+                 ${CMAKE_CURRENT_BINARY_DIR}/nv2a_filmup)
+
 # The lower levels of alpha-tested textures made again with their alpha
 # coverage (src/kernel/nv2a_texmip.c, BO-171), against synthetic textures
 # (every host, no GPU).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_texmip
                  ${CMAKE_CURRENT_BINARY_DIR}/nv2a_texmip)
+
+# The Vulkan backend's last-texture-set memo across a sampler eviction
+# (nv2a_tset_memo.h): a destroyed handle's value coming back for another
+# sampler must not bring back the old set (every host, no GPU).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_tset_memo
+                 ${CMAKE_CURRENT_BINARY_DIR}/nv2a_tset_memo)
+
+# The vertex gather's fast paths (src/kernel/nv2a_backend_common.c, BO-282)
+# against the gather as it was, on synthetic and recorded draws (POSIX).
+if(NOT WIN32)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_vtx_gather
+                     ${CMAKE_CURRENT_BINARY_DIR}/nv2a_vtx_gather)
+endif()
+
+# BO-385: line lists of a scaled target as quads (src/kernel/nv2a_wide_lines.c).
+if(NOT WIN32)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_wide_lines
+                     ${CMAKE_CURRENT_BINARY_DIR}/nv2a_wide_lines)
+endif()
 
 # The HLSL the parse -> generate pipeline emits, against recorded hashes
 # (every host: the emitters are API-free).

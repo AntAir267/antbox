@@ -40,6 +40,7 @@
 
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "nv2a_pb_state.h"
+#include "nv2a_pb_split.h"
 #include "platform/host_time.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -428,6 +429,122 @@ static void subr_adopt(void)
     s_ret_va = XBOX_CONTIG_BASE | (v & 0x0FFFFFFCu);
 }
 
+/* RECOMP_DEBUG=pb_record=<path> (BO-282): pb_record_n walks from the first
+ * one pb_record_at seconds in that starts between methods, as
+ * tests/nv2a_pb_walk replays them: each walk's ends and the words it read,
+ * as runs of consecutive words (a jump, call or return starts a new one).
+ * All little-endian 32-bit words:
+ *   file  "PBRC", version 1
+ *   walk  "WALK", start, end, runs, then per run its address, its word
+ *         count and the words.
+ * The walker's own thread only, so unlocked. */
+#define PREC_RUNS 4096
+static int      s_prec = -1;            /* -1 unread, 0 off, 1 waiting, 2 on */
+static FILE    *s_prec_f;
+static uint64_t s_prec_t0, s_prec_at;
+static uint32_t s_prec_left, s_prec_n, s_prec_lo;
+static uint32_t s_prec_run[PREC_RUNS][2];
+
+static void prec_u32(uint32_t v) { fwrite(&v, 4, 1, s_prec_f); }
+
+/* The walk is starting at start_va: whether this one is recorded. */
+static void prec_begin(uint32_t start_va)
+{
+    uint64_t now = xbox_HostNowNs();
+    if (s_prec < 0) {
+        const char *path = recomp_env(RENV_PB_RECORD);
+        const char *at = recomp_env(RENV_PB_RECORD_AT);
+        const char *n = recomp_env(RENV_PB_RECORD_N);
+        s_prec = path && *path;
+        if (!s_prec)
+            return;
+        s_prec_t0 = now;
+        s_prec_at = (uint64_t)((at ? atof(at) : 60.0) * 1e9);
+        s_prec_left = n ? (uint32_t)strtoul(n, NULL, 0) : 40u;
+        s_prec_f = fopen(path, "wb");
+        if (!s_prec_f || !s_prec_left) {
+            fprintf(stderr, "[PBREC] cannot write %s\n", path);
+            s_prec = 0;
+            return;
+        }
+        fwrite("PBRC", 4, 1, s_prec_f);
+        prec_u32(1);
+    }
+    /* The first recorded walk begins between methods, so a replay from
+     * there decodes the stream as the walker did. */
+    if (s_prec == 1 && !s_left && now - s_prec_t0 >= s_prec_at)
+        s_prec = 2;
+    s_prec_n = 0;
+    s_prec_lo = start_va;
+}
+
+/* The run being read ends before `end`; the next one starts at `next`. */
+static void prec_break(uint32_t end, uint32_t next)
+{
+    if (end != s_prec_lo && s_prec_n < PREC_RUNS) {
+        s_prec_run[s_prec_n][0] = s_prec_lo;
+        s_prec_run[s_prec_n][1] = (end - s_prec_lo) / 4u;
+        s_prec_n++;
+    }
+    s_prec_lo = next;
+}
+
+static void prec_end(const uint8_t *mem, uint32_t start_va, uint32_t end_va)
+{
+    uint32_t i;
+    fwrite("WALK", 4, 1, s_prec_f);
+    prec_u32(start_va);
+    prec_u32(end_va);
+    prec_u32(s_prec_n);
+    for (i = 0; i < s_prec_n; i++) {
+        prec_u32(s_prec_run[i][0]);
+        prec_u32(s_prec_run[i][1]);
+        fwrite(mem + s_prec_run[i][0], 4, s_prec_run[i][1], s_prec_f);
+    }
+    if (s_prec_n >= PREC_RUNS)
+        fprintf(stderr, "[PBREC] a walk with over %d runs: the rest is missing\n", PREC_RUNS);
+    if (--s_prec_left == 0) {
+        fclose(s_prec_f);
+        s_prec_f = NULL;
+        s_prec = 0;
+        fprintf(stderr, "[PBREC] done: %s\n", recomp_env(RENV_PB_RECORD));
+    }
+}
+
+/* The walker's block path (BO-282): a run of ARRAY_ELEMENT16 or
+ * INLINE_ARRAY parameters (53 % and 5 % of a race frame's words) goes to the
+ * executor in one call, nv2a_pb_exec_run, instead of a call a word; so does
+ * a run of immediate-mode vertex methods (nv2a_pb_exec_imm, BO-282.12). Only
+ * while no per-word hook is on: the survey (RECOMP_PB_SCAN) and the slow-
+ * method trace (pb_slow) see every word as before, and RECOMP_DEBUG=
+ * pb_block=0 turns it off for an A/B. -1 unread. */
+static int s_block = -1;
+
+/* How many of the method in progress's next parameters, from va, the walk
+ * would read in a row as parameters: none past PUT (end_va), the end of the
+ * contiguous window, the walk's word limit (`words` read so far), or the
+ * next stream mark's word (the per-word path applies it). 0: take them one
+ * at a time. */
+static inline uint32_t block_words(uint32_t va, uint32_t end_va, uint32_t words)
+{
+    uint32_t n = s_left, lim;
+    if (!pb_in_window(va) || words >= 0x100000u)
+        return 0;
+    lim = (XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - va) / 4u;
+    if (n > lim)
+        n = lim;
+    if (end_va > va && (end_va - va) / 4u < n)
+        n = (end_va - va) / 4u;
+    if (0x100000u - words < n)
+        n = 0x100000u - words;
+    if (s_sm_r != __atomic_load_n(&s_sm_w, __ATOMIC_ACQUIRE)) {
+        lim = ((s_sm[s_sm_r % SM_N].va - (va & SM_MASK)) & SM_MASK) / 4u;
+        if (lim < n)
+            n = lim;
+    }
+    return n;
+}
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -449,6 +566,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         double ms = e && *e ? atof(e) : 0.0;
         s_slow_ns = !e ? 0 : (uint64_t)((ms > 0.0 ? ms : 5.0) * 1e6);
     }
+    if (s_block < 0) {
+        const char *e = recomp_env(RENV_PB_BLOCK);
+        s_block = s_exec_enabled && !s_scan_enabled && !s_slow_ns && !(e && e[0] == '0');
+    }
     /* Test hook: RECOMP_PB_INJECT_STOP=N stops every Nth walk at its first
      * word, so the recovery from a stop can be seen without a real desync.
      * Never the first walk: it sets up the semaphore, and without that the
@@ -458,12 +579,41 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                ? atoi(recomp_env(RENV_PB_INJECT_STOP)) : 0;
     if (inject > 0 && s_tot_segments && s_tot_segments % (uint32_t)inject == 0)
         why = "injected (RECOMP_DEBUG=pb_inject_stop)";
+    if (s_prec)
+        prec_begin(start_va);
 
     /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
      * reaches PUT is a stream this walk is out of step with. */
     while (!why && va != end_va) {
         uint32_t tgt;
 
+        if (s_left && s_block && s_noninc && s_subch == 0
+                && (s_method == 0x1800u || s_method == 0x1818u)) {
+            uint32_t n = block_words(va, end_va, words);
+            if (n && nv2a_pb_exec_run(s_method, (const uint32_t *)(mem + va), n)) {
+                va += 4u * n;
+                at = va - 4u;
+                words += n;
+                s_left -= n;
+                continue;
+            }
+        }
+        /* BO-282.12: an incrementing run of immediate-mode vertex methods
+         * (SET_VERTEX3F/4F 0x1500..0x1527, SET_VERTEX_DATA* 0x1880..0x1AFF),
+         * as far as the executor takes it (nv2a_pb_exec_imm); the same
+         * limits as above, so a stream mark is still met word by word. */
+        if (s_left && s_block && !s_noninc && s_subch == 0
+                && s_method - 0x1500u < 0x600u) {
+            uint32_t n = block_words(va, end_va, words);
+            if (n && (n = nv2a_pb_exec_imm(s_method, (const uint32_t *)(mem + va), n))) {
+                va += 4u * n;
+                at = va - 4u;
+                words += n;
+                s_left -= n;
+                s_method += 4u * n;
+                continue;
+            }
+        }
         at = va;
         w = 0;
         if (s_sm_r != s_sm_w)
@@ -512,6 +662,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             to = XBOX_CONTIG_BASE | tgt;
             hop(at, to);
             va = to;
+            if (s_prec == 2)
+                prec_break(at + 4u, va);
             continue;
         }
         if ((w & 3u) == 2u) {                 /* call */
@@ -524,6 +676,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             subr_publish();
             hop(at, XBOX_CONTIG_BASE | tgt);
             va = XBOX_CONTIG_BASE | tgt;
+            if (s_prec == 2)
+                prec_break(at + 4u, va);
             continue;
         }
         if (w == 0x00020000u) {               /* return */
@@ -532,6 +686,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             va = s_ret_va;
             s_in_call = 0;
             subr_publish();
+            if (s_prec == 2)
+                prec_break(at + 4u, va);
             continue;
         }
         if ((w & 0xE0030003u) == 0u || (w & 0xE0030003u) == 0x40000000u) {
@@ -539,6 +695,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             s_subch  = (w >> 13) & 7u;
             s_method =  w & 0x1FFCu;
             s_noninc = (w & 0xE0000000u) == 0x40000000u;
+            if (nv2a_split)             /* RECOMP_TRACE=pb_split (BO-282.12) */
+                nv2a_split_header(nv2a_split, nv2a_split_class(s_subch, s_method), s_left);
             if (s_slow_ns && s_exec_enabled && s_left) {
                 s_run_t0 = xbox_HostNowNs();
                 s_run_method = s_method;
@@ -588,7 +746,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         }
     }
 
+    if (s_prec == 2) {
+        /* va is past the last word read, a stop's included. */
+        prec_break(va, 0);
+        prec_end(mem, start_va, end_va);
+    }
     s_run_t0 = 0;                   /* a run the walk left open is not timed */
+    if (nv2a_split)                 /* the timed header ends with the walk */
+        nv2a_split_header(nv2a_split, -1, 0);
     if (s_exec_enabled)
         nv2a_pb_perf_scan_end();
     s_tot_words += words;

@@ -281,7 +281,40 @@ def main():
                              "patches.json to -o. Without it the output is "
                              "unchanged")
 
+    parser.add_argument("--mem-order", metavar="JSON",
+                        help="Guest memory ordering for arm64 hosts "
+                             "(tools/recomp/mem_order.py): {\"release_stores\": "
+                             "[{\"va\": ...}], \"acquire_spin_exits\": bool}. "
+                             "Listed stores become RECOMP_STORE_REL*, every "
+                             "spin-wait candidate's exit gets "
+                             "RECOMP_ACQUIRE_FENCE(). Writes mem_order.json "
+                             "to -o. Without it the output is unchanged")
+
+    parser.add_argument("--no-reg-locals", dest="reg_locals",
+                        action="store_false",
+                        help="Keep the guest registers as the thread-local "
+                             "globals in every function, as before. By default "
+                             "each function holds them in C locals, written back "
+                             "only around calls and returns (translator.py, "
+                             "_localize_registers): on Wreckless, 6%% less CPU "
+                             "on the game thread")
+
+    parser.add_argument("--reg-verify", action="store_true",
+                        help="With register locals: check, at run time, every "
+                             "register a narrowed write-back skips against its "
+                             "global, and log a mismatch ([REGS] mismatch). For "
+                             "testing the translator's write analysis on a game")
+
     args = parser.parse_args()
+
+    mem_order = None
+    if args.mem_order:
+        from .mem_order import MemOrderConfig
+        try:
+            mem_order = MemOrderConfig.load(args.mem_order)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"ERROR: --mem-order {args.mem_order}: {e}", file=sys.stderr)
+            sys.exit(1)
 
     patches = None
     if args.patches:
@@ -367,7 +400,10 @@ def main():
             "icall_sites.json"),
         spin_waits=spin_waits,
         patches=patches,
+        mem_order=mem_order,
+        reg_locals=args.reg_locals,
     )
+    translator.translator.reg_verify = args.reg_verify
     translator.observed_seeds = _load_observed_seeds(args.seeds)
 
     t_load = time.time() - t0
@@ -570,6 +606,8 @@ def main():
         _finish_spin_waits(translator.translator.spin_waits, output_dir)
     if translator.translator.lifter.patches is not None:
         _finish_patches(translator.translator.lifter.patches, output_dir)
+    if translator.translator.lifter.mem_order is not None:
+        _finish_mem_order(translator.translator.lifter.mem_order, output_dir)
     print(f"MMIO: {translator.translator.mmio_lowered} constant device-register"
           f" accesses lowered to direct calls", file=sys.stderr)
 
@@ -614,6 +652,26 @@ def _finish_patches(report, output_dir):
         f.write("\n")
     print(f"Patches: {doc['patched_sites']} of {len(doc['sites'])} sites "
           f"({path})", file=sys.stderr)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _finish_mem_order(report, output_dir):
+    """Write the report; a listed release store that no body applied, or
+    that is not a mov to memory, fails the run."""
+    errors = report.finish()
+    doc = report.to_json()
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "mem_order.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Memory order: {sum(s['bodies'] for s in doc['release_stores'])} "
+          f"release stores in {len(doc['release_stores'])} sites, "
+          f"{len(doc['spin_exits_fenced'])} spin-wait exits fenced ({path})",
+          file=sys.stderr)
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)

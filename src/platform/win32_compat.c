@@ -1820,7 +1820,7 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 }
 #endif
 
-/* ---- the guest window (Linux) ---------------------------------------------
+/* ---- the guest window (Linux, macOS) ---------------------------------------
  *
  * The memory layout maps the guest's views at fixed addresses spread over
  * 4 GB from its base: RAM and its mirrors, the contiguous window at +2 GB,
@@ -1833,8 +1833,16 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
  * a fixed-address VirtualAlloc or MapViewOfFileEx whose pages are all still
  * that placeholder replaces them (MAP_FIXED), and anything else keeps
  * MAP_FIXED_NOREPLACE's refusal; VirtualFree in the window puts the
- * placeholder back. One bit per 4 KB page. */
-#if defined(__linux__)
+ * placeholder back. One bit per 4 KB page.
+ *
+ * macOS the same (BO-236): the Metal presenter's window and drawables are
+ * made before the guest's memory, and on a 4K fullscreen display at 60 Hz
+ * a mapping sat at base + 0xFD000000, so the NV2A, MCPX, flash and tiled
+ * apertures failed (errors 8 and 487) and the title's first register read
+ * in D3D's init crashed (SIGBUS) four seconds into the boot. There the
+ * fixed views went through mach_map_fixed, which refuses a taken range as
+ * it should; inside the window the placeholder is replaced instead. */
+#if defined(__linux__) || defined(__APPLE__)
 static uintptr_t s_gw_lo;
 static size_t    s_gw_pages;
 static uint8_t  *s_gw_bits;      /* 1: page is our placeholder */
@@ -1891,6 +1899,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 {
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    int gw_fixed = 0;                   /* replaces the guest window's placeholder */
 
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
      * just adjust protection. */
@@ -1903,14 +1912,21 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     if (address && gw_placeholder(address, size)) {
-        flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
+#if defined(MAP_FIXED_NOREPLACE)
+        flags &= ~MAP_FIXED_NOREPLACE;
+#endif
+        flags |= MAP_FIXED;
+        gw_fixed = 1;
         gw_mark(address, size, 0);
     }
     /* A pure no-access reservation holds address space, not memory: the
      * 4 GB guest window must not count against overcommit. */
     if (allocationType == MEM_RESERVE && protect == PAGE_NOACCESS && !address) {
+#if !defined(MAP_NORESERVE)
+#define MAP_NORESERVE 0
+#endif
         void *r = mmap(NULL, size, PROT_NONE, flags | MAP_NORESERVE, -1, 0);
         if (r == MAP_FAILED) {
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -1923,7 +1939,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
     void *p;
 #if defined(__APPLE__)
-    if (address) {
+    if (address && !gw_fixed) {
         p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
     } else
 #endif
@@ -1960,7 +1976,7 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
         size_t len = view_take(address);
         if (size == 0) size = len;
         if (size == 0) return FALSE;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
         {
             size_t p0, p1;
             if (gw_range(address, size, &p0, &p1)) {
@@ -2457,7 +2473,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
     if (baseAddr) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
         if (gw_placeholder(baseAddr, len)) {
             flags |= MAP_FIXED;          /* replaces our placeholder only */
             gw_mark(baseAddr, len, 0);

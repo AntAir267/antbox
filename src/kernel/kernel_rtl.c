@@ -204,7 +204,17 @@ typedef struct {
     volatile uint32_t      owner_site;
     volatile unsigned long owner_tid;
     volatile long          depth;
+    /* Calls between finding this slot and being done with it (Enter until
+     * the lock is held and noted, Leave until it is released). A slot is
+     * only ever freed with this and depth both 0, under the table lock
+     * taken exclusively, and lookups raise it under the same lock shared:
+     * nobody can hold or be about to use a freed lock. */
+    volatile LONG          inflight;
 } XBOX_CS_SLOT;
+
+/* A freed slot: lookups probe past it, an insert reuses it. A guest key is
+ * a native pointer and never this small. */
+#define XBOX_CS_KEY_FREED ((uintptr_t)1)
 
 static XBOX_CS_SLOT g_cs_table[XBOX_CS_TABLE_SIZE];
 
@@ -247,6 +257,41 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
+/* Free every slot nobody holds or is using. Table lock held exclusively.
+ *
+ * The Xbox kernel has no RtlDeleteCriticalSection, so the toolkit never
+ * learns that a guest lock died: a critical section inside a heap object is
+ * a new key every time the object lands at a new address, and the table
+ * used to keep each one for the rest of the run. At 4096 the shadow lookup
+ * then returned NULL and RtlEnterCriticalSection returned without locking --
+ * every lock the title took from then on was a no-op, with one log line to
+ * say so. A slot whose lock is free and that no call is between lookup and
+ * use of is safe to drop even if the guest lock is still alive: the guest's
+ * bytes were never touched, and its next Enter makes a fresh shadow. */
+static long g_cs_freed_total, g_cs_free_passes;
+
+static int xbox_cs_free_idle(void)
+{
+    int i, freed = 0;
+
+    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+        XBOX_CS_SLOT* slot = &g_cs_table[i];
+        if (slot->key <= XBOX_CS_KEY_FREED || slot->depth != 0
+                || InterlockedCompareExchange(&slot->inflight, 0, 0) != 0)
+            continue;
+        DeleteCriticalSection(&slot->cs);
+        slot->owner_site = 0;
+        slot->owner_tid = 0;
+        slot->key = XBOX_CS_KEY_FREED;
+        freed++;
+    }
+    g_cs_freed_total += freed;
+    g_cs_free_passes++;
+    return freed;
+}
+
+/* Find or make the shadow of `guest` and take one use of it: every non-NULL
+ * return is matched by one xbox_cs_done. NULL only for a NULL guest. */
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
     if (g_cs_single_mode < 0) {
@@ -265,6 +310,7 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     uintptr_t key = (uintptr_t)guest;
     CRITICAL_SECTION* found = NULL;
     size_t home, i;
+    int pass;
 
     if (!key)
         return NULL;
@@ -276,7 +322,11 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     AcquireSRWLockShared(&g_cs_table_lock);
     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
         XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
-        if (slot->key == key) { found = &slot->cs; break; }
+        if (slot->key == key) {
+            InterlockedIncrement(&slot->inflight);
+            found = &slot->cs;
+            break;
+        }
         if (slot->key == 0) break;
     }
     ReleaseSRWLockShared(&g_cs_table_lock);
@@ -284,27 +334,85 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
         return found;
 
     AcquireSRWLockExclusive(&g_cs_table_lock);
-    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
-        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
-        if (slot->key == key) { found = &slot->cs; break; }
-        if (slot->key == 0) {
-            InitializeCriticalSection(&slot->cs);
-            slot->key = key;             /* published last: a shared reader
+    for (pass = 0; pass < 2 && !found; pass++) {
+        XBOX_CS_SLOT* reuse = NULL;
+        int freed;
+
+        for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+            XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+            if (slot->key == key) { reuse = NULL; found = &slot->cs; break; }
+            if (slot->key == XBOX_CS_KEY_FREED) {
+                if (!reuse) reuse = slot;
+                continue;
+            }
+            if (slot->key == 0) {
+                if (!reuse) reuse = slot;
+                break;
+            }
+        }
+        if (!found && reuse) {
+            InitializeCriticalSection(&reuse->cs);
+            reuse->depth = 0;
+            reuse->inflight = 0;
+            reuse->key = key;            /* published last: a shared reader
                                           * that sees the key sees a live
                                           * lock behind it */
-            found = &slot->cs;
+            found = &reuse->cs;
+        }
+        if (found) {
+            InterlockedIncrement(
+                &((XBOX_CS_SLOT*)((char*)found
+                                  - offsetof(XBOX_CS_SLOT, cs)))->inflight);
             break;
+        }
+        if (pass == 0) {
+            freed = xbox_cs_free_idle();
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,
+                     "critical-section table full at %d entries: freed %d "
+                     "idle shadow locks (pass %ld, %ld freed in all)",
+                     XBOX_CS_TABLE_SIZE, freed, g_cs_free_passes,
+                     g_cs_freed_total);
         }
     }
     ReleaseSRWLockExclusive(&g_cs_table_lock);
 
-    if (!found && !g_cs_table_full) {
+    if (!found) {
+        /* Every one of 4096 locks held or in use at once. Going on would
+         * mean a lock that does not lock; stop where it happened instead. */
         g_cs_table_full = 1;
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_RTL,
-                 "critical-section table full at %d entries; further locks "
-                 "are unprotected", XBOX_CS_TABLE_SIZE);
+                 "critical-section table full at %d entries, all held or in "
+                 "use: cannot shadow guest lock %p; stopping rather than "
+                 "running it unlocked", XBOX_CS_TABLE_SIZE, (void*)guest);
+        fprintf(stderr, "  [CS] FATAL: critical-section table exhausted "
+                        "(%d held or in use)\n", XBOX_CS_TABLE_SIZE);
+        fflush(stderr);
+        abort();
     }
     return found;
+}
+
+/* The end of one use taken by xbox_cs_shadow. */
+static void xbox_cs_done(CRITICAL_SECTION* cs)
+{
+    XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+    if (slot)
+        InterlockedDecrement(&slot->inflight);
+}
+
+/* Shadow slots in use, and how many were freed so far (tests, reports). */
+int xbox_cs_table_stats(long* freed_total)
+{
+    int i, used = 0;
+
+    AcquireSRWLockShared(&g_cs_table_lock);
+    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++)
+        if (g_cs_table[i].key > XBOX_CS_KEY_FREED)
+            used++;
+    if (freed_total)
+        *freed_total = g_cs_freed_total;
+    ReleaseSRWLockShared(&g_cs_table_lock);
+    return used;
 }
 
 /* Contention is worth saying out loud.
@@ -480,6 +588,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
+        xbox_cs_done(cs);
         return;
     }
     if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
@@ -513,6 +622,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
     EnterCriticalSection(cs);
     xbox_cs_note_owner(cs);
+    xbox_cs_done(cs);
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
                 GetCurrentThreadId(),
@@ -530,6 +640,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         crt_lock_trace("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
+        xbox_cs_done(cs);
     }
 }
 
@@ -537,7 +648,9 @@ VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalS
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing
      * it now keeps the first Enter off the exclusive path. */
-    (void)xbox_cs_shadow(CriticalSection);
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (cs)
+        xbox_cs_done(cs);
 }
 
 /* ============================================================================

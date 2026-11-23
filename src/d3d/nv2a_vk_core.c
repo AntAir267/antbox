@@ -360,6 +360,21 @@ static int make_device(void)
     /* Anisotropic filtering (RECOMP_GFX_ANISO): on where the device has it,
      * for the backend's samplers to ask for. */
     f2.features.samplerAnisotropy = have2.features.samplerAnisotropy;
+    /* BC1/BC3 images for texture packs (BO-312). */
+    f2.features.textureCompressionBC = have2.features.textureCompressionBC;
+    s_core.bc = have2.features.textureCompressionBC != 0;
+    /* BO-332: the NV2A does not clip at the near and far planes; it culls
+     * window z outside the title's SET_CLIP_MIN/MAX (xemu: depthClampEnable
+     * in pgraph/vk/draw.c, the range test in pgraph/glsl/psh.c). Both
+     * features or neither: without them depth clips at [0, 1] as before. */
+    if (have2.features.depthClamp && have2.features.shaderClipDistance) {
+        f2.features.depthClamp = VK_TRUE;
+        f2.features.shaderClipDistance = VK_TRUE;
+        s_core.depth_clamp = 1;
+    } else {
+        fprintf(stderr, "[vulkan] %s: no depthClamp or shaderClipDistance; depth clips"
+                " at the near and far planes\n", s_core.name);
+    }
     s_core.max_aniso = have2.features.samplerAnisotropy
                      ? s_core.props.limits.maxSamplerAnisotropy : 0.0f;
     if (!have12.hostQueryReset)

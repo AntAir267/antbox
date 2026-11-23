@@ -411,6 +411,18 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     if (len > 0 && s_save_dir[len - 1] == L'\\')
         s_save_dir[len - 1] = L'\0';
 
+    /* Absolute, because SHCreateDirectoryExW below only accepts a fully
+     * qualified path: handed the relative "saves" a host passes, it fails with
+     * ERROR_BAD_PATHNAME and creates nothing. The partition images then cannot
+     * be created either, and a title that opens \Device\Harddisk0\Partition1\
+     * at boot gets STATUS_OBJECT_PATH_NOT_FOUND and quits to the dashboard.
+     * It only ever worked where someone had made the directory by hand. */
+    {
+        WCHAR full[MAX_PATH];
+        if (GetFullPathNameW(s_save_dir, MAX_PATH, full, NULL))
+            wcscpy_s(s_save_dir, MAX_PATH, full);
+    }
+
     /* Create the save-side directories. T:/U:/Z: map into subdirectories of
      * save_dir, and a title that opens a file there with a create disposition
      * fails if the parent does not exist -- which reads as "cannot create save
@@ -695,6 +707,76 @@ static void mkdir_p(const char* path)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
 }
 
+#include <dirent.h>
+#include <strings.h>
+/* The Xbox's file systems ignore case and titles rely on it: a title asks
+ * for D:\Data\movies\INTRO.bik where the disc has Movies/intro.bik. Each
+ * component of `path` after its first `keep` bytes takes the spelling of the
+ * entry in its directory that matches it ignoring case. A component nothing
+ * matches -- a file about to be created -- and everything after it stays as
+ * asked.
+ *
+ * Every component is read from its directory, including ones lstat already
+ * finds. Returning early when the path exists as spelled is tempting, and was
+ * how this was written: the folding is only needed where the open would
+ * otherwise fail. True of the open, false of the name. On a case-insensitive
+ * host lstat succeeds for any spelling, so macOS handed back whatever the
+ * title asked for while Linux handed back what the disc holds, and two hosts
+ * disagreeing about a translated path is worse than the readdir. */
+static void fold_case(char *path, size_t keep)
+{
+    char *comp = path + keep;
+
+    while (*comp == '/')
+        comp++;
+
+    while (*comp) {
+        char *end = strchr(comp, '/');
+        char save = end ? *end : '\0';
+        char cand[256];
+        int exact = 0, folded = 0;
+        size_t len;
+        DIR *d;
+        struct dirent *e;
+        char parent_end;
+
+        if (end)
+            *end = '\0';
+        len = strlen(comp);
+
+        parent_end = comp[-1];
+        comp[-1] = '\0';
+        d = opendir(comp == path + 1 ? "/" : path);
+        comp[-1] = parent_end;
+
+        /* `comp` is left alone until the directory has been read. Folding it
+         * in place mid-scan would leave later comparisons matching the
+         * spelling this loop just wrote rather than the one the caller asked
+         * for, so an exact match after a case-insensitive one would never be
+         * seen. */
+        while (d && (e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, comp) == 0) {
+                exact = 1;                        /* as asked: nothing to do */
+                break;
+            }
+            if (!folded && len < sizeof cand && strlen(e->d_name) == len
+                    && strcasecmp(e->d_name, comp) == 0) {
+                memcpy(cand, e->d_name, len);
+                folded = 1;                       /* keep reading for an exact */
+            }
+        }
+        if (d)
+            closedir(d);
+        if (!exact && folded)
+            memcpy(comp, cand, len);              /* case differs, length does not */
+
+        if (end)
+            *end = save;
+        if (!(exact || folded) || !end)
+            return;
+        comp = end + 1;
+    }
+}
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     if (game_dir) {
@@ -793,54 +875,6 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir, s_user_dir);
 }
 
-#if !defined(__APPLE__)
-#include <dirent.h>
-#include <strings.h>
-/* Xbox file names are case-insensitive (FATX, and the DVD's XDVDFS lookups),
- * and titles ask for "D:\Sound\DSP\B3XboxFx.bin" where the dumped disc
- * has sound/DSP. macOS volumes fold case by default; Linux ones do not, so
- * from `from` (the part after the existing base directory) each component
- * that does not exist as written takes the spelling a directory entry has,
- * compared without case. A component nothing matches stays as written (a
- * file about to be created). Only misses scan a directory. */
-static void fold_case(char *path, size_t from)
-{
-    char *p, *slash;
-    struct stat st;
-
-    if (stat(path, &st) == 0)
-        return;
-    p = path + from;
-    while (*p == '/')
-        p++;
-    for (; *p; p = slash + 1) {
-        DIR *d;
-        struct dirent *de;
-        char save;
-        slash = strchr(p, '/');
-        if (slash)
-            *slash = '\0';
-        if (stat(path, &st) != 0) {
-            /* p..: this component; its parent is path up to p - 1. */
-            save = p[-1];
-            p[-1] = '\0';
-            d = opendir(p - 1 == path ? "/" : path);
-            p[-1] = save;
-            if (d) {
-                while ((de = readdir(d)) != NULL)
-                    if (!strcasecmp(de->d_name, p) && strlen(de->d_name) == strlen(p)) {
-                        memcpy(p, de->d_name, strlen(p));
-                        break;
-                    }
-                closedir(d);
-            }
-        }
-        if (!slash)
-            break;
-        *slash = '/';
-    }
-}
-#endif
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
@@ -921,9 +955,10 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
-#if !defined(__APPLE__)
+        /* Every host, macOS too (upstream f75bc52): a case-insensitive
+         * volume opens any spelling, but the name handed back has to be the
+         * disc's, the same on every host. */
         fold_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
-#endif
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path

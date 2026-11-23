@@ -286,6 +286,7 @@ typedef struct MCPXAPUVPState {
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];
+    uint16_t idle_trap_last;   /* the idle voice trapped last; see mcpx_apu_vp_frame */
 
     struct {
         int current_entry;

@@ -26,6 +26,7 @@
 #include "xbox_memory_layout.h"
 #include "recomp_env.h"
 #include "platform/recomp_restart.h"   /* recomp_restart_stdio */
+#include "apu/apu.h"           /* mcpx_apu_dump_state, for the hang report */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1486,6 +1487,17 @@ void xbox_crash_test_fire(void)
 
 static unsigned s_hang_secs;
 
+/* The APU's own view of itself, as a hang-report note (BO-351): the front end,
+ * the interrupt line, frames, traps/deliveries and the voice lists. Runs
+ * unlocked -- the other threads may be stuck in the APU lock. g_state is the
+ * APU's singleton; NULL when the title never brought the APU up. */
+extern MCPXAPUState *g_state;
+
+static void apu_dump_note(void)
+{
+    mcpx_apu_dump_state(g_state, xbox_crash_printf);
+}
+
 static void hang_report(unsigned stalled_s)
 {
     char head[160];
@@ -1557,6 +1569,7 @@ void xbox_crash_watchdog_start(void)
     const char *test = recomp_env(RENV_CRASH_TEST);
 
     s_hang_secs = (unsigned)recomp_env_int(RENV_HANG_WATCHDOG, 15);
+    xbox_crash_add_note(apu_dump_note);
     if (test && *test) {
         const char *colon = strchr(test, ':');
         s_test_mode = !strncmp(test, "hang", 4) ? 2 : 1;

@@ -1,0 +1,113 @@
+// AMD FidelityFX Super Resolution 1.0.2, EASU, on the luma of a film frame,
+// 2x (BO-136, graphics.film_upscale Cheap). The filter is AMD's (MIT,
+// Copyright (c) 2021 Advanced Micro Devices, Inc.), as agyild's mpv port
+// runs it on one plane (MIT); written here as a compute pass: the 12 taps
+// are texel fetches of the frame (source, binding 0) turned into BT.709
+// luma, the edge rule clamps. Output: the 2x luma (x), destination.
+#include "common.glsl"
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D destination;
+
+float L(ivec2 p)
+{
+    return dot(texelFetch(source, edge(p, pc.size), 0).rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float APrxLoRcpF1(float a) { return uintBitsToFloat(uint(0x7ef07ebb) - floatBitsToUint(a)); }
+float APrxLoRsqF1(float a) { return uintBitsToFloat(uint(0x5f347d74) - (floatBitsToUint(a) >> uint(1))); }
+
+void FsrEasuTap(inout float aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob,
+                float clp, float c)
+{
+    vec2 v;
+    v.x = (off.x * ( dir.x)) + (off.y * dir.y);
+    v.y = (off.x * (-dir.y)) + (off.y * dir.x);
+    v *= len;
+    float d2 = min(v.x * v.x + v.y * v.y, clp);
+    float wB = (2.0 / 5.0) * d2 + -1.0;
+    float wA = lob * d2 + -1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = (25.0 / 16.0) * wB + (-(25.0 / 16.0 - 1.0));
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+void FsrEasuSet(inout vec2 dir, inout float len, float w,
+                float lA, float lB, float lC, float lD, float lE)
+{
+    float dc = lD - lC;
+    float cb = lC - lB;
+    float lenX = APrxLoRcpF1(max(abs(dc), abs(cb)));
+    float dirX = lD - lB;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX *= lenX;
+    float ec = lE - lC;
+    float ca = lC - lA;
+    float lenY = APrxLoRcpF1(max(abs(ec), abs(ca)));
+    float dirY = lE - lA;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY *= lenY;
+    dir += vec2(dirX, dirY) * w;
+    len += dot(vec2(w), vec2(lenX, lenY));
+}
+
+void main()
+{
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(q, pc.size * 2)))
+        return;
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o      F = the texel at fp
+    vec2 pp = (vec2(q) + 0.5) * 0.5 - 0.5;
+    vec2 fpf = floor(pp);
+    pp -= fpf;
+    ivec2 fp = ivec2(fpf);
+    float bL = L(fp + ivec2(0, -1)), cL = L(fp + ivec2(1, -1));
+    float eL = L(fp + ivec2(-1, 0)), fL = L(fp), gL = L(fp + ivec2(1, 0)), hL = L(fp + ivec2(2, 0));
+    float iL = L(fp + ivec2(-1, 1)), jL = L(fp + ivec2(0, 1)), kL = L(fp + ivec2(1, 1));
+    float lL = L(fp + ivec2(2, 1));
+    float nL = L(fp + ivec2(0, 2)), oL = L(fp + ivec2(1, 2));
+
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    FsrEasuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
+    FsrEasuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
+    FsrEasuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
+    FsrEasuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
+
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < (1.0 / 32768.0);
+    dirR = APrxLoRsqF1(dirR);
+    dirR = zro ? 1.0 : dirR;
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= vec2(dirR);
+    len = len * 0.5;
+    len *= len;
+    float stretch = (dir.x * dir.x + dir.y * dir.y) * APrxLoRcpF1(max(abs(dir.x), abs(dir.y)));
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 + -0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = APrxLoRcpF1(lob);
+
+    float aC = 0.0, aW = 0.0;
+    FsrEasuTap(aC, aW, vec2( 0.0, -1.0) - pp, dir, len2, lob, clp, bL);
+    FsrEasuTap(aC, aW, vec2( 1.0, -1.0) - pp, dir, len2, lob, clp, cL);
+    FsrEasuTap(aC, aW, vec2(-1.0,  1.0) - pp, dir, len2, lob, clp, iL);
+    FsrEasuTap(aC, aW, vec2( 0.0,  1.0) - pp, dir, len2, lob, clp, jL);
+    FsrEasuTap(aC, aW, vec2( 0.0,  0.0) - pp, dir, len2, lob, clp, fL);
+    FsrEasuTap(aC, aW, vec2(-1.0,  0.0) - pp, dir, len2, lob, clp, eL);
+    FsrEasuTap(aC, aW, vec2( 1.0,  1.0) - pp, dir, len2, lob, clp, kL);
+    FsrEasuTap(aC, aW, vec2( 2.0,  1.0) - pp, dir, len2, lob, clp, lL);
+    FsrEasuTap(aC, aW, vec2( 2.0,  0.0) - pp, dir, len2, lob, clp, hL);
+    FsrEasuTap(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, gL);
+    FsrEasuTap(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, oL);
+    FsrEasuTap(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, nL);
+    float y = aC / aW;
+    // Dering: within the four nearest texels.
+    y = clamp(y, min(min(fL, gL), min(jL, kL)), max(max(fL, gL), max(jL, kL)));
+    imageStore(destination, q, vec4(clamp(y, 0.0, 1.0), 0.0, 0.0, 1.0));
+}

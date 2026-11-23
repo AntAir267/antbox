@@ -39,7 +39,8 @@ class Disassembler:
                  force: bool = False,
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
-                 observed_seeds: Optional[set] = None):
+                 observed_seeds: Optional[set] = None,
+                 not_functions: Optional[set] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -52,6 +53,8 @@ class Disassembler:
         # Seeds a run actually reached (see _load_seed_functions). They are
         # not guesses, so the mid-instruction guard below does not apply.
         self.observed_seeds = observed_seeds or set()
+        # Never accepted as function starts ("not_function" seed entries).
+        self.not_functions = set(not_functions or ())
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -86,7 +89,9 @@ class Disassembler:
             if json_path and cache.is_valid(self.xbe_path, json_path,
                                              self.text_only,
                                              self.extra_sections,
-                                             self.seed_functions):
+                                             self.seed_functions,
+                                             self.observed_seeds,
+                                             self.not_functions):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -173,6 +178,7 @@ class Disassembler:
             print("\nPhase 5: Detecting functions...")
         self.func_detector = FunctionDetector(
             self.engine, self.image, self.xrefs, self.labels)
+        self.func_detector.not_functions = self.not_functions
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
@@ -300,7 +306,9 @@ class Disassembler:
             json_path = self._find_analysis_json()
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
-                           self.extra_sections, self.seed_functions)
+                           self.extra_sections, self.seed_functions,
+                           self.observed_seeds,
+                           self.not_functions)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")

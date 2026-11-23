@@ -211,6 +211,14 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 /* One byte per 4 KB page of the window, nonzero while the page is allocated
  * (or claimed). Read without the arena lock; a device model's view. */
 const volatile uint8_t *xbox_ContiguousPageMap(void);
+/* The physical number MmGetPhysicalAddress gives a RAM address (one outside
+ * the window): a heap page below 64 MB gets its alias in the first RAM mirror
+ * (va + xbox_PhysRamAlias()), so no window page shares the number; anything
+ * else, or every address when there is no alias, is the identity. */
+uint32_t xbox_PhysRamName(uint32_t va);
+/* What xbox_PhysRamName adds to a heap page: the RAM size when the first
+ * mirror is mapped and RECOMP_PHYS_RAM_ALIAS is not 0, else 0. */
+uint32_t xbox_PhysRamAlias(void);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
@@ -549,7 +557,9 @@ HANDLE xbox_GetMappingHandle(void);
 uint32_t xbox_AllocThreadStack(void);
 
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
- * template the loader built. Returns the new TIB's Xbox VA, or 0. */
+ * template the loader built. Returns the new TIB's Xbox VA, or 0. Every host
+ * thread that runs guest code takes one: it also gives the thread its own
+ * KTHREAD stand-in at fs:[0x28] (xbox_ThreadObjectForTib). */
 uint32_t xbox_AllocThreadTib(void);
 /* D3D software methods other than the swap: the title's dispatcher (the
  * routine its PGRAPH service calls for NO_OPERATION) and its object
@@ -564,6 +574,15 @@ void xbox_Nv2aSetSoftwareMethodHandler4134(uint32_t fn_va, uint32_t this_ptr_va,
 int xbox_Nv2aSoftwareMethodAbi(void);
 /* The executor's call: the parameter, and the two clear values (4134's data). */
 void xbox_Nv2aSoftwareMethodData(uint32_t param, uint32_t data, uint32_t data2);
+
+/* Bytes of TIB/KPCR per thread: through KPRCB.DpcRoutineActive, fs:[0x58]
+ * (XBOX_TIB_DPC_ACTIVE), which kernel_run_dpc sets while a DPC runs. */
+#define XBOX_TIB_SIZE       0x80u
+#define XBOX_TIB_DPC_ACTIVE 0x58u
+
+/* The calling thread's guest thread object, made on first use (kernel_bridge.c);
+ * 0 if the pool is full. Its +0x12C is a unique, never-reused thread id. */
+uint32_t xbox_ThreadObjectForTib(void);
 
 /**
  * Return a worker's stack when the worker ends. Takes the value

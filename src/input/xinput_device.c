@@ -469,6 +469,13 @@ static void open_controllers(void)
     int slot = xbox_InputFirstPadPort();
     if (g_pads_closed)
         return;
+    /* A pad unplugged since: its slot is free for the next one (or for it again). */
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        if (g_pads[p] && !SDL_GameControllerGetAttached(g_pads[p])) {
+            pad_rest_forget(g_pads[p]);
+            SDL_GameControllerClose(g_pads[p]);
+            g_pads[p] = NULL;
+        }
     for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
         if (!SDL_IsGameController(i))
             continue;
@@ -608,6 +615,18 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
     /* Held across the reads: the window's thread closes a removed
      * controller only under the lock. */
     pthread_mutex_lock(&g_pads_lock);
+    if (!g_main_pump && !g_pads_closed) {
+        /* Headless, nothing pumps SDL's events: a pad plugged in or out later is
+         * found here, once a second (as XboxXBERecomp polls SDL's device events
+         * from its own thread, MIT). */
+        static uint64_t next_ms;
+        uint64_t now = sdl_now_ms();
+        if (now >= next_ms) {
+            next_ms = now + 1000;
+            SDL_GameControllerUpdate();
+            open_controllers();
+        }
+    }
     if (xbox_InputPadsMerged()) {
         int n = 0;
         if (port == (DWORD)xbox_InputFirstPadPort() && !g_pads_closed) {

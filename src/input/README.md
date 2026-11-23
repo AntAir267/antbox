@@ -220,6 +220,13 @@ test.
 | D or Right arrow | Left stick right |
 <!-- keyboard_map:end -->
 
+The table is the defaults. Twelve of the rows (every one but the four arrows)
+can be rebound in the overlay's Controls page, two keys each, a key to one
+button; see the rebinding section of `keyboard.h`. The bindings are saved as
+text in settings.toml (`input.keys`) and can be given in `RECOMP_KEYBOARD_KEYS`.
+The page has no key rows on a Steam Deck or under gamescope (BO-327: a pad's
+place); the keys still work there, and the file or the variable changes them.
+
 ## Every controller is player 1's
 
 With one player, every connected controller feeds the first port, merged: a
@@ -239,8 +246,8 @@ first press, so a second pad that presses first after the split becomes player 1
 
 ## The first controller's player
 
-`input.first_pad` (settings.toml, the overlay's Input page as "First
-controller", `RECOMP_INPUT_FIRST_PAD=player1|player2`; not on Android).
+`input.first_pad` (settings.toml, the overlay's Controls page as
+"First controller", `RECOMP_INPUT_FIRST_PAD=player1|player2`; not on Android).
 `player1`, the default: a controller takes the lowest free port at its first
 button press, so the first one is player 1 and the keyboard adds to it on
 port 0. `player2`: port 0 is the keyboard's alone and controllers take ports
@@ -250,7 +257,7 @@ already taken; each controller takes one again at its next button press.
 
 ## A title's second control scheme
 
-`input.control_scheme` (settings.toml, the overlay's Input page as "Driving
+`input.control_scheme` (settings.toml, the overlay's Controls page as "Driving
 controls", `RECOMP_INPUT_CONTROL_SCHEME=xbox|ps2`) is a choice the toolkit
 only keeps: `xbox_InputControlScheme()` is 0 for the title's own layout and 1
 for an alternative that the title's host code provides, and the overlay shows
@@ -391,7 +398,7 @@ both. Each finger keeps the control it went down on; a finger on a button
 slides onto a neighbour (BOOST holds the accelerator too). The settings are
 `input.touch_controls` (auto: hidden while a controller is used, back at the
 next touch; always; off), `input.touch_opacity`, `input.touch_scale` and
-`input.touch_auto_gas`, on the Input page; only the Android table has them,
+`input.touch_auto_gas`, on the Controls page; only the Android table has them,
 so on the other hosts touch stays off. The Android activity passes the
 display cutout's safe insets in `RECOMP_TOUCH_INSETS`; the layout keeps out
 of them. `tests/input_touch` covers the layouts, glide, the stick,

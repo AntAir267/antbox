@@ -1,5 +1,5 @@
 /*
- * xbox_update - "Check for updates" (the overlay's Advanced page): one
+ * xbox_update - "Check for updates" (the overlay's System page): one
  * anonymous HTTPS GET of GitHub's latest-release record, when the user
  * presses the row and not before. This header is the part that needs no
  * network: reading the few fields of the JSON that are used, comparing the

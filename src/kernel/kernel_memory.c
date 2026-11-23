@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_PhysRamName */
 #include <stdlib.h>
 #include <stdio.h>
 #if defined(_WIN32)
@@ -233,7 +234,8 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     /*
      * The contiguous arena is the virtual window onto physical RAM, so an
      * address inside it is its physical offset plus XBOX_CONTIG_BASE. Anything
-     * outside passes through unchanged.
+     * outside is the identity, except a heap page below 64 MB, which is named
+     * by its alias in the first RAM mirror (xbox_PhysRamName).
      *
      * The only implementation. bridge_MmGetPhysicalAddress calls this rather
      * than repeating the arithmetic: the two used to disagree, with the bridge
@@ -246,7 +248,7 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
     uint32_t pa = (va >= XBOX_CONTIG_BASE &&
                    (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                ? va - XBOX_CONTIG_BASE : va;
+                ? va - XBOX_CONTIG_BASE : xbox_PhysRamName(va);
     if (pa < 0x10000000u) {
         LONG owner = (LONG)((va >> 12) + 1);
         LONG was = g_phys_owner[pa >> 12];

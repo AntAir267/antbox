@@ -71,12 +71,15 @@ def test_disagreeing_predecessors_keep_the_fallback():
     # Two predecessors reach the jz: one after `sub`, one after `inc`, whose
     # flags come from a different operand. The join must refuse.
     #   +0  sub eax, ecx
-    #   +2  jmp +3            -> the jz at +5
+    #   +2  jz +1             -> the jz at +5
     #   +4  inc edx           (falls through to the jz, different flag source)
     #   +5 L: jz +1
     #   +7  ret
+    # A jz, not a jmp, at +2: with a jmp the inc is unreachable, and the
+    # lifter now drops blocks the CFG cannot reach (upstream d4cbaaf2, with
+    # 162d64c4), so the join would have one predecessor and nothing to refuse.
     image = (b"\x29\xC8"          # sub eax, ecx
-             b"\xEB\x01"          # jmp +1 -> +5
+             b"\x74\x01"          # jz +1 -> +5; both predecessors reachable
              b"\x42"              # inc edx
              b"\x74\x00"          # jz +0 -> +7
              b"\xC3")             # ret

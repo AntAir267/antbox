@@ -3,7 +3,9 @@
  * of nv2a_backend_common.h. No OS or graphics headers.
  */
 #include "nv2a_backend_common.h"
+#include "nv2a_pb_split.h"
 #include "recomp_env.h"
+#include "platform/host_time.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -41,66 +43,323 @@ uint32_t nv2a_tex_face_stride(uint32_t fmt, uint32_t w, uint32_t h,
     return (n + 127u) & ~127u;
 }
 
+/* RECOMP_DEBUG=vtx_record=<path> (BO-282): the gathers of vtx_record_n draws
+ * from vtx_record_at seconds after the first one, as tests/nv2a_vtx_gather
+ * replays them: each draw's inputs and the guest bytes its streams are read
+ * from, so the gather can be run again on them away from the game. All
+ * little-endian 32-bit words:
+ *   file  "VTXR", version 1
+ *   draw  "DRAW", nf4, lo, count, inline_data, inline_bytes, then per input
+ *         slot, offset, type, size, stride and the SET_VERTEX_DATA value
+ *         (4 floats); then an inline draw's payload (bytes, then the bytes,
+ *         a 4-byte multiple), or for each input has-bytes and, when 1, the
+ *         guest address of vertex lo's element, the length and the bytes.
+ * Only the render thread calls the gather, so the state is unlocked. */
+static int      s_vrec = -1;            /* -1 unread, 0 off, 1 waiting or on */
+static FILE    *s_vrec_f;
+static uint64_t s_vrec_t0, s_vrec_at;
+static uint32_t s_vrec_left;
+
+/* The bytes nv2a_vtx_gather reads of one element of a stream. */
+static uint32_t vrec_elem_bytes(uint32_t type, uint32_t size)
+{
+    uint32_t n = size < 4 ? size : 4;
+    switch (type) {
+    case NV2A_VTX_FLOAT:    return 4 * n;
+    case NV2A_VTX_D3DCOLOR: return 4;
+    case NV2A_VTX_UBYTE:    return n;
+    case NV2A_VTX_S1:
+    case NV2A_VTX_S32K:     return 2 * n;
+    case NV2A_VTX_CMP:      return 4;
+    default:                return 0;
+    }
+}
+
+static void vrec_u32(uint32_t v) { fwrite(&v, 4, 1, s_vrec_f); }
+
+static void vtx_record(const struct nv2a_pb_draw *d, const int *slot, int nf4,
+                       uint32_t lo, uint32_t count, const float (*inl)[4],
+                       const uint8_t *mem)
+{
+    uint64_t now = xbox_HostNowNs();
+    int k;
+
+    if (s_vrec < 0) {
+        const char *path = recomp_env(RENV_VTX_RECORD);
+        const char *at = recomp_env(RENV_VTX_RECORD_AT);
+        const char *n = recomp_env(RENV_VTX_RECORD_N);
+        s_vrec = path && *path;
+        if (!s_vrec)
+            return;
+        s_vrec_t0 = now;
+        s_vrec_at = (uint64_t)((at ? atof(at) : 60.0) * 1e9);
+        s_vrec_left = n ? (uint32_t)strtoul(n, NULL, 0) : 3000u;
+        s_vrec_f = fopen(path, "wb");
+        if (!s_vrec_f || !s_vrec_left) {
+            fprintf(stderr, "[VTXREC] cannot write %s\n", path);
+            s_vrec = 0;
+            return;
+        }
+        fwrite("VTXR", 4, 1, s_vrec_f);
+        vrec_u32(1);
+    }
+    if (!s_vrec || now - s_vrec_t0 < s_vrec_at)
+        return;
+    if (nf4 > NV_VERTEX_ATTRS)
+        nf4 = NV_VERTEX_ATTRS;
+    fwrite("DRAW", 4, 1, s_vrec_f);
+    vrec_u32((uint32_t)nf4);
+    vrec_u32(lo);
+    vrec_u32(count);
+    vrec_u32((uint32_t)d->inline_data);
+    vrec_u32(d->inline_bytes);
+    for (k = 0; k < nf4; k++) {
+        const VertexAttr *a = &d->attr[slot[k]];
+        vrec_u32((uint32_t)slot[k]);
+        vrec_u32(a->offset);
+        vrec_u32(a->type);
+        vrec_u32(a->size);
+        vrec_u32(a->stride);
+        fwrite(inl[slot[k]], 4, 4, s_vrec_f);
+    }
+    if (d->inline_data) {
+        /* An element starting within the payload is read whole, up to 12
+         * bytes past its end. */
+        uint32_t n = d->inline_bytes + 12u;
+        if (n > NV_MAX_INLINE * 4u)
+            n = NV_MAX_INLINE * 4u;
+        vrec_u32(n);
+        fwrite(d->inline_buf, 1, n, s_vrec_f);
+    } else {
+        for (k = 0; k < nf4; k++) {
+            const VertexAttr *a = &d->attr[slot[k]];
+            uint64_t len = count ? (uint64_t)(count - 1u) * a->stride
+                                   + vrec_elem_bytes(a->type, a->size) : 0;
+            uint32_t va = a->offset + lo * a->stride;
+            if (!a->size || !a->stride || !a->offset || !len || len > (32u << 20)) {
+                vrec_u32(0);
+                continue;
+            }
+            vrec_u32(1);
+            vrec_u32(va);
+            vrec_u32((uint32_t)((len + 3u) & ~3ull));
+            fwrite(mem + va, 1, (size_t)len, s_vrec_f);
+            if (len & 3u)
+                fwrite("\0\0\0", 1, (size_t)(4u - (len & 3u)), s_vrec_f);
+        }
+    }
+    if (--s_vrec_left == 0) {
+        fclose(s_vrec_f);
+        s_vrec_f = NULL;
+        s_vrec = 0;
+        fprintf(stderr, "[VTXREC] done: %s\n", recomp_env(RENV_VTX_RECORD));
+    }
+}
+
+/* CMP (11:11:10 signed normalised in a dword) as nv2a_vtx_decode makes it:
+ * x and y are the low and middle 11 bits over 1023, z the top 10 over 511.
+ * One table entry per field value, worked out by the compiler
+ * (tests/nv2a_vtx_gather checks every one against the division). */
+#define CMP11(i)   ((float)((int)(i) - ((i) >= 1024 ? 2048 : 0)) / 1023.0f)
+#define CMP10(i)   ((float)((int)(i) - ((i) >= 512 ? 1024 : 0)) / 511.0f)
+#define T4(F, i)   F(i), F((i) + 1), F((i) + 2), F((i) + 3)
+#define T16(F, i)  T4(F, i), T4(F, (i) + 4), T4(F, (i) + 8), T4(F, (i) + 12)
+#define T64(F, i)  T16(F, i), T16(F, (i) + 16), T16(F, (i) + 32), T16(F, (i) + 48)
+#define T256(F, i) T64(F, i), T64(F, (i) + 64), T64(F, (i) + 128), T64(F, (i) + 192)
+const float nv2a_vtx_cmp11[2048] = {
+    T256(CMP11, 0), T256(CMP11, 256), T256(CMP11, 512), T256(CMP11, 768),
+    T256(CMP11, 1024), T256(CMP11, 1280), T256(CMP11, 1536), T256(CMP11, 1792)
+};
+const float nv2a_vtx_cmp10[1024] = {
+    T256(CMP10, 0), T256(CMP10, 256), T256(CMP10, 512), T256(CMP10, 768)
+};
+#undef T256
+#undef T64
+#undef T16
+#undef T4
+#undef CMP10
+#undef CMP11
+
+/* What nv2a_vtx_gather does with an input, decided once per draw (BO-282):
+ * before, every element went through the stream's NULL test, the inline
+ * payload's bounds test, a test of the type and a switch on the size, and
+ * every colour channel, packed normal and normalised short through
+ * divisions. In a Silver Lake race 54 % of the vertices carry a CMP normal
+ * and 27 % a D3DCOLOR; no stream there is a normalised short. */
+enum vin_kind {
+    VIN_DFLT,                   /* off: the SET_VERTEX_DATA value */
+    VIN_F1, VIN_F2, VIN_F3, VIN_F4,     /* FLOAT, 1 .. 4 components */
+    VIN_COLOR,                  /* D3DCOLOR */
+    VIN_CMP,                    /* 11:11:10 */
+    VIN_S1,                     /* normalised short, 1 .. 4 components */
+    VIN_DECODE                  /* the rest: nv2a_vtx_decode */
+};
+
+struct vin {
+    const uint8_t *p;           /* vertex lo's element */
+    size_t         stride;
+    uint32_t       kind, type, size;
+    uint32_t       live;        /* vertices 0 .. live - 1 read p, the rest
+                                 * (past an inline payload's end) dflt */
+    const float   *dflt;        /* SET_VERTEX_DATA value */
+};
+
+/* Vertices are made a block at a time on the stack (VTILE_FLOATS, as many
+ * vertices as fit), one input at a time down the block (a loop per input
+ * kind, no test per element), and the block is then copied out whole: the
+ * stores to `out` stay in address order, which write-combined upload memory
+ * needs. 8 KB: 170 vertices of three inputs, 32 of sixteen. */
+#define VTILE_FLOATS 2048u
+
+/* Input s's elements of the n vertices from i0 (all below s->live) into t,
+ * every ts floats. */
+static void vin_run(const struct vin *s, uint32_t i0, uint32_t n, float *t, size_t ts)
+{
+    const uint8_t *p = s->p + (size_t)i0 * s->stride;
+    const size_t st = s->stride;
+    uint32_t j;
+
+    /* Each element loaded into registers and stored once: a partial store
+     * read back whole stalls the store forwarding. */
+    switch (s->kind) {
+    case VIN_F1:
+        for (j = 0; j < n; j++, p += st, t += ts) {
+            float x;
+            memcpy(&x, p, 4);
+            t[0] = x; t[1] = 0.0f; t[2] = 0.0f; t[3] = 1.0f;
+        }
+        break;
+    case VIN_F2:
+        for (j = 0; j < n; j++, p += st, t += ts) {
+            float x, y;
+            memcpy(&x, p, 4); memcpy(&y, p + 4, 4);
+            t[0] = x; t[1] = y; t[2] = 0.0f; t[3] = 1.0f;
+        }
+        break;
+    case VIN_F3:
+        for (j = 0; j < n; j++, p += st, t += ts) {
+            float x, y, z;
+            memcpy(&x, p, 4); memcpy(&y, p + 4, 4); memcpy(&z, p + 8, 4);
+            t[0] = x; t[1] = y; t[2] = z; t[3] = 1.0f;
+        }
+        break;
+    case VIN_F4:
+        for (j = 0; j < n; j++, p += st, t += ts)
+            memcpy(t, p, 16);
+        break;
+    case VIN_COLOR:
+        /* 0xAARRGGBB: bytes B, G, R, A, as R, G, B, A. */
+        for (j = 0; j < n; j++, p += st, t += ts) {
+            t[0] = nv2a_vtx_unorm8[p[2]];
+            t[1] = nv2a_vtx_unorm8[p[1]];
+            t[2] = nv2a_vtx_unorm8[p[0]];
+            t[3] = nv2a_vtx_unorm8[p[3]];
+        }
+        break;
+    case VIN_CMP:
+        for (j = 0; j < n; j++, p += st, t += ts) {
+            uint32_t w;
+            memcpy(&w, p, 4);
+            t[0] = nv2a_vtx_cmp11[w & 0x7FFu];
+            t[1] = nv2a_vtx_cmp11[(w >> 11) & 0x7FFu];
+            t[2] = nv2a_vtx_cmp10[w >> 22];
+            t[3] = 1.0f;
+        }
+        break;
+    case VIN_S1: {
+        const uint32_t c = s->size < 4 ? s->size : 4u;
+        for (j = 0; j < n; j++, p += st, t += ts) {
+            float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            uint32_t q;
+            for (q = 0; q < c; q++) {
+                int16_t h;
+                memcpy(&h, p + 2u * q, 2);
+                v[q] = nv2a_vtx_snorm16(h);
+            }
+            memcpy(t, v, 16);
+        }
+        break;
+    }
+    case VIN_DECODE:
+        for (j = 0; j < n; j++, p += st, t += ts)
+            nv2a_vtx_decode(s->type, s->size, p, t);
+        break;
+    default:
+        for (j = 0; j < n; j++, t += ts)
+            memcpy(t, s->dflt, 16);
+        break;
+    }
+}
+
 void nv2a_vtx_gather(const struct nv2a_pb_draw *d, const int *slot, int nf4,
                      uint32_t lo, uint32_t count, const float (*inl)[4],
                      const uint8_t *mem, float *out)
 {
-    struct {
-        const uint8_t *p;       /* the element of the vertex being written */
-        size_t         stride;
-        uint32_t       type, size;
-        const float   *dflt;    /* SET_VERTEX_DATA value */
-    } s[NV_VERTEX_ATTRS];
+    struct vin s[NV_VERTEX_ATTRS];
+    float tile[VTILE_FLOATS];
     const int inl_data = d->inline_data;
-    uint32_t i;
+    uint32_t i0, nt;
+    size_t ts;
     int k;
 
+    if (s_vrec)
+        vtx_record(d, slot, nf4, lo, count, inl, mem);
     if (nf4 > NV_VERTEX_ATTRS)
         nf4 = NV_VERTEX_ATTRS;
+    if (nf4 <= 0)
+        return;
+    ts = (size_t)nf4 * 4u;
+    nt = VTILE_FLOATS / (uint32_t)ts;
     for (k = 0; k < nf4; k++) {
         const VertexAttr *a = &d->attr[slot[k]];
+        uint64_t at = (uint64_t)a->offset + (uint64_t)lo * a->stride;
         s[k].dflt = inl[slot[k]];
         s[k].stride = a->stride;
         s[k].type = a->type;
         s[k].size = a->size;
+        s[k].kind = VIN_DFLT;
+        s[k].live = count;
         s[k].p = NULL;
         if (!a->size || !a->stride)
             continue;
-        if (inl_data)
-            s[k].p = (const uint8_t *)d->inline_buf + a->offset + (size_t)lo * a->stride;
-        else if (a->offset)
-            s[k].p = mem + a->offset + (size_t)lo * a->stride;
-    }
-    for (i = 0; i < count; i++) {
-        for (k = 0; k < nf4; k++, out += 4) {
-            const uint8_t *p = s[k].p;
-            if (p) {
-                s[k].p = p + s[k].stride;
-                if (inl_data && (size_t)(p - (const uint8_t *)d->inline_buf) + 4 > d->inline_bytes)
-                    p = NULL;
-            }
-            if (!p) {
-                memcpy(out, s[k].dflt, 16);
+        if (inl_data) {
+            /* The payload's elements: vertex i's at at + i * stride is read
+             * while it starts 4 bytes or more before the payload's end. */
+            if (at + 4u > d->inline_bytes)
                 continue;
-            }
-            if (s[k].type == NV2A_VTX_FLOAT) {
-                /* Loaded into registers and stored once each: a partial
-                 * store read back whole stalls the store forwarding. */
-                float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
-                switch (s[k].size) {
-                default: memcpy(&w, p + 12, 4); /* fall through */
-                case 3:  memcpy(&z, p + 8, 4);  /* fall through */
-                case 2:  memcpy(&y, p + 4, 4);  /* fall through */
-                case 1:  memcpy(&x, p, 4);      break;
-                }
-                out[0] = x;
-                out[1] = y;
-                out[2] = z;
-                out[3] = w;
-            } else if (!nv2a_vtx_decode(s[k].type, s[k].size, p, out)) {
-                memcpy(out, s[k].dflt, 16);
-            }
+            if ((d->inline_bytes - at - 4u) / a->stride + 1u < count)
+                s[k].live = (uint32_t)((d->inline_bytes - at - 4u) / a->stride + 1u);
+            s[k].p = (const uint8_t *)d->inline_buf + at;
+        } else if (a->offset) {
+            s[k].p = mem + at;
+        } else {
+            continue;
         }
+        switch (a->type) {
+        case NV2A_VTX_FLOAT:
+            s[k].kind = a->size == 1 ? VIN_F1 : a->size == 2 ? VIN_F2
+                      : a->size == 3 ? VIN_F3 : VIN_F4;
+            break;
+        case NV2A_VTX_D3DCOLOR: s[k].kind = VIN_COLOR;  break;
+        case NV2A_VTX_CMP:      s[k].kind = VIN_CMP;    break;
+        case NV2A_VTX_S1:       s[k].kind = VIN_S1;     break;
+        case NV2A_VTX_UBYTE:
+        case NV2A_VTX_S32K:     s[k].kind = VIN_DECODE; break;
+        default:                s[k].kind = VIN_DFLT;   break;  /* no decoder */
+        }
+    }
+    for (i0 = 0; i0 < count; i0 += nt) {
+        uint32_t n = count - i0 < nt ? count - i0 : nt;
+        for (k = 0; k < nf4; k++) {
+            /* An input past an inline payload's end gives its dflt there. */
+            uint32_t m = s[k].live <= i0 ? 0 : s[k].live - i0 < n ? s[k].live - i0 : n;
+            struct vin rest = s[k];
+            vin_run(&s[k], i0, m, tile + 4 * k, ts);
+            rest.kind = VIN_DFLT;
+            vin_run(&rest, i0 + m, n - m, tile + 4 * k + m * ts, ts);
+        }
+        memcpy(out, tile, (size_t)n * ts * sizeof(float));
+        out += (size_t)n * ts;
     }
 }
 
@@ -123,6 +382,10 @@ uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h)
 
 static _Atomic uint64_t s_rt_hashes;
 
+/* RECOMP_TRACE=pb_split (nv2a_pb_split.h): set by nv2a_pb_exec.c's writer;
+ * here so a test that links the shared code alone still links. */
+struct nv2a_split *nv2a_split;
+
 static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, uint32_t h)
 {
     /* The end of the window addr lies in; an address in neither (a test's
@@ -130,11 +393,19 @@ static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, u
     uint64_t top = addr >= NV2A_RT_CONTIG_BASE
                        ? (uint64_t)NV2A_RT_CONTIG_BASE + NV2A_RT_CONTIG_SIZE
                  : addr < NV2A_RT_WINDOW ? NV2A_RT_WINDOW : 0x100000000ull;
-    uint64_t n = (uint64_t)pitch * h;
+    uint64_t n = (uint64_t)pitch * h, r, t0;
+    struct nv2a_split *sp = nv2a_split;   /* RECOMP_TRACE=pb_split (BO-282.12) */
     if (n > top - addr)
         n = top - addr;
     atomic_fetch_add_explicit(&s_rt_hashes, 1, memory_order_relaxed);
-    return nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    if (!sp)
+        return nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    t0 = nv2a_split_tick();
+    r = nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    sp->own_ticks += nv2a_split_tick() - t0;
+    sp->own_hash++;
+    sp->own_kb += (uint32_t)(n >> 10);
+    return r;
 }
 
 void nv2a_rt_own_reset(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
@@ -466,8 +737,19 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
     o->c[3] = v->poly_offset ? v->poly_bias / nv2a_zmax(surface_format) : 0.0f;
     o->c[4] = -1.0f;
     o->c[5] = 1.0f;
-    o->c[6] = 0.0f;
-    o->c[7] = 0.0f;
+    /* BO-332: SET_CLIP_MIN / SET_CLIP_MAX as normalised depth (window z
+     * over zmax), [0, 1] until the title sets them; u[6] 1 when
+     * SET_ZMIN_MAX_CONTROL's ZCLAMP_EN (bits 7:4) is CULL, as xemu's
+     * pgraph_glsl_set_clip_range_uniform_value and psh.c depth_clipping.
+     * Read by the GLSL vertex program with D3D8_GLSL_CLIP_RANGE. */
+    if (v->clip_set) {
+        float lo = v->clip_min, hi = v->clip_max;
+        o->c[6] = lo / nv2a_zmax(surface_format);
+        o->c[7] = hi / nv2a_zmax(surface_format);
+    } else {
+        o->c[6] = 0.0f;
+        o->c[7] = 1.0f;
+    }
     /* Fog and specular, as the CPU path's vsh_fog_factor and vsh_transform
      * apply them (xemu vsh.c). */
     o->c[8] = v->fog_param[0];
@@ -483,10 +765,12 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
     }
     o->u[4] = v->spec_enable ? 1u : 0u;
     o->u[5] = (v->light_ctl >> 17) & 1u;
+    o->u[6] = ((v->zminmax >> 4) & 0xFu) == 0u ? 1u : 0u;   /* BO-332: ZCLAMP_EN CULL */
     /* W-buffering (SET_CONTROL0's Z_PERSPECTIVE_ENABLE): the depth stored is
-     * w over the clip range, not z (xemu: pgraph vsh, z_perspective). */
+     * w over the clip range, not z (xemu: pgraph vsh, z_perspective); u[7],
+     * read as spec_ctl.w. */
     if ((v->control0 & (1u << 16)) && v->clip_max > 0.0f) {
-        o->u[6] = 1u;
+        o->u[7] = 1u;
         o->c[11] = 1.0f / v->clip_max;
     }
 }
@@ -1041,6 +1325,36 @@ void nv2a_host_set_dither(int on)
     s_dither = on ? 1 : 0;
 }
 
+int nv2a_rt_reduce_draw(uint32_t src_w, uint32_t src_h, uint32_t src_hw, uint32_t src_hh,
+                        uint32_t dst_w, uint32_t dst_h)
+{
+    if (!src_w || !src_h || !dst_w || !dst_h)
+        return 0;
+    if (src_hw <= src_w && src_hh <= src_h)
+        return 0;                       /* not scaled: 1x */
+    return dst_w <= src_w && dst_h <= src_h && (dst_w < src_w || dst_h < src_h);
+}
+
+int nv2a_rt_reduce_on(uint32_t flips)
+{
+    static int mode = -1;
+    static uint32_t ab, said = 0xFFFFFFFFu;
+    if (mode < 0) {
+        const char *e = recomp_env(RENV_RT_REDUCE), *a = recomp_env(RENV_RT_REDUCE_AB);
+        ab = a ? (uint32_t)strtoul(a, NULL, 0) : 0;
+        mode = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
+    }
+    if (ab) {
+        uint32_t half = (flips / ab) & 1u;
+        if (half != said) {
+            said = half;
+            fprintf(stderr, "[RT-REDUCE] ab: %s from flip %u\n", half ? "off" : "on", flips);
+        }
+        return half ? 0 : mode;
+    }
+    return mode;
+}
+
 unsigned nv2a_host_render_scale(void)
 {
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;
@@ -1140,6 +1454,7 @@ static void present_aspect_ratio(uint32_t src_w, uint32_t src_h, int aspect, dou
     switch (aspect) {
     case NV2A_ASPECT_4_3:  *aw = 4;  *ah = 3; break;
     case NV2A_ASPECT_16_9: *aw = 16; *ah = 9; break;
+    case NV2A_ASPECT_16_10: *aw = 16; *ah = 10; break;
     default:               *aw = src_w; *ah = src_h; break;
     }
 }

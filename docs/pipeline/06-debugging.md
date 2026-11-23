@@ -339,7 +339,7 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
   and the session's frame times, with the home path and the user and host
   names taken out. A host fills `xbox_bug_report_opts` in a maker function
   (`xbox_BugReportSetMaker`) and registers its own sections; the settings
-  overlay's Advanced page then has "Create bug report", and
+  overlay's System page then has "Create bug report", and
   `RECOMP_DEBUG=bug_report=<seconds>` (or `=@<file>`) makes one without a
   window. `tests/bug_report` holds the privacy test.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback

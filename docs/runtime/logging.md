@@ -23,7 +23,7 @@ is one load and a compare.
 **When it is on.** First that says anything: `RECOMP_LOG_DIAG=0|1`; a
 developer switch (`RECOMP_TRACE`, `RECOMP_DEBUG`, `RECOMP_STDIO_LOG`,
 `RECOMP_FLIP_MARK`, `RECOMP_HEADLESS`, `--headless`); the setting
-`advanced.diagnostic_log` (Advanced > Diagnostic logging, live); the build:
+`advanced.diagnostic_log` (System > Diagnostic logging, live); the build:
 off in a release build (`BO3_RELEASE_BUILD`), on in every other. A program
 that never calls `xr_log_init` (the tests, the tools) prints everything.
 A crash, a hang report or a fault turns it on for the rest of the run.

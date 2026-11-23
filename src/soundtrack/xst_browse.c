@@ -365,7 +365,7 @@ static void *count_thread(void *arg)
         budget.out = 0;
         if (mark) {
             int m = mark(path);
-            n = m > 0;
+            n = m > 0 ? m : 0;          /* the mark's own kind (1, 2, ...) */
             more = m < 0;
         } else {
 #if !defined(_WIN32)

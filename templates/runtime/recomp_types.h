@@ -64,6 +64,34 @@
 #include <xmmintrin.h>
 #endif
 
+/* The x87 transcendentals (fsin, fcos, fptan, fpatan, fyl2x, fyl2xp1, f2xm1).
+ * Hosts' libm need not agree in the last bit, so a project that compares
+ * guest state across machines, such as netplay, defines RECOMP_PORTABLE_MATH
+ * and links one implementation of these for every host. */
+#ifdef RECOMP_PORTABLE_MATH
+#ifdef __cplusplus
+extern "C" {
+#endif
+double recomp_sin(double x);
+double recomp_cos(double x);
+double recomp_tan(double x);
+double recomp_atan2(double y, double x);
+double recomp_log2(double x);
+double recomp_log1p(double x);
+double recomp_expm1(double x);
+#ifdef __cplusplus
+}
+#endif
+#else
+static inline double recomp_sin(double x) { return sin(x); }
+static inline double recomp_cos(double x) { return cos(x); }
+static inline double recomp_tan(double x) { return tan(x); }
+static inline double recomp_atan2(double y, double x) { return atan2(y, x); }
+static inline double recomp_log2(double x) { return log2(x); }
+static inline double recomp_log1p(double x) { return log1p(x); }
+static inline double recomp_expm1(double x) { return expm1(x); }
+#endif
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))
@@ -167,6 +195,39 @@ extern uint32_t g_xbox_code_hi;
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
+/* Generated with register locals (tools/recomp's default; translator.py,
+ * _localize_registers), a function keeps the registers in C locals named
+ * eax ... esp and these are where they meet the globals: written back before
+ * anything else can read them (a call, a return), read again after anything
+ * else can have changed them. Without it the names are the globals
+ * themselves and both are nothing. RECOMP_REG_ESP/EAX name the register a
+ * macro below adjusts on its own failure paths. */
+#ifdef RECOMP_REG_LOCALS
+/* All seven, the default. Each generated function redefines RECOMP_REGS_OUT
+ * and RECOMP_REGS_IN for the registers it writes and uses, and puts these
+ * back at its end (translator.py, _localize_registers). */
+#define RECOMP_REGS_OUT_ALL() ((void)(g_eax = eax, g_ecx = ecx, g_edx = edx, \
+    g_ebx = ebx, g_esi = esi, g_edi = edi, g_esp = esp))
+#define RECOMP_REGS_IN_ALL() ((void)(eax = g_eax, ecx = g_ecx, edx = g_edx, \
+    ebx = g_ebx, esi = g_esi, edi = g_edi, esp = g_esp))
+#define RECOMP_REGS_OUT() RECOMP_REGS_OUT_ALL()
+#define RECOMP_REGS_IN() RECOMP_REGS_IN_ALL()
+#define RECOMP_REG_ESP esp
+#define RECOMP_REG_EAX eax
+/* --reg-verify: a narrowed write-back skipped this register because the
+ * analysis says its local still equals its global. Checked, and said when
+ * it does not (recomp_trace.c). */
+void recomp_regs_mismatch(const char *reg, const char *func, int line,
+                          uint32_t local, uint32_t global);
+#define RECOMP_REGS_SKIPPED(r) \
+    ((g_##r != (r)) ? recomp_regs_mismatch(#r, __func__, __LINE__, (r), g_##r) : (void)0)
+#else
+#define RECOMP_REGS_OUT() ((void)0)
+#define RECOMP_REGS_IN() ((void)0)
+#define RECOMP_REG_ESP g_esp
+#define RECOMP_REG_EAX g_eax
+#endif
+
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
 extern RECOMP_TLS double g_fp_stack[8];
@@ -217,22 +278,74 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * -- harmless while every guest thread ran synchronously, and not once the
  * runtime began spawning real ones.
  *
+ * xchg with a memory operand is locked on x86 too (RECOMP_ATOMIC_XCHG*).
+ *
  * Genuinely atomic, not merely correct in isolation: the guest's own threads
  * now run on real host threads, so a read-modify-write that races is exactly
  * the bug these instructions exist to prevent.
  */
+/* Widths: the 8- and 16-bit forms are what `lock add byte ptr`, `xadd
+ * word ptr` and `cmpxchg byte ptr` need; CAS64 is cmpxchg8b. Every one is a
+ * full barrier (SEQ_CST), as the x86 locked instruction is.
+ *
+ * Alignment: these are applied to whatever address the guest computed. x86
+ * allows a locked instruction on an unaligned word (a split lock); arm64
+ * faults on an unaligned exclusive or CAS. Every live site in Burnout 3
+ * addresses a compiler-aligned field, so nothing checks here; a title that
+ * trips it stops with a SIGBUS at the site rather than silently. */
 #if defined(_MSC_VER)
 #include <intrin.h>
+#define RECOMP_ATOMIC_ADD8(p, v)      ((uint8_t)_InterlockedExchangeAdd8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_ADD16(p, v)     ((uint16_t)_InterlockedExchangeAdd16((volatile short *)(p), (short)(v)))
 #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
-#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#define RECOMP_ATOMIC_OR8(p, v)       ((uint8_t)_InterlockedOr8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_OR16(p, v)      ((uint16_t)_InterlockedOr16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_OR32(p, v)      ((uint32_t)_InterlockedOr((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_AND8(p, v)      ((uint8_t)_InterlockedAnd8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_AND16(p, v)     ((uint16_t)_InterlockedAnd16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_AND32(p, v)     ((uint32_t)_InterlockedAnd((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_XOR8(p, v)      ((uint8_t)_InterlockedXor8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_XOR16(p, v)     ((uint16_t)_InterlockedXor16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_XOR32(p, v)     ((uint32_t)_InterlockedXor((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_XCHG8(p, v)     ((uint8_t)_InterlockedExchange8((volatile char *)(p), (char)(v)))
+#define RECOMP_ATOMIC_XCHG16(p, v)    ((uint16_t)_InterlockedExchange16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_XCHG32(p, v)    ((uint32_t)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_CAS8(p, cmp, val)      ((uint8_t)_InterlockedCompareExchange8((volatile char *)(p), (char)(val), (char)(cmp)))
+#define RECOMP_ATOMIC_CAS16(p, cmp, val)     ((uint16_t)_InterlockedCompareExchange16((volatile short *)(p), (short)(val), (short)(cmp)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p), (long)(val), (long)(cmp)))
+#define RECOMP_ATOMIC_CAS64(p, cmp, val)     ((uint64_t)_InterlockedCompareExchange64((volatile long long *)(p), (long long)(val), (long long)(cmp)))
 #else
-#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
-#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#define RECOMP_ATOMIC_ADD8(p, v)      ((uint8_t)__atomic_fetch_add((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_ADD16(p, v)     ((uint16_t)__atomic_fetch_add((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__atomic_fetch_add((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_OR8(p, v)       ((uint8_t)__atomic_fetch_or((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_OR16(p, v)      ((uint16_t)__atomic_fetch_or((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_OR32(p, v)      ((uint32_t)__atomic_fetch_or((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_AND8(p, v)      ((uint8_t)__atomic_fetch_and((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_AND16(p, v)     ((uint16_t)__atomic_fetch_and((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_AND32(p, v)     ((uint32_t)__atomic_fetch_and((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_XOR8(p, v)      ((uint8_t)__atomic_fetch_xor((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_XOR16(p, v)     ((uint16_t)__atomic_fetch_xor((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_XOR32(p, v)     ((uint32_t)__atomic_fetch_xor((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_XCHG8(p, v)     ((uint8_t)__atomic_exchange_n((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_XCHG16(p, v)    ((uint16_t)__atomic_exchange_n((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_XCHG32(p, v)    ((uint32_t)__atomic_exchange_n((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST))
+#define RECOMP_ATOMIC_CAS8(p, cmp, val)      ((uint8_t)__sync_val_compare_and_swap((volatile uint8_t *)(p), (uint8_t)(cmp), (uint8_t)(val)))
+#define RECOMP_ATOMIC_CAS16(p, cmp, val)     ((uint16_t)__sync_val_compare_and_swap((volatile uint16_t *)(p), (uint16_t)(cmp), (uint16_t)(val)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p), (uint32_t)(cmp), (uint32_t)(val)))
+#define RECOMP_ATOMIC_CAS64(p, cmp, val)     ((uint64_t)__sync_val_compare_and_swap((volatile uint64_t *)(p), (uint64_t)(cmp), (uint64_t)(val)))
 #endif
 
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+/* It reads the frame it restores from the guest buffer, but what it leaves
+ * in the globals is what the landing reloads (register locals): write them back
+ * first, so the registers it does not restore come back as they were. */
+#ifdef RECOMP_REG_LOCALS
+#define recomp_guest_longjmp(buf_va, value) \
+    (RECOMP_REGS_OUT(), (recomp_guest_longjmp)((buf_va), (value)))
+#endif
 extern RECOMP_TLS uint32_t g_ebp;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
@@ -363,8 +476,8 @@ static inline void recomp_x87_shift(double x, double *s, double *c) {
     if (fabs(e) < 1.4901161193847656e-08) { /* 2^-26 */
         se = e; v = 0.0;
     } else {
-        double h = sin(0.5 * e);
-        se = sin(e); v = 2.0 * h * h;
+        double h = recomp_sin(0.5 * e);
+        se = recomp_sin(e); v = 2.0 * h * h;
     }
     *s = sx + (cx * se - sx * v);
     *c = cx - (sx * se + cx * v);
@@ -377,9 +490,9 @@ static inline int recomp_x87_fsin(double *st0, uint16_t *cc) {
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
     if (!(fabs(x) > 0.78539816339744830962) || !isfinite(x)) {
-        *st0 = sin(x);
+        *st0 = recomp_sin(x);
     } else {
-        s = sin(x); c = cos(x);
+        s = recomp_sin(x); c = recomp_cos(x);
         recomp_x87_shift(x, &s, &c);
         *st0 = s;
     }
@@ -389,9 +502,9 @@ static inline int recomp_x87_fcos(double *st0, uint16_t *cc) {
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
     if (!(fabs(x) > 0.78539816339744830962) || !isfinite(x)) {
-        *st0 = cos(x);
+        *st0 = recomp_cos(x);
     } else {
-        s = sin(x); c = cos(x);
+        s = recomp_sin(x); c = recomp_cos(x);
         recomp_x87_shift(x, &s, &c);
         *st0 = c;
     }
@@ -401,7 +514,7 @@ static inline int recomp_x87_fcos(double *st0, uint16_t *cc) {
 static inline int recomp_x87_fsincos(double *st0, double *cos_out, uint16_t *cc) {
     double x = *st0, s, c;
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
-    s = sin(x); c = cos(x);
+    s = recomp_sin(x); c = recomp_cos(x);
     if (fabs(x) > 0.78539816339744830962 && isfinite(x))
         recomp_x87_shift(x, &s, &c);
     *st0 = s; *cos_out = c;
@@ -414,11 +527,11 @@ static inline int recomp_x87_fptan(double *st0, double *push, uint16_t *cc) {
     if (recomp_x87_trig_oor(x)) return recomp_x87_cc_c2(cc, 1);
     *push = 1.0;
     if (!isfinite(x)) {
-        *st0 = *push = tan(x);
+        *st0 = *push = recomp_tan(x);
     } else if (!(fabs(x) > 0.78539816339744830962)) {
-        *st0 = tan(x);
+        *st0 = recomp_tan(x);
     } else {
-        s = sin(x); c = cos(x);
+        s = recomp_sin(x); c = recomp_cos(x);
         recomp_x87_shift(x, &s, &c);
         *st0 = s / c;
     }
@@ -447,9 +560,13 @@ static inline double recomp_frndint(double value, uint16_t control) {
     case 2: rounded=ceil(value); break;
     case 3: rounded=trunc(value); break;
     default: {
+        /* A half is rounded to the even neighbour. lo's parity from its
+         * integer value: a fraction of exactly 0.5 exists only below 2^52,
+         * where the conversion is exact (fmod(lo, 2.0) gave the same, but
+         * the compiler expands it to a fused multiply-add, BO-282.2). */
         double lo=floor(value), fraction=value-lo;
         rounded=lo;
-        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
+        if(fraction>0.5 || (fraction==0.5 && ((int64_t)lo & 1))) rounded=lo+1.0;
         break;
     }
     }
@@ -539,7 +656,30 @@ extern volatile int g_xbox_spin_sleep;
 extern volatile int g_xbox_irq_pending;
 void xbox_SpinWait(uint32_t va);
 #define RECOMP_SPIN_WAIT(va) \
-    do { if (g_xbox_spin_sleep | g_xbox_irq_pending) xbox_SpinWait(va); } while (0)
+    do { if (g_xbox_spin_sleep | g_xbox_irq_pending) { RECOMP_REGS_OUT(); xbox_SpinWait(va); RECOMP_REGS_IN(); } } while (0)
+
+/* Guest memory ordering on arm64 (tools/recomp/mem_order.py, --mem-order).
+ *
+ * Plain guest accesses are volatile and nothing more, which on x86-64 is the
+ * x86 ordering the title assumes and on arm64 is none. A listed lock-release
+ * store is emitted as RECOMP_STORE_REL* (a store-release: the owner's writes
+ * before it are visible to whoever sees it), and every spin-wait candidate's
+ * exit gets RECOMP_ACQUIRE_FENCE() (the loads after the loop are ordered
+ * after the one that saw the flag). On x86-64 both are what the plain code
+ * already was: a release store is a plain mov, the acquire fence is no
+ * instruction; MSVC's /volatile:ms (the default on x86 and x64) makes the
+ * volatile store a release already, so only a compiler barrier is needed. */
+#if defined(_MSC_VER)
+#define RECOMP_STORE_REL8(addr, v)   (MEM8(addr) = (uint8_t)(v))
+#define RECOMP_STORE_REL16(addr, v)  (MEM16(addr) = (uint16_t)(v))
+#define RECOMP_STORE_REL32(addr, v)  (MEM32(addr) = (uint32_t)(v))
+#define RECOMP_ACQUIRE_FENCE()       _ReadWriteBarrier()
+#else
+#define RECOMP_STORE_REL8(addr, v)   __atomic_store_n((volatile uint8_t *)XBOX_PTR(addr), (uint8_t)(v), __ATOMIC_RELEASE)
+#define RECOMP_STORE_REL16(addr, v)  __atomic_store_n((volatile uint16_t *)XBOX_PTR(addr), (uint16_t)(v), __ATOMIC_RELEASE)
+#define RECOMP_STORE_REL32(addr, v)  __atomic_store_n((volatile uint32_t *)XBOX_PTR(addr), (uint32_t)(v), __ATOMIC_RELEASE)
+#define RECOMP_ACQUIRE_FENCE()       __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#endif
 
 /* --patches (tools/recomp/patches.py): the value a patched guest load read,
  * or `value` while the setting `key` reads `when` (src/platform/
@@ -586,11 +726,11 @@ uint32_t xbox_PortIn(uint32_t port, int width);
 void     xbox_PortOut(uint32_t port, uint32_t value, int width);
 
 void recomp_trace_enter(const char *name, uint32_t va);
-#define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
+#define RECOMP_TRACE_ENTER(name, va) (RECOMP_REGS_OUT(), recomp_trace_enter((name), (va)))
 void recomp_trace_exit(const char *name, uint32_t va);
-#define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
+#define RECOMP_TRACE_EXIT(name, va) (RECOMP_REGS_OUT(), recomp_trace_exit((name), (va)))
 void recomp_trace_esp(const char *name, const char *tag);
-#define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
+#define RECOMP_TRACE_ESP(name, tag) (RECOMP_REGS_OUT(), recomp_trace_esp((name), (tag)))
 
 
 /* ================================================================
@@ -855,6 +995,8 @@ RECOMP_XMM_BITWISE(XMM_OR,   a.u[i] | b.u[i])
 RECOMP_XMM_BITWISE(XMM_XOR,  a.u[i] ^ b.u[i])
 /* ANDNPS is ~dst & src, not dst & ~src. */
 RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
+/* PCMPGTD: signed dword greater-than, dst = (dst > src). */
+RECOMP_XMM_BITWISE(XMM_PCMPGTD, ((int32_t)a.u[i] > (int32_t)b.u[i]) ? 0xFFFFFFFFu : 0u)
 
 /* Compares produce an all-ones or all-zero mask per lane. EQ/LT/LE are
  * the ordered forms (false when either lane is NaN); NEQ is the
@@ -1229,14 +1371,20 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
-#define RECOMP_ABI_CALL(va, fn) do { \
+/* The call alone, for a site that writes back and reloads the registers
+ * itself (a direct call's line, which writes back only what changed). */
+#define RECOMP_ABI_CALL_RAW(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
+#define RECOMP_ABI_CALL(va, fn) do { \
+    RECOMP_REGS_OUT(); RECOMP_ABI_CALL_RAW((va), fn); RECOMP_REGS_IN(); \
+} while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_RAW(va, fn) ((void)(va), (fn)())
+#define RECOMP_ABI_CALL(va, fn) (RECOMP_REGS_OUT(), (fn)(), RECOMP_REGS_IN())
 #endif
 
 /* A guarded arm of an indirect call. When a recorded run saw a call site
@@ -1280,7 +1428,7 @@ extern volatile uint64_t g_icall_guard_misses;
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp += 4; eax = 0; break; \
+        RECOMP_REG_ESP += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
@@ -1288,13 +1436,13 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+           recomp_icall_fail_log(_va); RECOMP_REG_ESP += 4; eax = 0; } \
 } while(0)
 
 /**
  * RECOMP_ICALL_SAFE - Stack-safe indirect call.
  *
- * Restores g_esp to saved_esp (pre-argument value) on lookup failure,
+ * Restores esp to saved_esp (pre-argument value) on lookup failure,
  * preventing stdcall argument leaks on failed vtable calls.
  * Use this when the caller pushes arguments that the callee would
  * normally clean up (stdcall convention).
@@ -1306,7 +1454,7 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        RECOMP_REG_ESP = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
@@ -1314,7 +1462,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); RECOMP_REG_ESP = (saved_esp); eax = 0; } \
 } while(0)
 
 /**
@@ -1332,7 +1480,7 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        RECOMP_REG_ESP = (saved_esp); eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -1341,7 +1489,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); RECOMP_REG_ESP = (saved_esp); eax = 0; } \
 } while(0)
 
 /**
@@ -1359,7 +1507,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+           recomp_icall_fail_log(_va); RECOMP_REG_ESP += 4; RECOMP_REG_EAX = 0; } \
 } while(0)
 
 /* ================================================================
@@ -1375,6 +1523,7 @@ extern volatile uint64_t g_icall_guard_misses;
  * ================================================================ */
 
 #ifdef RECOMP_GENERATED_CODE
+#ifndef RECOMP_REG_LOCALS /* else each function's own locals */
 #define eax g_eax
 #define ecx g_ecx
 #define edx g_edx
@@ -1382,6 +1531,7 @@ extern volatile uint64_t g_icall_guard_misses;
 #define ebx g_ebx
 #define esi g_esi
 #define edi g_edi
+#endif
 
 /* ================================================================
  * MMX register file

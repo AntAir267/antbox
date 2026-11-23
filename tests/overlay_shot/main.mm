@@ -87,6 +87,7 @@ static void frame(const char *save)
 {
     @autoreleasepool {
         xbox_OverlayPoll();
+        xbox_OverlayPlatformFrame(0);   /* ImGui's SDL half, as the window's thread does (BO-210) */
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                       width:W height:H mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -258,8 +259,9 @@ static int mixer_e2e(const char *file)
     pad(SDL_CONTROLLER_BUTTON_START, false); pad(SDL_CONTROLLER_BUTTON_BACK, false);
     run(12);
     CHECK(xbox_OverlayOpen() && xbox_HostPaused() && xbox_InputBlocked());
-    ptap(P_RB, 2); run(3);
-    CHECK(xbox_OverlayTestRowIndex("Custom music folder") == 0);
+    ptap(P_RB, 3); run(3);                                         /* Display, Graphics, Game, Audio */
+    CHECK(xbox_OverlayTestRowIndex("Custom music folder") > xbox_OverlayTestRowIndex("Master volume"));
+    xbox_OverlayTestShowAdvanced(1); run(2);               /* BO-338: the Mixer row is an advanced one */
     CHECK(xbox_OverlayTestSelectRow("Mixer")); run(2);   /* past the music folder's rows and the loudness */
     ptap(P_A); run(3);
     CHECK(xbox_OverlayMixerView() == 0);
@@ -559,7 +561,8 @@ static int mixer_tour(const char *pre, const char *file)
 
     tap(SDLK_F1);
     run(12);
-    tap(SDLK_PAGEDOWN); run(2); tap(SDLK_PAGEDOWN); run(3);       /* Audio */
+    tap(SDLK_PAGEDOWN); run(2); tap(SDLK_PAGEDOWN); run(2); tap(SDLK_PAGEDOWN); run(3);   /* Audio */
+    xbox_OverlayTestShowAdvanced(1); run(2);                      /* BO-338: advanced rows shown */
     CHECK(xbox_OverlayTestSelectRow("Mixer")); run(1);            /* the Mixer row, under the music folder's */
     snprintf(path, sizeof path, "%smixer_0_audio.bmp", pre); frame(path);
     tap(SDLK_RETURN); run(3);
@@ -720,9 +723,14 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
 
     tap(SDLK_F1);
     CHECK(xbox_OverlayOpen());
-    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                 /* the last page: Advanced */
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                 /* the last page: System */
     run(10);
     CHECK(xbox_OverlayTestHasRow("Export save to home folder"));
+    /* BO-327: its own Reset this page, then Reset all; the save rows under
+     * their title. */
+    CHECK(xbox_OverlayTestRowIndex("Reset all settings") == xbox_OverlayTestRowIndex("Reset this page") + 1);
+    CHECK(xbox_OverlayTestRowIndex("Save data") < xbox_OverlayTestRowIndex("Export save to home folder"));
+    CHECK(xbox_OverlayTestRowIndex("Bug reports") < xbox_OverlayTestRowIndex("Save data"));
     CHECK(xbox_OverlayTestHasRow("Import save from home folder (none found"));
     CHECK(xbox_OverlayTestHasRow("Import save from another folder"));
     /* Nothing waits for a restart: Quit game is the page's last row and there
@@ -772,13 +780,14 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     CHECK(!xbox_OverlayTestHasRow("Cancel the import") && xbox_OverlayTestHasRow("Import cancelled"));
     CHECK(!xbox_OverlayTestHasRow("Restart now"));
 
-    /* The cursor keeps its index when the rows change under it. With the
-     * cursor on "Import Xbox save..." (the fourth save row) an import gets
-     * staged, as the Xbox flow does after its folder browser: the save rows
-     * collapse to "Cancel the import" and the index now falls on "Reset all
-     * settings to the defaults". One more Enter there must not wipe the
-     * settings (settings.toml was rewritten to defaults on a test machine);
-     * a reset asks once more first. */
+    /* The cursor keeps its index when the rows change under it: with the
+     * cursor on "Import Xbox save..." an import gets staged, as the Xbox
+     * flow does after its folder browser, and the save rows collapse to
+     * "Cancel the import". One more Enter wherever the index then falls
+     * must not wipe the settings (settings.toml was rewritten to defaults on
+     * a test machine): a reset asks once more first. Since BO-327 the index
+     * falls on the Developer section's title, and the cursor goes back to
+     * the page's first row; the resets are checked by name below. */
     CHECK(xbox_OverlayTestSelectRow("Import Xbox save"));
     run(2);
     {
@@ -786,8 +795,12 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
         CHECK(recomp_save_import_stage(save, found, "4541005b", err, sizeof err));
     }
     run(3);
-    CHECK(xbox_OverlayTestRowIndex("Reset all settings") == xbox_OverlayTestRowIndex("Cancel the import") + 2);
     xbox_SettingSet(XS_GRAPHICS_RENDER_SCALE, 2);
+    run(2);
+    press_a();
+    CHECK(xbox_SettingGet(XS_GRAPHICS_RENDER_SCALE)->user && xbox_SettingValue(XS_GRAPHICS_RENDER_SCALE) == 2);
+    xbox_SettingReset(XS_INTERFACE_MENU_ENTRY);                 /* what that Enter switched, if anything */
+    CHECK(xbox_OverlayTestSelectRow("Reset all settings"));
     run(2);
     press_a();
     CHECK(xbox_SettingGet(XS_GRAPHICS_RENDER_SCALE)->user && xbox_SettingValue(XS_GRAPHICS_RENDER_SCALE) == 2);
@@ -924,7 +937,7 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
         CHECK(xbox_OverlayTestRowIndex("Restart now") > xbox_OverlayTestRowIndex("Reset "));
         press(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     }
-    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                  /* the Advanced page */
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                  /* another page */
     CHECK(xbox_OverlayTestSelectRow("Restart now"));
     run(3);
     snprintf(path, sizeof path, "%squitrow.bmp", pre);
@@ -967,7 +980,7 @@ static int saveio_tour(const char *pre, const char *work, int argc, char **argv)
     return s_fail ? 1 : 0;
 }
 
-/* OVERLAY_SHOT_UPDATE=<owner/repo>: the Advanced page's "Check for updates"
+/* OVERLAY_SHOT_UPDATE=<owner/repo>: the System page's "Check for updates"
  * (xbox_update.h). The row is pressed once, against the real GitHub (one
  * request), and the answer is shot. OVERLAY_SHOT_UPDATE_EXPECT is none (no
  * release published yet), newer, latest or error; OVERLAY_SHOT_UPDATE_VERSION
@@ -984,7 +997,7 @@ static int update_tour(const char *pre, const char *repo)
 
     tap(SDLK_F1);
     CHECK(xbox_OverlayOpen());
-    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                 /* the last page: Advanced */
+    press(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);                 /* the last page: System */
     run(10);
     CHECK(xbox_OverlayTestHasRow("Check for updates"));
     CHECK(xbox_OverlayTestRowIndex("Check for updates") == xbox_OverlayTestRowIndex("Takedawn 0.1.0") + 1);
@@ -1171,7 +1184,7 @@ static void browser_utf8_shot(const char *pre)
     run(1);
 }
 
-/* Two cheats as a port registers them, for the Advanced page's rows (one
+/* Two cheats as a port registers them, for the System page's rows (one
  * shown on); the save root a temporary folder. */
 extern "C" void xbox_path_init(const char *game_dir, const char *save_dir);
 static int s_cheat[2] = { 0, 1 };
@@ -1193,7 +1206,7 @@ int main(int argc, char **argv)
     setenv("SDL_VIDEODRIVER", "dummy", 1);
     setenv("RECOMP_SETTINGS", "none", 1);
     setenv("RECOMP_OVERLAY_PERF", "1", 1);
-    xbox_InputOfferControlScheme(1);     /* a title with a second driving layout: the Input page shows the row */
+    xbox_InputOfferControlScheme(1);     /* a title with a second driving layout: the Controls page shows the row */
     xbox_SettingsInit("Test");
     xbox_SettingsFinish();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 2; }
@@ -1205,8 +1218,9 @@ int main(int argc, char **argv)
     game_font_from_env();
     game_art_from_env();
     xbox_BugReportSetMaker(fake_report);
-    /* A port with a music folder (BO-108): its row is the Audio page's
-     * first, and every tour below goes down that page as a port has it. */
+    /* A port with a music folder (BO-108): its row heads the Audio page's
+     * Custom music section, and every tour below goes down that page as a
+     * port has it. */
     xbox_OverlaySetMusicFolder(&k_music_ops);
     if (getenv("OVERLAY_SHOT_MIXER_E2E"))
         return mixer_e2e(getenv("OVERLAY_SHOT_MIXER_E2E"));
@@ -1255,21 +1269,61 @@ int main(int argc, char **argv)
     snprintf(path, sizeof path, "%sdisplay2.bmp", pre);
     frame(path);
 
-    for (int p = 1; p < 6; p++) {
+    for (int p = 1; p < 7; p++) {                             /* Graphics .. System (BO-327) */
         pad(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, true);
         pad(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, false);
         run(3);
-        if (p == 2) {                                         /* audio */
-            /* The music folder's row is the first, its lines under it, the
-             * settings after them in the order they always had. */
-            CHECK(xbox_OverlayTestRowIndex("Custom music folder") == 0);
-            CHECK(xbox_OverlayTestRowIndex("2 soundtracks") == 1);
-            CHECK(xbox_OverlayTestRowIndex("  one.mp3") == 2);
-            CHECK(xbox_OverlayTestRowIndex("Custom music loudness") == 3);
-            CHECK(xbox_OverlayTestRowIndex("Master volume") == 4);
-            CHECK(xbox_OverlayTestRowIndex("Mute") == 5);
-            CHECK(xbox_OverlayTestRowIndex("Speakers") > xbox_OverlayTestRowIndex("Mute in the background"));
+        if (p == 2) {                                         /* game: the 60 fps section under its title */
+            CHECK(xbox_OverlayTestHasRow("Reset this page"));
+        }
+        if (p == 4) {                                         /* controls: the layout before the feel */
+            CHECK(xbox_OverlayTestRowIndex("Driving controls") == 0);
+            CHECK(xbox_OverlayTestRowIndex("Stick deadzone") > xbox_OverlayTestRowIndex("Button prompts"));
+            if (xbox_OverlayTestHasRow("Keyboard keys...")) {     /* BO-338: the keys on a sub-page */
+                CHECK(!xbox_OverlayTestHasRow("Reset keyboard keys"));
+                CHECK(xbox_OverlayTestSelectRow("Keyboard keys..."));
+                run(2);
+                tap(SDLK_RETURN);
+                run(3);
+                CHECK(xbox_OverlayTestHasRow("Back to Controls") && xbox_OverlayTestHasRow("Reset keyboard keys"));
+                CHECK(!xbox_OverlayTestHasRow("Stick deadzone") && !xbox_OverlayTestHasRow("Reset this page"));
+                tap(SDLK_ESCAPE);                                 /* B: back to Controls, not out of the menu */
+                run(3);
+                CHECK(xbox_OverlayOpen());
+                CHECK(xbox_OverlayTestHasRow("Stick deadzone") && !xbox_OverlayTestHasRow("Back to Controls"));
+                CHECK(xbox_OverlayTestSelectRow("Keyboard keys..."));
+                run(2);
+            }
+        }
+        if (p == 3) {                                         /* audio */
+            /* BO-327: volume and mute first, then the music folder's
+             * section (its row, its lines under it, its two settings). */
+            CHECK(xbox_OverlayTestRowIndex("Master volume") == 0);
+            CHECK(xbox_OverlayTestRowIndex("Mute") == 1);
+            CHECK(xbox_OverlayTestRowIndex("Mute in the background") == 2);
+            CHECK(xbox_OverlayTestRowIndex("Speakers") == 3);
+            CHECK(xbox_OverlayTestRowIndex("Custom music") < xbox_OverlayTestRowIndex("Custom music folder"));
+            const int mf = xbox_OverlayTestRowIndex("Custom music folder");
+            CHECK(mf > 3);
+            CHECK(xbox_OverlayTestRowIndex("2 soundtracks") == mf + 1);
+            CHECK(xbox_OverlayTestRowIndex("  one.mp3") == mf + 2);
+            CHECK(xbox_OverlayTestRowIndex("Custom music loudness") > mf);
+            /* BO-338: the expert rows (the Mixer, the direct speaker test)
+             * behind the page's switch, which sits above the reset. */
+            xbox_OverlayTestShowAdvanced(0);
+            run(2);
+            CHECK(xbox_OverlayTestHasRow("Speaker test, game mix") && !xbox_OverlayTestHasRow("Speaker test, direct"));
+            CHECK(xbox_OverlayTestRowIndex("Show advanced settings") > xbox_OverlayTestRowIndex("Speaker test, game mix"));
+            CHECK(xbox_OverlayTestRowIndex("Show advanced settings") + 1 == xbox_OverlayTestRowIndex("Reset this page"));
+            CHECK(xbox_OverlayTestSelectRow("Show advanced settings"));
+            run(2);
+            tap(SDLK_RETURN);
+            run(3);
+            CHECK(xbox_OverlayTestHasRow("Speaker test, direct"));
             CHECK(xbox_OverlayTestRowIndex("Reset this page") > xbox_OverlayTestRowIndex("Speaker test, direct"));
+            tap(SDLK_RETURN);                                     /* the cursor stayed on the switch: off again */
+            run(3);
+            CHECK(!xbox_OverlayTestHasRow("Speaker test, direct"));
             snprintf(path, sizeof path, "%saudio_top.bmp", pre);
             frame(path);
             CHECK(xbox_OverlayTestSelectRow("Master volume"));
@@ -1302,7 +1356,7 @@ int main(int argc, char **argv)
         }
         snprintf(path, sizeof path, "%spage%d.bmp", pre, p);
         frame(path);
-        if (p == 5) {                                         /* advanced: the bug report */
+        if (p == 6) {                                         /* system: the bug report */
             /* By its text: the rows above it have grown since this was
              * written (it used to be one step down). */
             CHECK(xbox_OverlayTestSelectRow("Create bug report"));
@@ -1323,6 +1377,7 @@ int main(int argc, char **argv)
             /* The cheat rows are a tester's: none until RECOMP_DEBUG=cheats. */
             CHECK(!xbox_OverlayTestHasRow("Unlock everything") && !xbox_OverlayTestHasRow("Cheats"));
             recomp_env_set(RENV_CHEATS, "1");
+            xbox_OverlayTestShowAdvanced(1);                  /* BO-338: a tester's rows are advanced ones */
             run(2);
             /* The cheats: label and state as a setting's row; A once shows
              * the warning and asks again. */

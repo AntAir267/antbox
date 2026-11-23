@@ -286,8 +286,10 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
         "/* Auto-generated NV2A vertex program (GLSL, Vulkan) */\n"
         "layout(set = 0, binding = 0, std140) uniform VsC { vec4 c[%d]; };\n"
         D3D8_GLSL_VPCONSTS
-        D3D8_GLSL_VS_OUT
-        D3D8_GLSL_SATURATE, NV2A_VS_MAX_CONSTANTS);
+        "%s"
+        D3D8_GLSL_SATURATE, NV2A_VS_MAX_CONSTANTS,
+        (flags & D3D8_GLSL_SCREEN_SPACE) && (flags & D3D8_GLSL_CLIP_RANGE)
+            ? D3D8_GLSL_VS_OUT_CLIP : D3D8_GLSL_VS_OUT);
     for (i = 0, k = 0; i < NV2A_VS_MAX_INPUTS; i++)
         if (inputs & (1u << i))
             sb_append(&sb, "layout(location = %d) in vec4 v%d;\n", k++, i);
@@ -340,9 +342,9 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
             /* vp_scale.w: polygon offset's constant part, normalised
              * (nv2a_vp_consts_fill), as the MSL. */
             "    float pz = (oPos.z * vp.vp_scale.z + vp.vp_scale.w) * pw;\n"
-            /* W-buffering: the depth is w over the clip range (spec_ctl.z,
+            /* W-buffering: the depth is w over the clip range (spec_ctl.w,
              * fog_param.w: nv2a_vp_consts_fill), linear in distance. */
-            "    if (vp.spec_ctl.z != 0u) pz = (pw * vp.fog_param.w + vp.vp_scale.w) * pw;\n"
+            "    if (vp.spec_ctl.w != 0u) pz = (pw * vp.fog_param.w + vp.vp_scale.w) * pw;\n"
             /* z = zmax times 1/zmax can round an ulp past 1: the far plane
              * would clip Burnout 3's movie quad, which sits at zmax (BO-43).
              * Only that rounding is snapped back; farther geometry clips as
@@ -351,8 +353,16 @@ int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
             "    if (pz > pw && pz <= pw * 1.000001) pz = pw;\n"
             /* The W-buffer's depth for the fragment shader to write
              * (D3D8_GLSL_VS_OUT); otherwise the depth the divide gives. */
-            "    o_wz = (vp.spec_ctl.z != 0u) ? pw * vp.fog_param.w + vp.vp_scale.w : pz / pw;\n"
-            "    gl_Position = vec4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw, pz, pw);\n"
+            "    o_wz = (vp.spec_ctl.w != 0u) ? pw * vp.fog_param.w + vp.vp_scale.w : pz / pw;\n"
+            "    gl_Position = vec4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw, pz, pw);\n");
+        if (flags & D3D8_GLSL_CLIP_RANGE)
+            /* BO-332: the title's clip range instead of the far plane (see
+             * d3d8_glsl.h). Window z times w is linear in clip space, so
+             * the clipper cuts where xemu's per-fragment test would. */
+            sb_append(&sb,
+            "    gl_ClipDistance[0] = vp.spec_ctl.z != 0u ? pz - vp.vp_off.z * pw : pw;\n"
+            "    gl_ClipDistance[1] = vp.spec_ctl.z != 0u ? vp.vp_off.w * pw - pz : pw;\n");
+        sb_append(&sb,
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"

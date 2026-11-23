@@ -22,7 +22,7 @@ static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 static const char *const s_pacing[] = { "spin", "sleep", NULL };
 /* present.aspect; "auto" is resolved below, the rest index
  * enum nv2a_present_aspect + 1. */
-static const char *const s_aspects[] = { "auto", "frame", "4:3", "16:9", NULL };
+static const char *const s_aspects[] = { "auto", "frame", "4:3", "16:9", "16:10", NULL };
 /* present.crop: the whole frame (stock), or the part the title drew in. */
 static const char *const s_crops[] = { "off", "clip", NULL };
 /* The dashboard's HDTV modes, each with those below it (the dashboard has a
@@ -40,7 +40,7 @@ int xbox_enhance_init(const char *root, const char *title)
     struct nv2a_host_opts o;
     const char *aspect;
     long long scale;
-    int rc, pacing, wide, hdtv, pa, half, crop;
+    int rc, pacing, wide, w1610, hdtv, pa, half, crop;
     double lead;
     int lead_auto, pacing_unset;
     ULONG xc_video;
@@ -121,7 +121,7 @@ int xbox_enhance_init(const char *root, const char *title)
      * with them is its own: Burnout 3 renders 16:9 anamorphic into its
      * 640x480 buffer and asks D3D for 480p. Stock is neither. Before the
      * kernel bridge starts, which copies the SMC mode into guest memory. */
-    wide = enhance_cfg_bool("display.widescreen", 0);
+    wide = enhance_widescreen(&w1610);
     hdtv = enhance_cfg_choice("display.hdtv", s_hdtv, 0);
     xc_video = (wide ? XC_VIDEO_AV_WIDESCREEN : 0) | s_hdtv_bits[hdtv];
     xbox_SetVideoSettings(xc_video, hdtv ? SMC_VIDEO_MODE_HDTV : SMC_VIDEO_MODE_SCART);
@@ -132,7 +132,8 @@ int xbox_enhance_init(const char *root, const char *title)
      * own shape otherwise (stock). A title that ignores the setting stays
      * 4:3 with present.aspect = "frame". */
     pa = enhance_cfg_choice("present.aspect", s_aspects, 0);
-    o.present_aspect = pa == 0 ? (wide ? NV2A_ASPECT_16_9 : NV2A_ASPECT_FRAME) : pa - 1;
+    o.present_aspect = pa == 0 ? (w1610 ? NV2A_ASPECT_16_10 : wide ? NV2A_ASPECT_16_9 : NV2A_ASPECT_FRAME)
+                               : pa - 1;
     /* A frame the title draws only part of (an HD picture kept inside the
      * TV-safe area, which a TV's overscan hid): the window shows that part. */
     crop = enhance_cfg_choice("present.crop", s_crops, 0);
@@ -184,8 +185,8 @@ int xbox_enhance_init(const char *root, const char *title)
             " present.pacing=%s (display.aspect=%s)\n", half ? "1.5 (a backend without it: " : "",
             o.render_scale, half ? ")" : "",
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
-    XR_NOTICE( LOGP "display.widescreen=%d display.hdtv=%s (XC_VIDEO=0x%08lX)"
-            " present.aspect=%s (%s) present.crop=%s\n", wide, s_hdtv[hdtv],
+    XR_NOTICE( LOGP "display.widescreen=%s display.hdtv=%s (XC_VIDEO=0x%08lX)"
+            " present.aspect=%s (%s) present.crop=%s\n", w1610 ? "16:10" : wide ? "1" : "0", s_hdtv[hdtv],
             (unsigned long)xc_video, s_aspects[pa], s_aspects[o.present_aspect + 1], s_crops[crop]);
     if (lead_auto)
         fprintf(stderr, LOGP "present.spin_lead=auto%s\n",

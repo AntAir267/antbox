@@ -280,6 +280,7 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
     StrBuf sb;
     int i, k, stride = 0;
     uint16_t inputs = program->inputs_read;
+    int clip = (flags & D3D8_MSL_SCREEN_SPACE) && (flags & D3D8_MSL_CLIP_RANGE);
 
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
         if (inputs & (1u << i))
@@ -296,11 +297,12 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
         "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
         "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
         "};\n"
-        D3D8_MSL_VOUT
-        "vertex VOut vs_main(uint vid [[vertex_id]],\n"
+        "%s"
+        "vertex %s vs_main(uint vid [[vertex_id]],\n"
         "                    const device float4 *vb [[buffer(0)]],\n"
         "                    constant float4 *c [[buffer(1)]],\n"
-        "                    constant VpConsts &vp [[buffer(2)]]) {\n");
+        "                    constant VpConsts &vp [[buffer(2)]]) {\n",
+        clip ? D3D8_MSL_VOUT_CLIP : D3D8_MSL_VOUT, clip ? "VOutC" : "VOut");
     for (i = 0; i <= 12; i++)
         sb_append(&sb, "    float4 R%d = float4(0.0);\n", i);
     sb_append(&sb, "    int a0 = 0;\n");
@@ -337,14 +339,21 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
             sb_append(&sb, "        a0 = a0n;\n");
         sb_append(&sb, "    }\n");
     }
-    sb_append(&sb, "#undef R12\n    VOut o;\n");
+    sb_append(&sb, "#undef R12\n    %s o;\n", clip ? "VOutC" : "VOut");
     if (flags & D3D8_MSL_SCREEN_SPACE) {
         /* As the HLSL: pixels -> NDC, z -> [0,1], times w again so the
          * rasteriser's divide gives perspective-correct interpolation. */
         sb_append(&sb,
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.pos = float4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw,\n"
-            "                   (oPos.z * vp.vp_scale.z + vp.vp_scale.w) * pw, pw);\n"
+            "                   (oPos.z * vp.vp_scale.z + vp.vp_scale.w) * pw, pw);\n");
+        if (clip)
+            /* BO-332: the title's clip range instead of the far plane, as
+             * the GLSL (d3d8_vsh_glsl.c). */
+            sb_append(&sb,
+            "    o.cd[0] = vp.spec_ctl.z != 0u ? o.pos.z - vp.vp_off.z * pw : pw;\n"
+            "    o.cd[1] = vp.spec_ctl.z != 0u ? vp.vp_off.w * pw - o.pos.z : pw;\n");
+        sb_append(&sb,
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"

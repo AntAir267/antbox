@@ -75,4 +75,32 @@ int tum_job_encode_pass(TumJob *j, id<MTLCommandBuffer> cb, double *texels);
  * after the last hook; NNEDI3 1: the 2x luma), nil past the end. */
 id<MTLTexture> tum_job_scratch(const TumJob *j, int i);
 
+/* ── films (BO-136, nv2a_filmup.h) ──────────────────────────────────────
+ * The film passes (deblock, FSR 1's EASU and RCAS, the recombine; MIT,
+ * compiled into the program: nv2a_filmup_shaders.h) on a thread of their
+ * own, once; Best also takes the FSRCNNX passes tum_load made. A TumFilm
+ * holds one film size's intermediates and a ring of results. */
+void tum_film_load_async(id<MTLDevice> dev);
+/* 0 not yet, 1 ready, -1 failed. */
+int  tum_film_state(void);
+
+typedef struct TumFilm TumFilm;
+TumFilm *tum_film_new(id<MTLDevice> dev, uint32_t w, uint32_t h);
+void     tum_film_free(TumFilm *f);
+uint32_t tum_film_w(const TumFilm *f);
+uint32_t tum_film_h(const TumFilm *f);
+/* Encodes the filter of src (the frame, w x h) into cb and returns the
+ * result, 2w x 2h, one level (the film's: valid until the ring comes round,
+ * three frames on; the caller retains it to keep it). mode: NV2A_FILMUP_*;
+ * Best runs as Cheap while the FSRCNNX passes are not there. *ran: the mode
+ * that ran. nil: nothing encoded. */
+id<MTLTexture> tum_film_encode(TumFilm *f, id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                               int mode, int *ran, int *sample);
+/* *sample (tum_film_encode; -1: none): the encoder's own GPU ms (stage-
+ * boundary timestamps, not the buffer's span, which on Apple GPUs runs
+ * beside the frame's work), after the buffer completed; -1 when the device
+ * has no such counters (use the buffer's GPUStartTime..GPUEndTime). A ring
+ * of 8: read it in the completion handler. */
+double tum_film_sample_ms(int sample);
+
 #endif

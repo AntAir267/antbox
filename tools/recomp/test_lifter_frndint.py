@@ -96,6 +96,91 @@ int main(void) {
             self.assertEqual(0, ran.returncode,
                              f"check on line {ran.returncode} failed")
 
+    def test_nearest_parity_is_the_old_fmod_bit_for_bit(self):
+        """The half-to-even test reads lo's parity from (int64_t)lo & 1, not
+        fmod(lo, 2.0) (BO-282.2): the same bits on every case below, the
+        old helper compiled beside the new."""
+        cc = next(filter(None, map(shutil.which, ("cc", "gcc", "clang"))), None)
+        if not cc:
+            self.skipTest("no C compiler available")
+        source = r'''
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include "recomp_types.h"
+
+ptrdiff_t g_xbox_mem_offset;
+
+static double old_frndint(double value, uint16_t control) {
+    double rounded;
+    if (!isfinite(value)) return value;
+    switch((control>>10)&3) {
+    case 1: rounded=floor(value); break;
+    case 2: rounded=ceil(value); break;
+    case 3: rounded=trunc(value); break;
+    default: {
+        double lo=floor(value), fraction=value-lo;
+        rounded=lo;
+        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
+        break;
+    }
+    }
+    return rounded == 0.0 ? copysign(0.0, value) : rounded;
+}
+
+static int same(double a, double b) { uint64_t x, y; memcpy(&x, &a, 8); memcpy(&y, &b, 8); return x == y; }
+
+static int check(double v) {
+    static const uint16_t cw[4] = { 0x037F, 0x077F, 0x0B7F, 0x0F7F };
+    int k;
+    for (k = 0; k < 4; k++)
+        if (!same(recomp_frndint(v, cw[k]), old_frndint(v, cw[k]))) return 0;
+    return 1;
+}
+
+int main(void) {
+    static const double edge[] = {
+        0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5, 0.0, -0.0, 0.49999999999999994,
+        -0.49999999999999994, 1e-300, -1e-300, 4.9e-324, -4.9e-324,
+        4503599627370495.5, -4503599627370495.5,          /* 2^52 - 0.5: the last halves */
+        4503599627370494.5, -4503599627370494.5,
+        4503599627370496.0, 4503599627370497.0,           /* 2^52, 2^52 + 1 */
+        9007199254740991.0, 9007199254740992.0, 9007199254740994.0,   /* 2^53 - 1, 2^53, + 2 */
+        -9007199254740991.0, -9007199254740992.0, 1e300, -1e300,
+        9.2233720368547758e18, -9.2233720368547758e18, 1.8e19, -1.8e19,
+        (double)INFINITY, -(double)INFINITY, (double)NAN,
+    };
+    unsigned i;
+    uint64_t r = 0x9E3779B97F4A7C15ull;
+    for (i = 0; i < sizeof edge / sizeof edge[0]; i++)
+        if (!check(edge[i])) return 100 + (int)i;
+    /* Halves and near-halves at every magnitude up to 2^53, both signs. */
+    for (i = 0; i < 2000000; i++) {
+        double v;
+        r ^= r << 13; r ^= r >> 7; r ^= r << 17;
+        v = ldexp((double)(r >> 11), -(int)(r % 64u));          /* below 2^53 */
+        if (i & 1) v = floor(v) + 0.5;
+        if (i & 2) v = -v;
+        if (i % 5 == 0) v = nextafter(v, (i & 4) ? INFINITY : -INFINITY);
+        if (!check(v)) return 3;
+    }
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="frndint-parity-") as tmp:
+            tmp = Path(tmp)
+            src, exe = tmp / "test.c", tmp / "test"
+            src.write_text(source, encoding="utf-8")
+            built = subprocess.run(
+                [cc, "-std=c11", "-O2", "-ffp-contract=off", "-Wall", "-Wextra", "-Werror",
+                 "-I", str(_ROOT / "templates" / "runtime"),
+                 str(src), "-o", str(exe)]
+                    + ([] if os.name == "nt" else ["-lm"]),
+                capture_output=True, text=True)
+            self.assertEqual(0, built.returncode, built.stdout + built.stderr)
+            ran = subprocess.run([str(exe)], capture_output=True, text=True)
+            self.assertEqual(0, ran.returncode, f"case {ran.returncode} differs")
+
 
 if __name__ == "__main__":
     unittest.main()

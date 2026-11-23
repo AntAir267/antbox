@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -582,6 +583,82 @@ unsigned usb_gamepad_live_taken(void)
 
 #define PAD_LIVE_STALE_S 30
 
+/* Lines from inside the process (usb_gamepad_live_push), taken like lines of
+ * RECOMP_PAD_LIVE: an in-process navigator presses without a file. */
+#define PAD_PUSH_MAX 16
+static pthread_mutex_t s_push_mu = PTHREAD_MUTEX_INITIALIZER;
+static char s_push[PAD_PUSH_MAX][64];
+static unsigned s_push_head, s_push_tail;
+static volatile int s_push_on;
+
+void usb_gamepad_live_enable(void)
+{
+    s_push_on = 1;
+}
+
+int usb_gamepad_live_push(const char *line)
+{
+    int ok = 0;
+    if (!line || !*line || strlen(line) >= sizeof s_push[0])
+        return 0;
+    s_push_on = 1;
+    pthread_mutex_lock(&s_push_mu);
+    if (s_push_head - s_push_tail < PAD_PUSH_MAX) {
+        snprintf(s_push[s_push_head % PAD_PUSH_MAX], sizeof s_push[0], "%s", line);
+        s_push_head++;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&s_push_mu);
+    return ok;
+}
+
+/* One live line scheduled at t (or when its pad is free). Several lines in
+ * one read go one after another, with a 200 ms release between: a title
+ * polling its pad a few times a second would otherwise see "down" and "a" in
+ * the same report, which is a different input from "down, then a".
+ * Serialised per pad: pad 2's throttle must not wait out pad 1's --
+ * split-screen players press at the same time. */
+static void pad_live_line(const char *pending, unsigned long t)
+{
+    static unsigned long next_free[USB_GAMEPAD_MAX];
+    char line[560];
+    int pd = (pending[0] == 'p' || pending[0] == 'P')
+             && pending[1] >= '1' && pending[1] <= '4'
+             && pending[2] == '-' ? pending[1] - '1' : 0;
+    unsigned long at = t > next_free[pd] ? t : next_free[pd];
+    snprintf(line, sizeof line, "%lu:%s", at, pending);
+    if (s_script_len >= PAD_SCRIPT_MAX - 1)
+        pad_script_compact(t);
+    pad_script_parse(line);
+    if (s_script_len > 0)
+        next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
+    fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms%s\n", pending, at,
+            (s_taken & (1u << pd)) ? " (ignored: a controller has the pad)" : "");
+    fflush(stderr);
+    s_live_taken++;
+}
+
+/* The lines pushed from inside the process since last time. */
+static void pad_push_poll(unsigned long t)
+{
+    char line[64];
+    if (!s_push_on)
+        return;
+    for (;;) {
+        int got = 0;
+        pthread_mutex_lock(&s_push_mu);
+        if (s_push_tail != s_push_head) {
+            memcpy(line, s_push[s_push_tail % PAD_PUSH_MAX], sizeof line);
+            s_push_tail++;
+            got = 1;
+        }
+        pthread_mutex_unlock(&s_push_mu);
+        if (!got)
+            break;
+        pad_live_line(line, t);
+    }
+}
+
 /* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
  * schedule each complete line at t. Polled at most every 50 ms. */
 static void pad_live_poll(unsigned long t)
@@ -592,9 +669,10 @@ static void pad_live_poll(unsigned long t)
     static unsigned long last_poll;
     static char pending[512];
     static size_t npending;
-    static unsigned long next_free[USB_GAMEPAD_MAX];
     FILE *f;
     int c;
+
+    pad_push_poll(t);
 
     if (!checked) {
         checked = 1;
@@ -633,28 +711,8 @@ static void pad_live_poll(unsigned long t)
         consumed++;
         if (c == '\n' || c == '\r') {
             if (npending) {
-                char line[560];
-                /* Several lines in one read go one after another, with a
-                 * 200 ms release between: a title polling its pad a few times
-                 * a second would otherwise see "down" and "a" in the same
-                 * report, which is a different input from "down, then a". */
-                /* Serialised per pad: pad 2's throttle must not wait out
-                 * pad 1's -- split-screen players press at the same time. */
-                int pd = (pending[0] == 'p' || pending[0] == 'P')
-                         && pending[1] >= '1' && pending[1] <= '4'
-                         && pending[2] == '-' ? pending[1] - '1' : 0;
-                unsigned long at = t > next_free[pd] ? t : next_free[pd];
                 pending[npending] = 0;
-                snprintf(line, sizeof line, "%lu:%s", at, pending);
-                if (s_script_len >= PAD_SCRIPT_MAX - 1)
-                    pad_script_compact(t);
-                pad_script_parse(line);
-                if (s_script_len > 0)
-                    next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
-                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms%s\n", pending, at,
-                        (s_taken & (1u << pd)) ? " (ignored: a controller has the pad)" : "");
-                fflush(stderr);
-                s_live_taken++;
+                pad_live_line(pending, t);
                 npending = 0;
             }
         } else if (npending < sizeof pending - 1) {
@@ -825,13 +883,13 @@ static int pad_scripted(void)
         const char *a = recomp_env(RENV_PAD_SCRIPT), *b = recomp_env(RENV_PAD_LIVE);
         const char *k = recomp_env(RENV_PAD_SCRIPT_KEEP), *h = recomp_env(RENV_HEADLESS);
         const char *o = recomp_env(RENV_PAD_SCRIPT_ONLY);
-        s_scripted = (a && *a) || (b && *b);
+        s_scripted = (a && *a) || (b && *b) || s_push_on;
         s_script_keep = k && *k && *k != '0';
         s_script_only = s_scripted && !s_script_keep
                      && ((h && *h && *h != '0') || (o && *o && *o != '0'));
         if (s_scripted) {
             fprintf(stderr, "  PAD: SCRIPTED INPUT drives the pads in this run (%s)%s\n",
-                    (b && *b) ? "RECOMP_PAD_LIVE" : "RECOMP_PAD_SCRIPT",
+                    (b && *b) ? "RECOMP_PAD_LIVE" : (a && *a) ? "RECOMP_PAD_SCRIPT" : "an in-process driver",
                     s_script_keep ? "; pad_script_keep: merged with the controllers"
                     : s_script_only ? "; headless: the host's controllers are not read"
                     : "; a controller's first button takes its pad back");

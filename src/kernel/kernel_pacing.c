@@ -565,6 +565,97 @@ static SpinSite *site_for(uint32_t va)
     return &s_sites[SITE_SLOTS];
 }
 
+volatile int      g_xbox_spin_waiters;
+volatile uint32_t g_xbox_spin_wait_va;
+
+/* The pictures' steps (xbox_PictureSteps): a ring the game pushes to and the
+ * walker pops from at its first question after a flip. */
+#define PIC_RING 32
+static volatile uint32_t s_pic_steps[PIC_RING];
+static volatile uint32_t s_pic_w, s_pic_r;
+static int s_pic_cur = -1, s_pic_need = 1;
+static unsigned s_pic_depth_max;
+
+unsigned xbox_PictureStepsDepthMax(void)
+{
+    unsigned m = s_pic_depth_max;
+    s_pic_depth_max = 0;
+    return m;
+}
+
+void xbox_PictureSteps(uint32_t steps)
+{
+    uint32_t w = __atomic_load_n(&s_pic_w, __ATOMIC_RELAXED);
+    if (w - __atomic_load_n(&s_pic_r, __ATOMIC_ACQUIRE) >= PIC_RING)
+        return;                         /* nobody pops: drop */
+    s_pic_steps[w % PIC_RING] = steps;
+    __atomic_store_n(&s_pic_w, w + 1, __ATOMIC_RELEASE);
+}
+
+int xbox_PictureStepsCur(void);
+
+void xbox_PictureStepsFlip(void)
+{
+    if (s_pic_need)
+        (void)xbox_PictureStepsCur();   /* nobody asked: still this picture's */
+    s_pic_need = 1;
+}
+
+int xbox_PictureStepsCur(void)
+{
+    if (s_pic_need) {
+        uint32_t r = __atomic_load_n(&s_pic_r, __ATOMIC_RELAXED);
+        s_pic_need = 0;
+        uint32_t w = __atomic_load_n(&s_pic_w, __ATOMIC_ACQUIRE);
+        if (w - r > s_pic_depth_max)
+            s_pic_depth_max = w - r;
+        if (r != w) {
+            s_pic_cur = (int)s_pic_steps[r % PIC_RING];
+            __atomic_store_n(&s_pic_r, r + 1, __ATOMIC_RELEASE);
+        } else {
+            s_pic_cur = -1;
+        }
+    }
+    return s_pic_cur;
+}
+
+static uint64_t s_idle_gwait, s_idle_grun, s_idle_va_ns[4];
+static uint32_t s_idle_va[4];
+
+void xbox_IdleSplitAdd(uint64_t ns, int guest_waiting, uint32_t va)
+{
+    int i, lo = 0;
+    if (!guest_waiting) {
+        s_idle_grun += ns;
+        return;
+    }
+    s_idle_gwait += ns;
+    for (i = 0; i < 4; i++) {
+        if (s_idle_va[i] == va) {
+            s_idle_va_ns[i] += ns;
+            return;
+        }
+        if (s_idle_va_ns[i] < s_idle_va_ns[lo])
+            lo = i;
+    }
+    s_idle_va[lo] = va;
+    s_idle_va_ns[lo] = ns;
+}
+
+void xbox_IdleSplitTake(uint64_t *gwait_ns, uint64_t *grun_ns, uint32_t *va)
+{
+    int i, hi = 0;
+    for (i = 1; i < 4; i++)
+        if (s_idle_va_ns[i] > s_idle_va_ns[hi])
+            hi = i;
+    *gwait_ns = s_idle_gwait;
+    *grun_ns = s_idle_grun;
+    *va = s_idle_va_ns[hi] ? s_idle_va[hi] : 0;
+    s_idle_gwait = s_idle_grun = 0;
+    memset(s_idle_va_ns, 0, sizeof s_idle_va_ns);
+    memset(s_idle_va, 0, sizeof s_idle_va);
+}
+
 void xbox_SpinWait(uint32_t va)
 {
     SpinSite *site;
@@ -609,6 +700,8 @@ void xbox_SpinWait(uint32_t va)
         c0 = xbox_ThreadCpuNs();
 
     pacing_once();
+    g_xbox_spin_wait_va = va;
+    __atomic_add_fetch(&g_xbox_spin_waiters, 1, __ATOMIC_RELAXED);
     EnterCriticalSection(&s_lock);
     if (s_gen != t_seen_gen) {
         immediate = 1;
@@ -618,6 +711,7 @@ void xbox_SpinWait(uint32_t va)
     }
     t_seen_gen = s_gen;
     LeaveCriticalSection(&s_lock);
+    __atomic_sub_fetch(&g_xbox_spin_waiters, 1, __ATOMIC_RELAXED);
 
     if (immediate)
         InterlockedIncrement(&site->immediate);

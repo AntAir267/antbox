@@ -38,6 +38,14 @@ const char *recomp_save_dir(const char *name);
 enum { RECOMP_DIR_DATA, RECOMP_DIR_LOCAL, RECOMP_DIR_CACHE };
 int recomp_user_dir(int kind, const char *name, char *out, unsigned out_size);
 
+/* Portable mode (recomp_exe_dir.h: portable.txt or a data folder beside the
+ * program, Windows and Linux): every kind above is a folder of <exe dir>/data
+ * and `name` is not used. RECOMP_DIR_DATA is data/Saves, RECOMP_DIR_LOCAL
+ * data itself (the title's Game folder goes in it), RECOMP_DIR_CACHE
+ * data/cache. This is the part recomp_user_dir calls, for any host so a test
+ * can check it. */
+int recomp_portable_user_dir(const char *root, int kind, char *out, unsigned out_size);
+
 /* A folder that got a new name: move `old_dir` to `new_dir`, once. Only when
  * `old_dir` is a folder and nothing is at `new_dir` (a folder without a file
  * in it is nothing); no file is ever deleted or written over, so a second call, or

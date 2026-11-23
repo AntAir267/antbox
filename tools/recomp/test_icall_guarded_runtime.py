@@ -77,6 +77,8 @@ volatile uint64_t g_icall_count;
 uint32_t g_xbox_code_lo = 0x00010000u, g_xbox_code_hi = 0x00020000u;
 uint32_t g_esp, eax;
 #define esp g_esp
+#define RECOMP_REG_ESP esp
+#define RECOMP_REG_EAX eax
 #define PUSH32(sp, v) do { (sp) -= 4; } while (0)
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
 #define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)

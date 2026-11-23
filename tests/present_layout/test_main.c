@@ -204,6 +204,19 @@ static int fill_overscan(void)
     nv2a_present_layout(640, 480, 1280, 800, NV2A_PRESENT_LINEAR, &s, &d);
     CHECK(R4(s, 0, 16, 640, 448) && R4(d, 106, 0, 1067, 800));
 
+    /* A 16:10 picture (BO-271) on the Deck's 1280x800 fills it whole, the
+     * 16:10 fit with it or not; on a 1920x1080 window it is pillarboxed. */
+    mode(NV2A_ASPECT_16_10, 0, 0);
+    nv2a_present_layout(640, 480, 1280, 800, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 0, 640, 480) && R4(d, 0, 0, 1280, 800));
+    mode(NV2A_ASPECT_16_10, 0, 1);
+    nv2a_present_layout(640, 480, 1280, 800, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 0, 640, 480) && R4(d, 0, 0, 1280, 800));
+    CHECK(visible(NV2A_ASPECT_16_10, 0, 1, 1280, 800, 0, 640, 0, 640));
+    mode(NV2A_ASPECT_16_10, 0, 0);
+    nv2a_present_layout(640, 480, 1920, 1080, NV2A_PRESENT_LINEAR, &s, &d);
+    CHECK(R4(s, 0, 0, 640, 480) && R4(d, 96, 0, 1728, 1080));
+
     /* The integer filter: the box is the whole frame's multiple (2x here), the
      * band is stretched into it, so it is filtered, not nearest ("whole" 0). */
     mode(NV2A_ASPECT_FRAME, 2, 0);

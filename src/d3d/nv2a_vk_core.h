@@ -50,6 +50,8 @@ struct nvk_core {
     int                              hdr_metadata;   /* VK_EXT_hdr_metadata on (BO-110) */
     int                              demote;         /* shaderDemoteToHelperInvocation on: SPIR-V 1.6's discard */
     float                            max_aniso;      /* samplerAnisotropy on: the limit; else 0 */
+    int                              bc;             /* textureCompressionBC on: BC1/BC3 images (texture packs, BO-312) */
+    int                              depth_clamp;    /* depthClamp and shaderClipDistance on: the title's clip range, not the far plane (BO-332) */
     char                             name[256];
 };
 

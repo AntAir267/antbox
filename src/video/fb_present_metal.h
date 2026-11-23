@@ -34,4 +34,16 @@ void *fbm_scene_slot(int k, uint32_t w, uint32_t h, int valid);
 int   fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                   const char *shot_path, uint32_t flip, uint64_t vblank_ns);
 
+/* The display-link presenter (display.present_timing = auto on macOS 14
+ * and later, BO-236), on the present thread. fbm_link_wait runs the link
+ * until it names a refresh (1: its drawable is pending), timeout_ns passes
+ * (0) or the strategy is not the link (-1: present as before).
+ * fbm_link_left_ns: how long a new frame may still be waited for, for that
+ * refresh. fbm_link_drop: the refresh passes with nothing presented.
+ * fbm_link_thread_exit: the link goes, before the thread does. */
+int      fbm_link_wait(uint64_t timeout_ns);
+uint64_t fbm_link_left_ns(void);
+void     fbm_link_drop(void);
+void     fbm_link_thread_exit(void);
+
 #endif

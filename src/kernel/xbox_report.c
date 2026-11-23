@@ -1609,8 +1609,9 @@ int xbox_BugReport(const xbox_bug_report_opts *o, char *out_path, size_t n)
      * the start-up facts only. Said, with the way to a full one. */
     if (!XR_DIAG_ON())
         xbox_report_printf(&readme, "logs: diagnostic logging was off in this run (%s): the log has"
-                           " only errors and the start-up facts. For a full log switch on"
-                           " Advanced > Diagnostic logging in the overlay (Back+Start or F1),"
+                           " only errors, the start-up facts and a few online lines ([NET]: the lobby's session id,"
+                           " sign-in, games, peers). For a full log switch on"
+                           " System > Diagnostic logging in the overlay (Back+Start or F1),"
                            " restart the game, make the problem happen again, then create the"
                            " report again.\n", xr_log_source());
     else

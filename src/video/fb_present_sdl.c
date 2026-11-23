@@ -812,6 +812,7 @@ static int s_bg_paused;
 void xbox_HostPause(int on);
 int  xbox_HostPaused(void);
 void fbv_android_surface_gone(void);
+void fbv_android_surface_back(void);
 
 #include <jni.h>
 #include <SDL_system.h>
@@ -1285,6 +1286,11 @@ static int android_lifecycle(void *user, SDL_Event *ev)
             fprintf(stderr, "[PRESENT] the app is in the background: the title is held\n");
     } else if (ev->type == SDL_APP_DIDENTERFOREGROUND) {
         fprintf(stderr, "[PRESENT] the app is back in front\n");
+#if defined(XBOXRECOMP_HAVE_VULKAN)
+        /* SDL sends it once the window's new surface is ready
+         * (SDLActivity.handleNativeState): a surface may be made again. */
+        fbv_android_surface_back();
+#endif
         __atomic_store_n(&s_app_away, 0, __ATOMIC_RELEASE);
         pt_request(FW_CTL_DIRTY);
         if (s_bg_paused) {
@@ -1486,6 +1492,7 @@ static void *present_thread(void *arg)
     uint32_t shown_flip = 0;
     int dirty = 1;                       /* paint black before the first frame */
     int shoot = 0, burst = 0, new_frame = 0, retry_soon = 0, failed = 0;
+    int stale_wait = 0;                  /* the display link: a newer frame is waited for */
     char req[sizeof s_shot_req] = "";
     char bprefix[sizeof s_burst_prefix] = "";
     unsigned bn = 0;
@@ -1500,6 +1507,7 @@ static void *present_thread(void *arg)
                     && !__atomic_load_n(&s_app_away, __ATOMIC_ACQUIRE);
         int filter = nv2a_host_opts()->present_filter;
         int pvideo_up = 0;
+        int lk = -1;
         {
             /* The video overlay (xbox_pvideo.h) has frames of its own: a
              * new one is shown over the last frame, as the display did at
@@ -1519,6 +1527,13 @@ static void *present_thread(void *arg)
                 dirty = 1;
             }
         }
+#if defined(__APPLE__)
+        /* The display link (BO-236): this thread runs it until it names a
+         * refresh; the newest frame then goes into that refresh's drawable,
+         * waited for until shortly before its deadline. -1: not the link. */
+        if (!s_vk && s_layer && ok)
+            lk = fbm_link_wait(100000000ull);
+#endif
 #if defined(XBOXRECOMP_HAVE_OVERLAY)
         s_overlay_open = xbox_OverlayOpen();
         s_overlay_note = xbox_OverlayNotice();
@@ -1542,6 +1557,18 @@ static void *present_thread(void *arg)
             timeout_ns = 0;
         else
             timeout_ns = 100000000ull;
+#if defined(__APPLE__)
+        if (lk >= 0) {
+            /* A refresh named: wait for the new frame until its take-until,
+             * a redraw (expose, resize, the overlay) too. Presented at the
+             * callback, a redraw took the refresh's drawable from the
+             * title's frame due a few ms later, which was then stale at the
+             * next refresh and dropped: every other frame on the glass
+             * through a live resize (the Fable review of BO-236). */
+            timeout_ns = lk == 1 ? fbm_link_left_ns() : 0;
+            retry_soon = 0;
+        }
+#endif
 
         pthread_mutex_lock(&s_lock);
         w = fw_wait_work(&s_lock, &s_pub_cv, &s_ready_seq, shown_seq, &s_pt_ctl, timeout_ns);
@@ -1645,6 +1672,17 @@ static void *present_thread(void *arg)
                 uint64_t vbl = shown_seq && new_frame ? f->vbl_ns : 0;
                 rc = fbm_present(win, s_front, shown_seq ? f->w : 0, shown_seq ? f->h : 0,
                                  filter, shoot ? path : NULL, shown_flip, vbl);
+                stale_wait = 0;
+                if (rc == 3) {
+                    /* The display link: this frame was meant for the
+                     * refresh before; the newer one is waited for until
+                     * the refresh's take-until (fb_present_metal.m). */
+                    stale_wait = 1;
+                    retry_soon = 0;
+                    rc = 0;
+                    failed = 0;
+                    goto link_wait;
+                }
                 if (rc == 2) {
                     /* Skipped (present timing: no drawable without a wait).
                      * The next frame replaces it; should none come (the
@@ -1684,13 +1722,25 @@ static void *present_thread(void *arg)
                  * yet, a lost device: tried again in a while. */
                 failed = 1;
             }
+#if defined(__APPLE__)
+        link_wait:
+#endif
             s_upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
         }
+#if defined(__APPLE__)
+        if (lk == 1 && !stale_wait)
+            fbm_link_drop();             /* a refresh with nothing new: no present */
+#endif
+        (void)lk;
         counters_tick(now_ns(CLOCK_MONOTONIC), s_dropped, s_presents,
                       __atomic_load_n(&s_win_ok, __ATOMIC_ACQUIRE));
         if (s_pt_stats)
             stats_tick("present thread");
     }
+#if defined(__APPLE__)
+    if (!s_vk && s_layer)
+        fbm_link_thread_exit();
+#endif
     return NULL;
 }
 

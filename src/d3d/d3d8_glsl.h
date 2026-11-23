@@ -38,7 +38,7 @@ extern "C" {
  * interpolated linearly across the screen, which runs deeper inside a big
  * triangle (the arithmetic mean of the corners' w, not the harmonic), so
  * a W-buffered fragment shader writes i_wz (NV2ACombinerState.wbuffer). */
-#define D3D8_GLSL_VS_OUT \
+#define D3D8_GLSL_VS_OUT_VARS \
     "layout(location = 0) out vec4 o_d0;\n" \
     "layout(location = 1) out vec4 o_d1;\n" \
     "layout(location = 2) out vec4 o_t0;\n" \
@@ -46,8 +46,14 @@ extern "C" {
     "layout(location = 4) out vec4 o_t2;\n" \
     "layout(location = 5) out vec4 o_t3;\n" \
     "layout(location = 6) out float o_fog;\n" \
-    "layout(location = 7) out float o_wz;\n" \
+    "layout(location = 7) out float o_wz;\n"
+#define D3D8_GLSL_VS_OUT \
+    D3D8_GLSL_VS_OUT_VARS \
     "out gl_PerVertex { vec4 gl_Position; float gl_PointSize; };\n"
+/* The same with two clip distances (D3D8_GLSL_CLIP_RANGE, BO-332). */
+#define D3D8_GLSL_VS_OUT_CLIP \
+    D3D8_GLSL_VS_OUT_VARS \
+    "out gl_PerVertex { vec4 gl_Position; float gl_PointSize; float gl_ClipDistance[2]; };\n"
 
 #define D3D8_GLSL_FS_IN \
     "layout(location = 0) in vec4 i_d0;\n" \
@@ -99,6 +105,17 @@ extern "C" {
  * viewport height.
  */
 #define D3D8_GLSL_SCREEN_SPACE 0x1
+/**
+ * With D3D8_GLSL_CLIP_RANGE (and SCREEN_SPACE), z is not clipped at the
+ * near and far planes by the rasteriser (the backend turns depth clamp on)
+ * but against the title's own range, as xemu does it (pgraph/vk/draw.c
+ * depthClampEnable, pgraph/glsl/psh.c depth_clipping): two clip distances
+ * keep window z inside [vp_off.z, vp_off.w] (SET_CLIP_MIN / SET_CLIP_MAX as
+ * normalised depth) when spec_ctl.z is 1 (SET_ZMIN_MAX_CONTROL's ZCLAMP_EN
+ * is CULL), and nothing is culled when it is 0 (CLAMP). Needs the device's
+ * shaderClipDistance and depthClamp (BO-332).
+ */
+#define D3D8_GLSL_CLIP_RANGE   0x2
 
 int d3d8_vsh_generate_glsl(const NV2AVshProgram *program, unsigned flags,
                            char *buf, int bufsize);

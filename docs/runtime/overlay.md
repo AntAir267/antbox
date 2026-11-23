@@ -20,6 +20,85 @@ Close with B or Esc. `RECOMP_OVERLAY=0` turns it off. For scripted runs:
 `RECOMP_WINDOW_SHOT` pending while it is open is taken of the overlay over
 the last frame.
 
+## Pages
+
+Seven tabs, LB / RB (Q / E, PgUp / PgDn) between them; System is the last,
+so LB from the first page goes there (BO-327). Section titles (`R_HEADER`,
+the label face in capitals, smaller, in the title's red, with a rule) break
+the longer pages up; a row that belongs to the one above it (texture
+upscale's three, HDR's levels, the touch controls' three, Crash Nav map
+under 4:3 pictures) is indented, with a short dash.
+
+| Page | Rows, in order |
+|---|---|
+| Display | Fullscreen (not Android), Aspect ratio, Filter, Overscan, Present fit (only on a 16:10 window with Aspect ratio 16:9), HDR and its levels (only on an HDR display); FRAME RATE: High refresh rate, Frame presentation (Metal) or Frame pacing (Vulkan, Linux and Windows), Power mode, Performance overlay |
+| Graphics | Render scale, Anisotropic filtering, Anti-aliasing, Sharpening; SHARPER ART: Menu and HUD upscaling, Texture upscale and its three, Film upscale; EFFECTS AND DETAIL: Bloom, Motion blur, Soft-body damage (PR #88), Vehicle detail distance, Scenery detail distance, Texture sharpness (LOD bias); the shader build's line and row; Android: the driver in use and the port's driver rows (`xbox_OverlaySetHostRows`) |
+| Game | Language (only when the disc has more than one, PR #5); the title's own switches (guest patches, each only when the title enabled it): Widescreen HUD, 4:3 pictures, Crash Nav map, Ultrawide, Score board, Rival marker switch, Speed units; FRAME RATE AND SPLIT SCREEN: 60 fps crash cameras, 60 fps split screen, Music in split screen, Potato mode |
+| Audio | Master volume, Mute, Mute in the background, Speakers, Menu sounds; CUSTOM MUSIC: the folder (its status and notes), Custom music at start, Custom music loudness; SPEAKERS AND MIXER: Surround effects level, the Mixer page, the two speaker tests |
+| Controls | Driving controls (where the title offers them), Face buttons, First controller (not Android; PR #7, `input.first_pad`), Button prompts, Rumble strength, (Android: Vibration), Stick deadzone, Trigger deadzone; Android: Touch controls and its three; "Keyboard keys..." (not on a Steam Deck, not under gamescope, never on Android), which opens the keyboard's sub-page (below) |
+| Mods | the port's host page (`xbox_OverlaySetHostPage`; Burnout 3: `src/game/modstab.c`); the toolkit adds "Reset this page" when the page gives a `reset` |
+| System | the version line, Check for updates, Add Steam library art, Entry in the game's menu; ONLINE PLAY: Online play, and with it Online name and (Internet) Server, both edited in place (BO-134); BUG REPORTS: Diagnostic logging, where the log is, Create bug report (with a screenshot); SAVE DATA: export, import (Import Xbox or PS2 save...; a PS2 save with several profiles lists one row each, BO-323), restore, a save guard problem; DEVELOPER: Power mode Auto's state, the Metal graph's lines, the console key, the cheats (`RECOMP_DEBUG=cheats`) |
+
+Every page ends with "Reset this page to the defaults" (the settings the page
+shows now, an advanced row only while it is shown); System then has "Reset all
+settings to the defaults". Both ask once more.
+
+### When a change is used: the tags
+
+A setting that does not change at once has a small tag after its label, in the
+grey of a disabled row (BO-338; it replaced a sentence at the end of the help
+line):
+
+| Tag | Meaning | Rows |
+|---|---|---|
+| RESTART | read when the game starts (the table's `XS_RESTART`; also counts for the Restart row); yellow while the value differs from the one the game started with | Aspect ratio, Render scale, Speakers, Language, Soft-body damage, Online play, Vibration (Android) |
+| NEXT RACE | read when a race starts | Speed units, Widescreen HUD, Ultrawide, 60 fps split screen, Music in split screen, Potato mode |
+| NEXT START | read at the start, but nothing waits for a restart; yellow while a change waits | Custom music at start; each mod of the Mods tab |
+
+The tag is `tag_word()` in `overlay_ui.cpp`; a host page's row asks for NEXT
+RACE or NEXT START with `xbox_overlay_hostrow.tag` (`tag_hot` lights it). A
+`RECOMP_OVERLAY_TEST` dump prints the tag after the value (`[NEXT RACE]`,
+`[RESTART*]` while lit).
+
+### Show advanced settings
+
+A page with rows an ordinary player never needs has a switch above its reset
+rows, "Show advanced settings" (Off by default, `R_ADV`). It is per page and
+for this session only: there is no setting for it, so `settings.toml` has no
+key. A row is tagged advanced where `page_rows()` makes it (`ASET`, `ASUB`,
+`AACT`, `AINFO`, `AHEAD` for `SET`, `SUB`, `ACT`, `INFO`, `HEAD`; a host row
+sets `xbox_overlay_hostrow.adv`); `adv_filter()` leaves them out while the
+switch is off, drops a section title left with nothing under it, and adds the
+switch. A page with none has no switch. A dump prints a shown advanced row with `[advanced]`.
+
+| Page | Advanced rows |
+|---|---|
+| Display | HDR's Shadows and Highlight gain (with HDR on) |
+| Graphics | Upscale while loading (under Texture upscale), Texture sharpness (LOD bias), the shader build's line and row |
+| Audio | Menu sounds, Surround effects level, Mixer, Speaker test direct |
+| Mods | the line naming the `TAKEDAWN_MODS` folders |
+| System | Diagnostic log's path line; DEVELOPER: Power mode Auto's state, Graph: simulation steps and the glass lines (Metal), the console key line, the cheats (`RECOMP_DEBUG=cheats`, except while a cheat session asks something) |
+
+Game and Controls have none.
+
+### The keyboard keys' sub-page
+
+"Keyboard keys..." on Controls opens a page of the keyboard's keys (BO-267,
+one row for each button of the pad, two keys each): "Back to Controls", the
+rows, and "Reset keyboard keys to the defaults". B (Esc), Back to Controls or
+another tab leaves it; the cursor lands on "Keyboard keys..." again. Controls'
+"Reset this page" leaves the keys alone, as the keys have their own reset
+(Reset all settings still resets them). A dump has a `subpage Keyboard keys`
+line under `page Controls` while it is open. The page's rows stay hidden on a
+Steam Deck and under gamescope as before.
+
+The page names are what a `RECOMP_OVERLAY_TEST` dump prints on
+its `page` line (Display, Graphics, Game, Audio, Controls, Mods, System); a
+sub-row's label follows "- " there, and a section title is a `header` row.
+
+The settings keys did not move with the rows: `settings.toml` reads as
+before (`tests/overlay_settings` checks every key and choice spelling).
+
 ## Look and sizes
 
 The overlay uses the whole window (it pauses the game anyway), over the
@@ -142,6 +221,35 @@ Many of the title's world textures (the road among them) have one level only
 although their filter asks for mips; no bias reaches those, which is why
 `auto` changes little on the road at a distance.
 
+## Reductions of a scaled target (BO-178)
+
+A title's post effects read a whole render target into a smaller one with a
+few taps placed in its own texels. Burnout 3's bloom draws the 640x480 frame
+into 320x240 with four point taps (one per stage), then that into 160x120
+with four bilinear taps; its radial blur reads the frame into 320x240 the
+same way. At 1x four taps cover each 2x2 block. At a render scale they land
+on 4 of the 16 host texels of that block at 2x, 4 of 36 at 3x: a small
+bright spot (a tail light, a highlight) passes the bloom's threshold on one
+frame and not the next, and comes out as a grid of glow dots that 1x never
+draws.
+
+A draw that reads a scaled target into a target smaller than it in guest
+pixels (`nv2a_rt_reduce_draw`: not larger on either side, smaller on one)
+reads instead a copy of the target at its guest size, each texel the area
+average of the host texels under it (`rt_reduced` in both backends, one
+full-screen pass, made again only when the target was drawn since; a
+part-covered host texel counts by its share, so 1.5x works too). The
+title's taps then read the 1x texels at host-pixel positions. Same-size
+passes (a blur in place, a self copy) and enlargements read the host-size
+texture as before, and at 1x nothing is scaled, so nothing changes. Which
+draws are reductions is decided from the sizes only, so every such pass
+of a title gets it: in Burnout 3 the bloom's two, the radial blur's, and a
+pass of the pause menu's highlight bar.
+
+`RECOMP_DEBUG=rt_reduce=0` gives the old picture; `rt_reduce_ab=<n>` swaps
+every n flips for comparisons; `RECOMP_TRACE=metal_frame` lists each copy
+as `reduce`.
+
 ## 2D art upscaling (`graphics.ui_scale`, off by default)
 
 PPSSPP's texture scaling for the 2D art only: a texture the title draws its
@@ -228,6 +336,22 @@ Off (the default) asks for factor 0: no draw is classified, nothing is
 hashed or queued, no thread is started, and every path is the one it was. A
 change of the setting reaches a texture at its next bind (the cache entry
 remembers the factor it was uploaded at).
+
+## Film upscaling (`graphics.film_upscale`, Best by default)
+
+The title's films (linear 640x480 or 640x352 textures whose bytes change
+from flip to flip) filtered once per decoded frame on the GPU (BO-136,
+`src/kernel/nv2a_filmup.h`): a light deblock of the 8x8 block edges, then
+2x on the luma, FSRCNNX (Best, the texture upscaler's LGPL shader files) or
+AMD FSR 1 EASU + RCAS (Cheap, MIT, compiled in from `src/d3d/film_shaders`).
+The 2x result is bound in place of the frame and the draw's own filter fits
+it to the screen; nothing is written to disk, and a title that stops its
+film decoder while playing (Burnout 3 in races) pays nothing there. Best
+runs as Cheap while the FSRCNNX files are not loaded. The row's help shows
+the last films' GPU milliseconds a film frame and the frame time; the
+diagnostic log has the same as a `[FILMUP]` line every 5 s.
+`RECOMP_DEBUG=filmup_ab=<n>` cycles Off, Cheap and Best every n flips (for
+before/after shots of one film moment).
 
 ## World texture upscaling (`graphics.texture_upscale`, off by default)
 
@@ -342,7 +466,7 @@ title's defaults when those change. Keys it does not know are kept.
 | `display.aspect` (`4:3`, `16:9`) | `RECOMP_DISPLAY_WIDESCREEN` | restart: the title reads the dashboard's video flags at boot |
 | `display.filter` | `RECOMP_PRESENT_FILTER` | yes |
 | `display.overscan` (`off`, `crop`, `fill`) | `RECOMP_PRESENT_OVERSCAN` | yes |
-| `display.fit` (`letterbox`, `fill16x10`) | `RECOMP_PRESENT_FIT` | yes |
+| `display.fit` (`letterbox`, `fill16x10`) | `RECOMP_PRESENT_FIT` | yes; Display page, only on a 16:10 window with `display.aspect` 16:9 (the one case where it changes anything) |
 | `graphics.render_scale` | `RECOMP_RENDER_SCALE` | restart |
 | `graphics.aniso` (`off`, `2x` .. `16x`) | `RECOMP_GFX_ANISO` | yes (the sampler caches key on the level) |
 | `graphics.aa` (`off`, `fxaa`, `smaa`) | `RECOMP_GFX_AA` | yes |
@@ -354,38 +478,40 @@ title's defaults when those change. Keys it does not know are kept.
 | `graphics.texture_upscale_scale` (`2x`, `4x`) | `RECOMP_GFX_TEXTURE_UPSCALE_SCALE` | yes |
 | `graphics.texup_roads` (bool) | `RECOMP_GFX_TEXUP_ROADS` | yes |
 | `graphics.texture_upscale_preload` (bool, on) | `RECOMP_GFX_TEXTURE_UPSCALE_PRELOAD` | yes |
+| `graphics.film_upscale` (`off`, `cheap`, `best`; default `best`, `cheap` on Android and ARM Linux) | `RECOMP_GFX_FILM_UPSCALE` | yes (the next decoded film frame); Metal and Vulkan |
 | `audio.volume`, `audio.mute`, `audio.mute_background` | `RECOMP_AUDIO_VOLUME`, `_MUTE`, `_MUTE_BG` | yes |
 | `audio.speakers` (`auto`, `stereo`, `5.1`) | `RECOMP_AUDIO_SPEAKERS` | restart (auto: 5.1 when the default output has 6+ channels) |
 | `audio.fx_level` (0..1, default 0.25) | `RECOMP_AUDIO_FX_LEVEL` | yes; 5.1 only: the title's effect-send bins, where they play dry. Not used (and not shown) for a title whose GP effects image is modelled (`src/apu/apu_gp.h`) |
 | `audio.lfe_lowpass` (`off`, `80`, `100`, `120`; default `120`) | `RECOMP_AUDIO_LFE_LOWPASS` | not on the page (the settings file or the variable only; a change in a running game fades over 21 ms). For a title whose GP effects image is modelled: the low-pass on the LFE (subwoofer) feed, 24 dB an octave. 120 Hz is what the console's Dolby Digital encoder did after the effects stage and is the stock behaviour; off is that stage's own full-range feed. For tuning by ear use the mixer's own `lfe_lowpass_hz`, which comes after this one: with both on the feed passes both |
 | `audio.menu_sounds` (default on) | `RECOMP_AUDIO_MENU_SOUNDS` | live; the title's own menu sounds in the overlay (above, "The title's own menu sounds"). Audio page, only for a port that named them |
 | `audio.mixer` (default off) | `RECOMP_AUDIO_MIXER` | yes; the host mixer (`src/apu/apu_bus.h`): buses over the title's voices, on the Audio page's Mixer page. Its mix is not in settings.toml but in `mixer.toml` beside it (`RECOMP_AUDIO_MIXER_FILE`), read again when it changes. Off, and on with the neutral preset, the output is the same as before |
-| `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). The Audio page's first row, "Custom music folder", with a folder browser (its status line and notes right under it, the page's settings after them), when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
+| `audio.custom_music_dir` (a folder, default empty) | `RECOMP_AUDIO_MUSIC_DIR` | a text setting (`xbox_SettingsText`). The first row of the Audio page's CUSTOM MUSIC section, "Custom music folder", with a folder browser (its status line and notes right under it, the page's settings after them), when the port asked for it (`xbox_OverlaySetMusicFolder`); live if the port can (`soundtrack.md`) |
 | `display.frame_pacing` (`auto`, `low_latency`, `smooth`; default `auto`) | `RECOMP_FRAME_PACING` | live (read twice a second); Display page, "Frame pacing", on Linux with the Vulkan presenter. `smooth` keeps one finished frame queued: each frame's present-to-display time (present_wait) gives the queue depth, and three frames in a row at the title's 60 with none queued present the frame once more, three with two queued skip one present (each logged as `[PACING] smooth:`, counted in the `[PRESENT]` exit line). The title's 30 fps stretches and redraws are not measured. +1 refresh of latency against an empty queue; a present up to ~29 ms late still makes its refresh. `low_latency` is FIFO without it (each frame at the first refresh it can make, the depth wherever the last hiccup left it). `auto` is `smooth` under gamescope (Steam Deck Game Mode, Bazzite), `low_latency` elsewhere. Needs FIFO and present_wait, and off gamescope three swapchain images; otherwise it is `low_latency`. Metal (`display.present_timing`), D3D11 and Android: no effect yet (BO-110) |
 | `display.present_mode` (`auto`, `fifo`, `mailbox`) | `RECOMP_PRESENT_MODE` | a text setting, no row in the overlay; after a restart. Vulkan with vsync: `auto` and `fifo` are FIFO, `mailbox` is MAILBOX where the surface offers it. Never picked by itself: under gamescope MAILBOX turned every late present into a repeated frame and replaced early ones (BO-110). The queue under FIFO is `display.frame_pacing` |
 | `audio.custom_music_at_start` (bool, default on) | `RECOMP_AUDIO_CUSTOM_AT_START` | with a music folder set, the port starts the title on the custom soundtrack the player last chose (BO-230). Audio page, right under "Custom music folder", greyed out (with a hint) while no folder is set; only for a title that registered the folder row. Read by the port at the title's start |
 | `audio.custom_music_soundtrack` (text, default absent) | `RECOMP_AUDIO_CUSTOM_SOUNDTRACK` | a text setting (`xbox_SettingsText`) the port writes: the name of the soundtrack the player last confirmed in the title's own screen. `""` is kept in the file (it means EA GAMES TRAX was chosen); no key means nothing chosen yet (`xbox_SettingsTextIsSet`). No row |
 | `audio.custom_music_level` (`off`, `quieter`, `match`, `louder`; default `match`) | `RECOMP_AUDIO_CUSTOM_LEVEL` | live; the level of a title's custom soundtrack against its own music (`src/apu/apu_level.h`): a loudness chain on the custom-soundtrack voices only (BO-246: K-weighted 3 s short-term loudness, gated at -50 LUFS and 10 LU under the song's running level; the gain toward the target from the song's gated integrated level, -20 to +15 dB, 3 s; a 2:1 soft-knee compressor 8 dB over the target; `RECOMP_AUDIO_CUSTOM_AGC=old` runs the first leveller of BO-132 instead), with `quieter` and `louder` at -4 and +4 dB on the target and `off` no processing at all (bit for bit the title's sends). Audio page, under "Custom music folder", only for a title that registered the folder row. Needs the port to name its custom-soundtrack voices (`apu_level_set_classifier`); a title that does not is not touched. `RECOMP_AUDIO_LEVEL_LOG=1` logs the readings, the gain, the compressor and the limiter's count once a second. Separately, always on: a no-look-ahead peak limiter at -0.5 dBFS in front of the 16-bit clamp (`src/apu/apu_limit.h`), 50 ms release, which changes nothing while the mix stays under the ceiling (`RECOMP_AUDIO_SAFETY_LIMITER=0` switches it off, for comparison) |
-| `game.speed_units` (`mph`, `kmh`) | `RECOMP_SPEED_UNITS` | live; Display page, only when the title enabled a guest patch for it (`recomp_patch_enable`, lifting: Guest patches) |
-| `game.language` (`english`, `japanese`, `german`, `french`, `spanish`, `italian`, `korean`, `chinese`, `portuguese`, or the number 1..9; default `english`) | `RECOMP_GAME_LANGUAGE` | restart; the dashboard language the kernel reports (`XC_LANGUAGE`, `xbox_GetLanguage` in `src/kernel/kernel_xbox.c`), from which the title picks its text, speech and films. Display page, "Language", only when the title named more than one language its disc has (`xbox_SettingsSetLanguages`); the row steps over the others. Unset, English, as before |
-| `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Display page, only when the title enabled a guest patch for it |
-| `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Display page, only when the title enabled a guest patch for it |
-| `display.score_board` (`original`, `smooth`) | `RECOMP_GFX_SCORE_BOARD` | live, from the next frame; a title hook on its HUD (Burnout 3: the SCORE board; the port's `src/game/scoreboard.c`): `original` touches nothing, `smooth` fades the board's plate with its text and fades the board in after a camera; Display page, only when the title enabled it (`recomp_patch_enable`) |
-| `display.rival_marker` (`original`, `farther`) | `RECOMP_GFX_RIVAL_MARKER` | live, from the next frame; where the marker over a rival changes from its far look to its near one, by guest patches at `farther` (Burnout 3: the arrow and the race position, 35 units checked every 30 steps as shipped; farther: the position below 60, the arrow past 75, checked every step); Display page, row "Rival marker switch", only when the title enabled a guest patch for it |
-| `display.crashnav_map` (`stretched`, `native`) | `RECOMP_DISPLAY_CRASHNAV_MAP` | live, from the next frame; with `display.hud_fix` on in 16:9, a title's map screen (Burnout 3: Crash Nav's Select Location) across the picture with its route and markers (stretched), or 4:3 with the rest of the menu (native); Display page, row "Crash Nav map", only when the title enabled a switch for it and `display.hud_fix` is on |
+| `game.speed_units` (`mph`, `kmh`) | `RECOMP_SPEED_UNITS` | live; Game page, only when the title enabled a guest patch for it (`recomp_patch_enable`, lifting: Guest patches) |
+| `game.language` (`english`, `japanese`, `german`, `french`, `spanish`, `italian`, `korean`, `chinese`, `portuguese`, or the number 1..9; `dutch`, `swedish`; default `english`) | `RECOMP_GAME_LANGUAGE` | restart; the dashboard language the kernel reports (`XC_LANGUAGE`, `xbox_GetLanguage` in `src/kernel/kernel_xbox.c`), from which the title picks its text, speech and films. `dutch` and `swedish` are no dashboard's: the kernel reports English for them, and a title that has them sets them itself from the setting. Game page, "Language" (first row), only when the title named more than one language its disc has (`xbox_SettingsSetLanguages`); the row steps over the others. Unset, English, as before |
+| `display.ultrawide` (`off`, `21:9`, `32:9`, `window`) | `RECOMP_DISPLAY_ULTRAWIDE` | live, from the title's next 3D set-up; Game page, only when the title enabled a guest patch for it |
+| `display.hud_fix` (bool) | `RECOMP_GFX_HUD_FIX` | live, shown whole from the title's next HUD set-up; Game page, only when the title enabled a guest patch for it |
+| `display.score_board` (`original`, `smooth`) | `RECOMP_GFX_SCORE_BOARD` | live, from the next frame; a title hook on its HUD (Burnout 3: the SCORE board; the port's `src/game/scoreboard.c`): `original` touches nothing, `smooth` fades the board's plate with its text and fades the board in after a camera; Game page, only when the title enabled it (`recomp_patch_enable`) |
+| `display.rival_marker` (`original`, `farther`) | `RECOMP_GFX_RIVAL_MARKER` | live, from the next frame; where the marker over a rival changes from its far look to its near one, by guest patches at `farther` (Burnout 3: the arrow and the race position, 35 units checked every 30 steps as shipped; farther: the position below 60, the arrow past 75, checked every step); Game page, row "Rival marker switch", only when the title enabled a guest patch for it |
+| `display.crashnav_map` (`stretched`, `native`) | `RECOMP_DISPLAY_CRASHNAV_MAP` | live, from the next frame; with `display.hud_fix` on in 16:9, a title's map screen (Burnout 3: Crash Nav's Select Location) across the picture with its route and markers (stretched), or 4:3 with the rest of the menu (native); Game page, row "Crash Nav map" (indented under "4:3 pictures" when that row is there), only when the title enabled a switch for it and `display.hud_fix` is on |
+| `display.pictures` (`stretch`, `blur`, `black`) | `RECOMP_DISPLAY_PICTURES` | live, from the next frame; with `display.hud_fix` on in 16:9, a title's 4:3 full-screen pictures (Burnout 3: loading screens, the films behind the menus, the Crash Nav map and its zoom) 4:3 with a blurred, darkened copy of the picture beside them (blur, the default: an unset variable reads as blur), 4:3 with dark sides (black), or across the picture (stretch, as shipped); at blur or black a title's map screen follows them and the `display.crashnav_map` row is hidden; Game page, row "4:3 pictures", only when the title enabled a switch for it and `display.hud_fix` is on |
 | `graphics.bloom`, `graphics.motion_blur` (0 to 1 in tenths, default 1, a slider in percent; a file's or variable's `false` / `true` reads as 0 / 1) | `RECOMP_GFX_BLOOM`, `RECOMP_GFX_MOTION_BLUR` | live, from the next frame; the title's own effects: a guest patch skips them at `0` and scales their weight in between (BO-212); Graphics page, only when the title enabled a guest patch for them |
-| `graphics.crash_60fps` (bool, default off) | `RECOMP_GFX_CRASH_60FPS` | live, from the title's next frame; the title's own 30 Hz phases (Burnout 3: crash and takedown cameras) at 60, by a guest patch on the title's own rate choice at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
-| `graphics.softbody` (bool, default off) | `RECOMP_GFX_SOFTBODY` | read at start (a restart applies it); the title's own soft-body vehicle damage, for a title that has one (Burnout 3: Takedawn's `src/game/softbody.c`): vehicles crumple, tear and bend where they are hit, drawn only, handling unchanged; Graphics page, only when the title enabled it; costs CPU in a pile-up |
-| `graphics.split_60fps` (bool, default off) | `RECOMP_GFX_SPLIT_60FPS` | from the title's next two-player stage; the title's 30 Hz split screen at 60, by a guest patch at `1`; Graphics page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
-| `game.race_clock` (bool, default off) | `RECOMP_GAME_RACE_CLOCK` | from the title's next race; on a host that cannot hold 60, a race keeps real time from its start: the title's own catch-up stepping, which it otherwise starts only at the end of the first crash camera, by a guest patch at `1`; no change at a steady 60; Graphics page, row "Potato mode", only when the title enabled a guest patch for it |
-| `audio.split_music` (bool, default off) | `RECOMP_AUDIO_SPLIT_MUSIC` | live; the title's music in split screen, where it plays none, by a guest patch at `1`; Audio page, only when the title enabled a guest patch for it |
+| `graphics.crash_60fps` (bool, default off) | `RECOMP_GFX_CRASH_60FPS` | live, from the title's next frame; the title's own 30 Hz phases (Burnout 3: crash and takedown cameras) at 60, by a guest patch on the title's own rate choice at `1`; Game page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
+| `graphics.split_60fps` (bool, default off) | `RECOMP_GFX_SPLIT_60FPS` | from the title's next two-player stage; the title's 30 Hz split screen at 60, by a guest patch at `1`; Game page, only when the title enabled a guest patch for it; for strong machines: a host that cannot hold 60 runs the game itself slower while it is on (the title steps once a frame), so the row says to leave it off on a Steam Deck and other handhelds |
+| `game.race_clock` (bool, default off) | `RECOMP_GAME_RACE_CLOCK` | from the title's next race; on a host that cannot hold 60, a race keeps real time from its start: the title's own catch-up stepping, which it otherwise starts only at the end of the first crash camera, by a guest patch at `1`; no change at a steady 60; Game page, row "Potato mode", only when the title enabled a guest patch for it |
+| `audio.split_music` (bool, default off) | `RECOMP_AUDIO_SPLIT_MUSIC` | live; the title's music in split screen, where it plays none, by a guest patch at `1`; Game page, only when the title enabled a guest patch for it |
+| `graphics.softbody` (bool, default off) | `RECOMP_GFX_SOFTBODY` | read at start (a restart applies it); the title's own soft-body vehicle damage, for a title that has one (Burnout 3: Takedawn's `src/game/softbody.c`): vehicles crumple, tear and bend where they are hit, drawn only, handling unchanged; Graphics page, under "Effects and detail" after Motion blur, only when the title enabled it; costs CPU in a pile-up |
 | `graphics.vehicle_detail` (`original`, `far`, `farthest`) | `RECOMP_GFX_VEHICLE_DETAIL` | live, from the next frame; the distances at which the title swaps its vehicle models for simpler ones, scaled by a guest patch (2x, 4x); Graphics page, only when the title enabled a guest patch for it |
-| `graphics.scenery_detail` (`original`, `far`) | `RECOMP_GFX_SCENERY_DETAIL` | live, from the next frame; the distance at which the title swaps a scenery object's detailed model for its simple one (Burnout 3: trees, signs and the other track props with two models), scaled by a guest patch at `far` (the factor is the title's: 4x in Burnout 3); Graphics page, row "Scenery detail", only when the title enabled a guest patch for it |
+| `graphics.scenery_detail` (`original`, `far`) | `RECOMP_GFX_SCENERY_DETAIL` | live, from the next frame; the distance at which the title swaps a scenery object's detailed model for its simple one (Burnout 3: trees, signs and the other track props with two models), scaled by a guest patch at `far` (the factor is the title's: 4x in Burnout 3); Graphics page, row "Scenery detail distance", only when the title enabled a guest patch for it |
 | `input.deadzone`, `input.trigger_deadzone` | `RECOMP_PAD_DEADZONE`, `RECOMP_PAD_TRIGGER_DEADZONE` | yes |
 | `input.rumble` (strength, 0 to 3 in steps of 0.25; 1 the original, 0 off; motor = (speed / peak) ^ (1 / strength), see src/input/README.md) | `RECOMP_INPUT_RUMBLE_GAIN` | yes |
 | `input.glyphs` (`auto`, `xbox`, `xbox_modern`, `playstation`, `playstation5`, `nintendo`, `steam`, `positional`, `keyboard`) | `RECOMP_INPUT_GLYPHS` | live: the title's button prompts drawn for the pad in use (`src/input/pad_glyphs.h`). `auto` follows the pad that last pressed a button (the keyboard counts, and shows key caps); `xbox` is the title's own picture, nothing replaced; `positional` is for any pad (no letters: a diamond of four dots, the one to press filled; `auto` picks it for a pad of unknown family, and the title's own picture while no pad has been used). Only a title that registers its prompt textures and brings pictures for them has anything to change (`src/kernel/nv2a_texrep.h`; Metal and Vulkan backends) |
-| `power.mode` (`stock`, `performance`, `battery`, `auto`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` (`auto`: `sleep` + `auto`) | yes |
-| `advanced.perf_overlay` | `RECOMP_OVERLAY_PERF` | yes |
+| `power.mode` (`stock`, `performance`, `battery`, `auto`) | `RECOMP_PRESENT_PACING` + `RECOMP_PRESENT_SPIN_LEAD` (`auto`: `sleep` + `auto`) | yes; Display page, FRAME RATE section |
+| `advanced.perf_overlay` | `RECOMP_OVERLAY_PERF` | yes; Display page, FRAME RATE section |
 | `advanced.diagnostic_log` (bool; default on, off in a release build) | `RECOMP_LOG_DIAG` | yes; the print gate (`logging.md`). The row shows where the log is and what set it when the environment did |
 | `advanced.perf_steps` (bool) | `RECOMP_OVERLAY_PERF_STEPS` | yes; the graph marks frames of more than one simulation step, when the port reports them (`xbox_PresentCadenceSteps`) |
 | `display.present_timing` (`legacy`, `auto`; default `auto` on macOS, `legacy` elsewhere) | `RECOMP_PRESENT_TIMING` | yes, within half a second; Display page, Metal windows only. `legacy` presents a frame when it is ready; `auto` aims each frame at one refresh (`present-timing.md`) |
@@ -411,14 +537,14 @@ stall (100 ms late, or 250 ms without a flip: a load) decides nothing for
 3 s, undoes a climb that began less than 20 s before it, and takes the lead
 back to the level last needed. It
 changes only how the hold waits: the flip leaves at the same vblank. The
-Advanced page shows the lead it holds and why it last moved;
+System page shows the lead it holds and why it last moved;
 `RECOMP_TRACE=pacing` prints its counts and each change.
 
 The host's default is Balanced on every platform; the Burnout 3 port's macOS
 default became Balanced too (BO-75, measured: as steady as Stock at about half
 the CPU), with Maximum still offered there and a stored `power.mode = "stock"`
 still honoured. *stock* (shown as Maximum) is offered on macOS only. On Windows, Android and
-Linux / Steam Deck the Power page has Balanced (`performance`) and Battery
+Linux / Steam Deck the Power mode row has Balanced (`performance`) and Battery
 saver; a stored `stock` is read as `performance` at load (the file is not
 rewritten for that; the next save writes the new value). The spin pacing
 stays reachable for diagnosis with `RECOMP_PRESENT_PACING=spin`, which also
@@ -478,7 +604,7 @@ the task does not stay behind. The Android part is not tested on a device.
 ## Save data: export and import
 
 `xbox_OverlaySetSaveIO({save_dir, title_id, export_dir, note})` puts three
-rows on the Advanced page, above the reset row (the functions are
+rows on the System page, in its SAVE DATA section (the functions are
 `recomp_save_dir.h`'s; `tests/save_io` covers them on a made tree):
 
 - **Export save to home folder**: copies the title's own save files,
@@ -524,7 +650,7 @@ wrote over it, each folder an export. Kept: the 20 newest, the newest of
 each of the last 7 days and of each of the last 4 weeks; only dated, real
 folders are removed (never a link, never a folder of another name).
 
-**Restore an earlier save (N kept)...** (on the Advanced page with the
+**Restore an earlier save (N kept)...** (on the System page with the
 other save rows, when there is at least one) opens the folder browser in
 `save-history`, newest first, the cursor on the newest. The folder chosen
 is staged exactly like an import: "Restart now (the save is imported at the
@@ -533,7 +659,7 @@ start)", the save in use copied to `save-before-import/` first.
 ## Cheats (a tester's tool)
 
 `xbox_OverlaySetCheats` registers up to four cheats, but their rows on the
-Advanced page show only with `RECOMP_DEBUG=cheats`; players do not see them.
+System page show only with `RECOMP_DEBUG=cheats`; players do not see them.
 With the key set, a cheat on asks once more, and from the first one on the
 title's saves go to a copy of the save (`<save root>/cheat-session`). When
 the last goes off, the page asks whether to keep that progress (the save

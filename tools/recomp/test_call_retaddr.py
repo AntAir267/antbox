@@ -104,7 +104,7 @@ def test_icall_save_stops_at_a_completed_direct_call():
         "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
     ]
     out = _fixup_icall_esp_save(lines)
-    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = esp" in l)
     call_idx = next(i for i, l in enumerate(out) if "/* call 0x" in l)
     assert save_idx > call_idx, (
         "save must be after the completed direct call:\n" + "\n".join(out))
@@ -137,7 +137,7 @@ def test_icall_save_stops_at_a_callee_saved_register_save():
         "    POP32(esp, edi);",
     ]
     out = _fixup_icall_esp_save(lines)
-    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = esp" in l)
     icall_idx = next(i for i, l in enumerate(out) if "RECOMP_ICALL_SAFE" in l)
     push_esi = next(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, esi);")
     assert save_idx > push_esi, (
@@ -154,7 +154,7 @@ def test_icall_save_still_covers_a_pushed_esi_argument():
         "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
     ]
     out = _fixup_icall_esp_save(lines)
-    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = esp" in l)
     arg = next(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, esi);")
     assert save_idx < arg, "\n".join(out)
 
@@ -177,7 +177,7 @@ def test_icall_save_absorbs_a_saved_register_pushed_again_as_an_argument():
         "    POP32(esp, ecx);",
     ]
     out = _fixup_icall_esp_save(lines)
-    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = esp" in l)
     arg_push = max(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, edi);")
     assert save_idx < arg_push, (
         "the argument push must be inside the rewind window:\n" + "\n".join(out))
@@ -193,7 +193,7 @@ def test_icall_save_still_covers_a_plain_arg_run():
         "    PUSH32(esp, 0x00120010u); RECOMP_ICALL_SAFE(edx, _icall_esp); /* indirect call */",
     ]
     out = _fixup_icall_esp_save(lines)
-    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = g_esp" in l)
+    save_idx = next(i for i, l in enumerate(out) if "_icall_esp = esp" in l)
     first_arg = next(i for i, l in enumerate(out) if l.strip() == "PUSH32(esp, ecx);")
     assert save_idx < first_arg, "\n".join(out)
 

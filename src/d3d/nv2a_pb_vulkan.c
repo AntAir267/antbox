@@ -65,6 +65,7 @@
 #include "nvr/nvr_capture.h"
 #include "nv2a_vk_glsl.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_pb_split.h"
 #include "nv2a_backend_common.h"
 #include "d3d8_glsl.h"
 #include "../video/hdr_shaders.h"   /* BO-244: the HDR maths shared with Metal */
@@ -75,6 +76,9 @@
 #include "kernel_pause.h"
 #include "kernel_pacing.h"
 #include "nv2a_texup.h"
+#include "nv2a_texpack.h"
+#include "nv2a_filmup.h"
+#include "nv2a_tset_memo.h"
 #include "recomp_exe_dir.h"
 static void scale_prepare_loaded(void);
 static void texup_cmd_begin(VkCommandBuffer cb);   /* BO-245 */
@@ -118,7 +122,7 @@ _Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size change
 typedef struct {
     struct nv2a_ps_consts b;
     float tex_bias[4];
-    float bump_mat[4][4];   /* per stage: SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11 */
+    float bump_mat[4][4];   /* per stage: BUMPMAT 00 01 10 11 (the method's words 0, 1, 3, 2) */
     float bump_lum[4][4];   /* per stage: x bump-env luminance scale, y offset */
     float hdr[4];           /* BO-110: x the colour bound of the HDR combiners (unread by SDR ones) */
 } VkPsConsts;
@@ -226,6 +230,24 @@ static uint64_t s_hdr_draws[2], s_hdr_maps;
 static uint16_t s_h8[256];        /* byte / 255 as a half float */
 
 static const struct nvk_core *C;
+
+/* BO-332: depth is clamped, not clipped at the near and far planes, and the
+ * vertex programs cull window z outside the title's SET_CLIP_MIN/MAX
+ * themselves (D3D8_GLSL_CLIP_RANGE), as xemu draws. The water at Island
+ * Paradise samples a 128x128 R5G6B5 sky target whose surface says Z16 while
+ * the title's transform and clip range are Z24's: past the Z16 far plane the
+ * whole sky was clipped and the sea showed the target's black. Off where the
+ * device lacks depthClamp or shaderClipDistance; RECOMP_DEBUG=zclamp=0 also
+ * turns it off (the old clip, for comparisons). */
+static int clip_range_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_ZCLAMP);
+        on = C && C->depth_clamp && !(e && e[0] == '0');
+    }
+    return on;
+}
 static VkDevice               s_dev;
 static int                    s_failed;
 static int                    s_win;           /* the window takes slot images */
@@ -344,7 +366,8 @@ typedef struct {
     uint64_t present, t_ns;
     uint32_t flip, draws, passes, p_clear, p_load, p_resumed, p_empty, p_maxdraws,
              rt_switch, zload, zresumed, pass_draws,
-             d_main, d_square, d_other;   /* draws by target: >= 640 wide, square, the rest */
+             d_main, d_square, d_other,   /* draws by target: >= 640 wide, square, the rest */
+             rt_hashes;                   /* render-target ownership hashes (BO-282.7) */
     uint32_t sub[FL_N];
     uint32_t polls, waits, qres, nts, ready_done;
     uint64_t submit_ns, submit_max_ns, qlock_ns, poll_ns, poll_max_ns, wait_ns,
@@ -489,6 +512,12 @@ static int serial_wait(uint64_t v, int site)
     return 1;
 }
 
+/* The last texture set, this frame (nv2a_tset_memo.h: handles as 64-bit
+ * words). */
+typedef char tmemo_handles_are_64_bit[sizeof(VkImageView) == 8 && sizeof(VkSampler) == 8
+                                      && sizeof(VkDescriptorSet) == 8 ? 1 : -1];
+static TsetMemo s_tmemo;
+
 static void garbage_push_(const struct nvk_image *im, VkImageView view2,
                           const struct nvk_buffer *buf, VkDescriptorPool pool)
 {
@@ -505,6 +534,7 @@ static void garbage_push_(const struct nvk_image *im, VkImageView view2,
             if (view2) vkDestroyImageView(s_dev, view2, NULL);
             if (buf) { struct nvk_buffer t = *buf; nvk_buffer_free(&t); }
             if (pool) vkDestroyDescriptorPool(s_dev, pool, NULL);
+            tmemo_forget(&s_tmemo);   /* a view gone mid-frame: its handle may come back */
             return;
         }
         s_garbage = n;
@@ -642,9 +672,6 @@ static struct {
     uint8_t      vp[sizeof(struct nv2a_vp_consts)];
     uint8_t      ps[sizeof(VkPsConsts)];
 } s_umemo;
-static VkDescriptorSet s_tset_last;      /* the last texture set, this frame */
-static VkImageView     s_tset_views[4];
-static VkSampler       s_tset_smp[4];
 
 static void rings_reset(void)
 {
@@ -892,6 +919,9 @@ struct RenderTarget {
     int              presented;  /* ever picked by present_target */
     uint64_t         pass_flip;  /* vk_frame: s_presents + 1 at its last pass */
     struct nv2a_rt_own own;      /* is the guest memory under it still its own */
+    struct nvk_image gim;        /* BO-178: im area-averaged to w x h (rt_reduced) */
+    uint64_t         ggen;       /* gen gim was made at */
+    int              gopaque;    /* gim made with alpha 1 (a 16-bit surface) */
 };
 
 static RenderTarget  s_rt[RT_MAX];
@@ -902,6 +932,7 @@ static DepthTarget   s_dt[DT_MAX];
 static RenderTarget  s_nocolor[NC_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies, s_zcolor_binds;
+static uint64_t      s_reduce_binds, s_reduce_made;   /* BO-178, rt_reduced */
 static uint64_t      s_stale_drops, s_retired, s_decode_syncs;
 static uint64_t      s_grows, s_partial_clears;
 
@@ -967,6 +998,8 @@ static void rt_free(RenderTarget *rt)
     garbage_push(&rt->im, rt->opaque, NULL);
     if (rt->gb)
         garbage_push(NULL, rt->gb, NULL);
+    if (rt->gim.img)
+        garbage_push(&rt->gim, VK_NULL_HANDLE, NULL);
     memset(rt, 0, sizeof *rt);
 }
 
@@ -1973,7 +2006,8 @@ static VkShaderModule vs_build(const uint32_t *slots, int n, uint32_t hash, uint
 
     snprintf(what, sizeof what, "program %08X", hash);
     d3d8_vsh_parse(slots, n, parsed);
-    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE, glsl, 65536) <= 0) {
+    if (d3d8_vsh_generate_glsl(parsed, D3D8_GLSL_SCREEN_SPACE
+                               | (clip_range_on() ? D3D8_GLSL_CLIP_RANGE : 0u), glsl, 65536) <= 0) {
         COUNT(s_compile_errors);
         fprintf(stderr, LOGP "%s: no GLSL\n", what);
     } else if ((m = module_from_glsl(NVK_STAGE_VERTEX, glsl, what)) != VK_NULL_HANDLE) {
@@ -2427,6 +2461,7 @@ static VkPipeline pipeline_new(const PsoKey *k, int prewarm)
     memset(&rs, 0, sizeof rs);
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.depthClampEnable = clip_range_on() ? VK_TRUE : VK_FALSE;   /* BO-332 */
     rs.lineWidth = 1.0f;
     memset(&ms, 0, sizeof ms);
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -2657,6 +2692,15 @@ typedef struct {
     uint8_t          tu, tu_slot, tu_add, tu_demote;
     uint32_t         tgen, tu_flip;
     uint64_t         tu_hash, tu_bytes;
+    /* texture packs (BO-312), as Metal's */
+    uint8_t          pk, pk_add, pk_demote;
+    uint32_t         pk_gen, pk_id, pk_token, pk_flip, pk_retry, pk_cut;
+    uint64_t         pk_bytes;
+    /* graphics.film_upscale (BO-136), as Metal's; film_view: the film's
+     * ring image the entry's frame was filtered into (the film owns it). */
+    uint8_t          film, film_n;
+    uint64_t         film_flip;
+    VkImageView      film_view;
     int              live;
     struct nvk_image im;
 } TexEntry;
@@ -2842,8 +2886,8 @@ static int tex_upload_scaled(const Stage *t, unsigned f, int algo, struct nvk_im
     return 0;
 }
 
-static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
-                      struct nvk_image *out)
+static int tex_upload_body(const Stage *t, unsigned scale, int algo, uint32_t cut,
+                           struct nvk_image *out)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
@@ -2863,6 +2907,9 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
     t0 = s_pc_trace ? now_ns() : 0;
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    /* texrep_dump: the texture as decoded, before any replacement, as a pack file. */
+    nv2a_texpack_dump(mem + t->offset, t->color, t->width, t->height, t->pitch, t->levels,
+                      (const uint8_t *)pal, pal ? t->pal_len : 0, s_texels);
     /* The title's button prompts as the pad in use prints them (input.glyphs,
      * nv2a_texrep.h): rectangles of a registered texture replaced here. */
     s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
@@ -2940,6 +2987,26 @@ static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
         s_fup.copy += t3 - t2;
     }
     return 1;
+}
+
+/* RECOMP_TRACE=pb_split (BO-282.12): an upload's count, decoded bytes and
+ * time, decode included. */
+static int tex_upload(const Stage *t, unsigned scale, int algo, uint32_t cut,
+                      struct nvk_image *out)
+{
+    struct nv2a_split *sp = nv2a_split;
+    uint64_t t0;
+    int r;
+    if (!sp)
+        return tex_upload_body(t, scale, algo, cut, out);
+    t0 = nv2a_split_tick();
+    r = tex_upload_body(t, scale, algo, cut, out);
+    sp->up_ticks += nv2a_split_tick() - t0;
+    if (r) {
+        sp->up++;
+        sp->up_kb += (uint32_t)((nv2a_tex_texels(t->width, t->height, t->levels) * 4u) >> 10);
+    }
+    return r;
 }
 
 /* RECOMP_TRACE=pcache: a frame that spent 2 ms or more on new textures says
@@ -4596,6 +4663,83 @@ static void texup_flip(void)
     }
 }
 
+/* BO-282.6: the texture hash epoch. A bound texture is hashed again (to see
+ * whether the title rewrote it) once an epoch, not once a picture: with high
+ * refresh on, the pictures between two simulation steps (0 steps, the
+ * blended ones) keep the epoch, since the title's CPU does not run its frame
+ * there; every other flip (a step, or high refresh off: no steps pushed,
+ * xbox_PictureStepsCur -1) starts a new one, so off and at 60 Hz it moves
+ * exactly when the guest's flip count does, as the old e->gen != flips.
+ * The proof it needs (RECOMP_DEBUG=rehash_steps): 0 textures or cube maps
+ * changed in a 0-step picture over 3 Silver Lake
+ * races and 4 random events (~172k 0-step pictures, ~16 M checks).
+ * RECOMP_DEBUG=rehash_picture brings the per-picture rehash back. */
+static uint32_t s_tex_epoch = 1;
+static uint32_t s_tex_epoch_flip;
+static int      s_tex_epoch_have;
+
+static uint32_t tex_epoch(void)
+{
+    static int per_picture = -1;
+    static uint32_t blits;
+    uint32_t flips = nv2a_pb_gpu_state()->flips;
+    /* The 2D engine copied into guest memory: hash again now, so a picture
+     * built by copies is seen the frame it is built in. */
+    if (nv2a_pb_blit_generation() != blits) {
+        blits = nv2a_pb_blit_generation();
+        s_tex_epoch++;
+    }
+    if (!s_tex_epoch_have || s_tex_epoch_flip != flips) {
+        s_tex_epoch_have = 1;
+        s_tex_epoch_flip = flips;
+        if (per_picture < 0)
+            per_picture = recomp_env(RENV_REHASH_PICTURE) != NULL;
+        if (per_picture || xbox_PictureStepsCur() != 0)
+            s_tex_epoch++;
+    }
+    return s_tex_epoch;
+}
+
+/* RECOMP_DEBUG=rehash_steps (BO-282.6): a rehash that found new content,
+ * counted by the high-refresh steps of the picture being drawn (-1: not a
+ * high-refresh picture), and the first ones seen in a 0-step picture said.
+ * The proof a once-a-step rehash would need: 0 changes in 0-step pictures. */
+static uint64_t s_rh_changed[3];       /* steps -1, 0, >= 1 */
+static uint64_t s_rh_checked[3];
+static void rehash_note(int changed, uint32_t offset, uint32_t color, uint32_t w, uint32_t h,
+                        const char *what)
+{
+    static int on = -1, said;
+    int k;
+    if (on < 0)
+        on = recomp_env(RENV_REHASH_STEPS) != NULL;
+    if (!on)
+        return;
+    k = xbox_PictureStepsCur();
+    k = k < 0 ? 0 : k == 0 ? 1 : 2;
+    s_rh_checked[k]++;
+    if (changed) {
+        s_rh_changed[k]++;
+        if (k == 1 && said < 200) {
+            said++;
+            fprintf(stderr, LOGP "[REHASH0] %s 0x%08X fmt 0x%02X %ux%u changed in a 0-step picture,"
+                    " flip %llu\n", what, offset, color, w, h, (unsigned long long)s_presents);
+        }
+    }
+    if ((s_presents % 1200) == 0) {
+        static uint64_t last;
+        if (last != s_presents) {
+            last = s_presents;
+            fprintf(stderr, LOGP "[REHASH] flip %llu: changed/checked, no HR %llu/%llu, 0-step"
+                    " %llu/%llu, step %llu/%llu; step ring depth max %u\n", (unsigned long long)s_presents,
+                    (unsigned long long)s_rh_changed[0], (unsigned long long)s_rh_checked[0],
+                    (unsigned long long)s_rh_changed[1], (unsigned long long)s_rh_checked[1],
+                    (unsigned long long)s_rh_changed[2], (unsigned long long)s_rh_checked[2],
+                    xbox_PictureStepsDepthMax());
+        }
+    }
+}
+
 /* The texture cache's lookup (tex_bind): what makes an entry the stage's,
  * and a small table from a hash of that key to the entry last found. */
 static int tc_match(const TexEntry *c, const Stage *t)
@@ -4615,6 +4759,768 @@ static unsigned tc_hint_key(const Stage *t)
     h ^= ((uint32_t)t->color << 24) ^ (t->width << 12) ^ t->height ^ (t->palette * 0x85EBCA6Bu);
     h ^= h >> 15;
     return h & (TC_HINT - 1);
+}
+
+/* ---- texture packs (BO-312, nv2a_texpack.h) ---------------------------------
+ *
+ * A texture whose key (nv2a_texpack_key: the hash of its level-0 guest bytes,
+ * for P8 and the palette's) is in a pack mod is shown from the pack's PNG at
+ * the PNG's own size. The title's texture is uploaded as always and shown
+ * until a worker thread has the replacement ready (decoded, scaled, mipped,
+ * compressed); the swap is a new image at a bind, within a per-flip
+ * upload budget. The bytes kept are bounded (nv2a_texpack_cap_bytes): over it
+ * the least recently bound replacement goes back to the title's texture at
+ * its next bind. Off (no pack): nothing is hashed or asked.
+ *
+ * The entry's steps (TexEntry.pk): PK_NONE not looked at, PK_NO no pack has
+ * it (or not a texture a pack can replace), PK_WANT in a pack but no job yet,
+ * PK_JOB a job is out, PK_ON replaced, PK_CAPPED sent back by the budget (asks
+ * again later). */
+enum { PK_NONE = 0, PK_NO, PK_WANT, PK_JOB, PK_ON, PK_CAPPED };
+
+static uint64_t  s_pk_resident;
+static size_t    s_pk_left;
+static uint32_t *s_pk_dec;
+static uint8_t  *s_pk_alpha;
+static size_t    s_pk_dec_cap;
+
+static void pack_init(void)
+{
+    static int done;
+    char dir[900], sub[1000];
+    if (done)
+        return;
+    done = 1;
+    if (nvk_core_get()->bc) {
+        VkFormatProperties f1, f3;
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+            | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        vkGetPhysicalDeviceFormatProperties(nvk_core_get()->phys, VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &f1);
+        vkGetPhysicalDeviceFormatProperties(nvk_core_get()->phys, VK_FORMAT_BC3_UNORM_BLOCK, &f3);
+        if ((f1.optimalTilingFeatures & need) == need && (f3.optimalTilingFeatures & need) == need)
+            nv2a_texpack_set_formats(1u << NV2A_TEXPACK_FMT_BC1 | 1u << NV2A_TEXPACK_FMT_BC3);
+    }
+    if (nvk_cache_dir(dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/texpack", dir);
+        nv2a_texpack_cache_dir(sub);
+    }
+}
+
+/* The entry's pack state goes (its content changed, the packs changed, the
+ * budget took it back): the job is let go and a replacement's bytes are no
+ * longer counted. */
+static void pack_detach(TexEntry *e)
+{
+    if (e->pk_token) {
+        nv2a_texpack_release(e->pk_token);
+        e->pk_token = 0;
+    }
+    if (e->pk == PK_ON) {
+        s_pk_resident -= e->pk_bytes;
+        nv2a_texpack_stats_rw()->resident_bytes = s_pk_resident;
+    }
+    e->pk = (uint8_t)(e->pk_demote ? PK_CAPPED : PK_NONE);
+    e->pk_retry = e->pk_demote ? nv2a_pb_gpu_state()->flips + 600u : 0;
+    e->pk_add = 0;
+    e->pk_demote = 0;
+    e->pk_bytes = 0;
+    e->pk_cut = 0;
+    e->pk_gen = nv2a_texpack_generation();
+}
+
+/* Room for bytes more under the cap: the least recently bound replacements
+ * go back to the title's at their next bind. 0: no room. */
+static int pack_room(uint64_t bytes, const TexEntry *keep)
+{
+    uint64_t cap = nv2a_texpack_cap_bytes();
+    while (s_pk_resident + bytes > cap) {
+        TexEntry *lru = NULL;
+        int i;
+        for (i = 0; i < TEX_CACHE; i++) {
+            TexEntry *c = &s_tc[i];
+            if (c->live && c->pk == PK_ON && !c->pk_demote && c != keep
+                    && (!lru || c->used < lru->used))
+                lru = c;
+        }
+        if (!lru)
+            return 0;
+        lru->pk_demote = 1;
+        s_pk_resident -= lru->pk_bytes;
+        lru->pk_bytes = 0;
+        nv2a_texpack_stats_rw()->demoted++;
+        nv2a_texpack_stats_rw()->resident_bytes = s_pk_resident;
+    }
+    return 1;
+}
+
+/* One level of a replacement from the upload ring (its bytes as the format
+ * stores them). */
+static int upload_blob(struct nvk_image *im, uint32_t level, uint32_t w, uint32_t h,
+                       const void *px, size_t bytes, VkImageLayout final, int last)
+{
+    VkDeviceSize off;
+    VkBufferImageCopy bc;
+    void *dst = ring_alloc(RING_UP, (VkDeviceSize)bytes, 16, &off);
+
+    if (!dst)
+        return 0;
+    memcpy(dst, px, bytes);
+    ensure_up();
+    if (im->layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+        nvk_image_to(s_up, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    memset(&bc, 0, sizeof bc);
+    bc.bufferOffset = off;
+    bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bc.imageSubresource.mipLevel = level;
+    bc.imageSubresource.layerCount = 1;
+    bc.imageExtent.width = w;
+    bc.imageExtent.height = h;
+    bc.imageExtent.depth = 1;
+    vkCmdCopyBufferToImage(s_up, s_ring[RING_UP].buf, im->img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    if (last)
+        nvk_image_to(s_up, im, final);
+    return 1;
+}
+
+static int pack_image(const struct nv2a_texpack_img *img, struct nvk_image *out)
+{
+    VkFormat fmt = img->fmt == NV2A_TEXPACK_FMT_BC1 ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+                 : img->fmt == NV2A_TEXPACK_FMT_BC3 ? VK_FORMAT_BC3_UNORM_BLOCK : RT_FORMAT;
+    const uint8_t *src = img->data;
+    uint32_t l;
+
+    if (!nvk_image_new(out, fmt, img->w, img->h, img->levels,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT))
+        return 0;
+    for (l = 0; l < img->levels; l++) {
+        uint32_t lw = nv2a_texpack_level_dim(img->w, l), lh = nv2a_texpack_level_dim(img->h, l);
+        size_t n = nv2a_texpack_level_bytes(img->fmt, lw, lh);
+        if (!upload_blob(out, l, lw, lh, src, n, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         l + 1 == img->levels)) {
+            garbage_push(out, VK_NULL_HANDLE, NULL);
+            memset(out, 0, sizeof *out);
+            return 0;
+        }
+        src += n;
+    }
+    return 1;
+}
+
+/* The title's level-0 alpha as bytes (NULL when it is all 255), for a
+ * file without alpha or a pack that asks for the title's. */
+static const uint8_t *pack_title_alpha(const Stage *t, const uint8_t *mem)
+{
+    size_t n = (size_t)t->width * t->height, i;
+    const uint32_t *pal = NULL;
+    int any = 0;
+
+    if (n > s_pk_dec_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_pk_dec, n * 4);
+        uint8_t *a = (uint8_t *)realloc(s_pk_alpha, n);
+        if (p)
+            s_pk_dec = p;
+        if (a)
+            s_pk_alpha = a;
+        if (!p || !a)
+            return NULL;
+        s_pk_dec_cap = n;
+    }
+    if (t->color == NV2A_TEX_P8)
+        pal = (const uint32_t *)(mem + t->palette);
+    nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch, 1, pal,
+                    pal ? t->pal_len : 0, s_pk_dec);
+    for (i = 0; i < n; i++) {
+        s_pk_alpha[i] = (uint8_t)(s_pk_dec[i] >> 24);
+        any |= s_pk_alpha[i] != 255;
+    }
+    return any ? s_pk_alpha : NULL;
+}
+
+static void pack_bind(TexEntry *e, const Stage *t, const uint8_t *mem, uint32_t cut)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    struct nv2a_texpack_stats *st = nv2a_texpack_stats_rw();
+    const struct nv2a_texpack_img *img = NULL;
+    struct nv2a_texpack_req rq;
+    struct nvk_image ni;
+    uint32_t gen = nv2a_texpack_generation();
+    int r;
+
+    if (e->pk_gen != gen) {        /* the packs changed: look again */
+        if (e->pk_token) {
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+        }
+        e->pk = PK_NONE;
+        e->pk_gen = gen;
+    }
+    switch (e->pk) {
+    case PK_NONE: {
+        uint64_t hash, palh;
+        uint32_t id = 0;
+        pack_init();
+        if (nv2a_tex_size_from_format(t->color) && !stage_signed(t)
+                && nv2a_texpack_key(mem + t->offset, t->color, t->width, t->height, t->pitch,
+                                    mem + t->palette, t->pal_len, &hash, &palh))
+            id = nv2a_texpack_find(hash, palh);
+        if (!id) {
+            e->pk = PK_NO;
+            return;
+        }
+        e->pk_id = id;
+        e->pk = PK_WANT;
+        if (nv2a_texpack_log())
+            fprintf(stderr, "[TEXPACK] seen %016llx%s %ux%u (pack %d), filter 0x%08x, flip %llu\n",
+                    (unsigned long long)hash, palh ? "-pal" : "", t->width, t->height,
+                    nv2a_texpack_pack_of(id), (unsigned)t->filter, (unsigned long long)s_presents);
+    }
+    /* fall through */
+    case PK_WANT:
+        if (g->flips < e->pk_retry)
+            return;
+        memset(&rq, 0, sizeof rq);
+        rq.id = e->pk_id;
+        rq.w = t->width;
+        rq.h = t->height;
+        rq.levels = t->levels;
+        rq.cut = cut;
+        rq.alpha = pack_title_alpha(t, mem);
+        rq.gen = e->pk_gen;          /* the packs the id was found in */
+        e->pk_token = nv2a_texpack_request(&rq);
+        if (!e->pk_token) {            /* the queue is full: a little later */
+            e->pk_retry = g->flips + 15u;
+            return;
+        }
+        e->pk = PK_JOB;
+        e->pk_cut = cut;
+        e->pk_flip = g->flips;
+        return;
+    case PK_JOB:
+        if (e->pk_flip == g->flips)
+            return;
+        e->pk_flip = g->flips;
+        r = nv2a_texpack_poll(e->pk_token, &img);
+        if (r == NV2A_TEXPACK_PENDING)
+            return;
+        if (r != NV2A_TEXPACK_READY) {
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+            e->pk = PK_NO;             /* the title's texture stays */
+            return;
+        }
+        if (!nv2a_texpack_swap_fits(img->bytes, s_pk_left))
+            return;                    /* this flip's upload budget is spent */
+        if (!pack_room(img->bytes, e)) {
+            st->over_cap++;
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+            e->pk = PK_NO;
+            return;
+        }
+        if (!pack_image(img, &ni)) {
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+            e->pk = PK_NO;
+            return;
+        }
+        s_pk_left = img->bytes < s_pk_left ? s_pk_left - img->bytes : 0;
+        if (e->tu || e->tu_slot || e->tu_add)
+            tu_detach(e, 0);           /* the upscaler leaves a pack texture alone */
+        tex_retire(&e->im);
+        e->im = ni;
+        e->up_scale = 0;               /* not the 2D scaler's picture any more */
+        e->pend = 0;
+        e->pk_add = (uint8_t)img->add;
+        e->pk_bytes = img->bytes;
+        e->pk = PK_ON;
+        s_pk_resident += img->bytes;
+        st->resident_bytes = s_pk_resident;
+        st->original_bytes += nv2a_tex_texels(t->width, t->height, t->levels) * 4u;
+        st->swaps++;
+        s_tex_uploads++;
+        s_sn.uploads++;
+        s_sn.swaps++;
+        if (nv2a_texpack_log())
+            fprintf(stderr, "[TEXPACK] swap %ux%u -> %ux%u (%u levels, +%u), %.2f MB, resident %.1f MB, flip %llu\n",
+                    t->width, t->height, img->w, img->h, img->levels, img->add,
+                    (double)img->bytes / 1048576.0, (double)s_pk_resident / 1048576.0,
+                    (unsigned long long)s_presents);
+        nv2a_texpack_release(e->pk_token);
+        e->pk_token = 0;
+        return;
+    default:
+        return;
+    }
+}
+
+/* Once a flip: the swap budget. */
+static void pack_flip(void)
+{
+    static uint64_t last_log;
+    s_pk_left = nv2a_texpack_swap_bytes();
+    if (nv2a_texpack_log() && s_presents - last_log >= 600 && nv2a_texpack_active()) {
+        struct nv2a_texpack_stats x;
+        last_log = s_presents;
+        nv2a_texpack_stats(&x);
+        fprintf(stderr, "[TEXPACK] flip %llu: %llu swaps, %.1f MB resident, %.1f MB held for jobs,"
+                " %llu decoded, %llu from cache, %llu failed, %llu demoted, %llu over the cap,"
+                " decode %.0f ms, compress %.0f ms\n", (unsigned long long)s_presents,
+                (unsigned long long)x.swaps, (double)x.resident_bytes / 1048576.0,
+                (double)x.cpu_bytes / 1048576.0, (unsigned long long)x.decoded,
+                (unsigned long long)x.from_cache, (unsigned long long)x.failed,
+                (unsigned long long)x.demoted, (unsigned long long)x.over_cap, x.decode_ms,
+                x.compress_ms);
+    }
+}
+
+/* ---- graphics.film_upscale (BO-136, nv2a_filmup.h), as Metal --------------
+ *
+ * A film frame is filtered at its upload, on the upload command buffer
+ * (s_up, submitted ahead of the frame's): the uploaded image is copied into
+ * the film's own input image (so every descriptor set is made once), then
+ * the deblock, FSRCNNX (Best, BO-245's pipelines) or FSR 1 (Cheap) and the
+ * recombine write one image of a ring of three, which tex_bind returns in
+ * place of the entry's own (the entry keeps its image; the ring is the
+ * film's). Barriers: transfer/compute -> compute before, compute -> fragment
+ * after (the ring image's layout change). Off: film_frame is never called. */
+#include "nv2a_filmup_shaders.h"
+
+#define FILM_MAX  2
+#define FILM_RING 3
+#define FQ_N      8                /* timestamp pairs */
+enum { FV_D1, FV_D2, FV_Y, FV_F1, FV_F2, FV_A1, FV_A2, FV_B1, FV_B2, FV_E2, FV_R2, FV_N };
+
+static VkDescriptorSetLayout s_fv_dsl[2];
+static VkPipelineLayout      s_fv_pl[2];
+static VkPipeline            s_fv_pipe[FILM_P_N];
+static VkSampler             s_fv_point;
+static int                   s_fv_state;       /* 0 not yet, 1 ready, -1 failed (atomic) */
+static VkQueryPool           s_fq;
+static uint64_t              s_fq_flip[FQ_N];  /* 0: free */
+static int                   s_fq_mode[FQ_N];
+static unsigned              s_fq_next;
+static uint64_t              s_film_last_ns;
+
+typedef struct {
+    uint32_t         w, h;
+    struct nvk_image in, s[FV_N], out[FILM_RING];
+    VkDescriptorPool pool;
+    VkDescriptorSet  db[2], cheap[2], cheap_rc[FILM_RING], best_luma, best_fsr[13],
+                     best_rc[FILM_RING];
+    int              have_cheap, have_best, next, failed;
+} VkFilm;
+static VkFilm s_vfilm[FILM_MAX];
+
+static int fv_layout(int p) { return p == FILM_P_RCAS ? 1 : 0; }
+
+static void *fv_load_main(void *arg)
+{
+    int i, ok = 1;
+    (void)arg;
+    for (i = 0; i < FILM_P_N && ok; i++) {
+        char err[1024] = "";
+        const uint32_t *w;
+        size_t n;
+        int compiled;
+        VkShaderModuleCreateInfo mi;
+        VkShaderModule mod = VK_NULL_HANDLE;
+        VkComputePipelineCreateInfo ci;
+        if (!nvk_glsl_spirv(NVK_STAGE_COMPUTE, k_film_glsl[i], &w, &n, &compiled, err,
+                            sizeof err)) {
+            fprintf(stderr, "[FILMUP] pass %d: %s\n", i, err);
+            ok = 0;
+            break;
+        }
+        memset(&mi, 0, sizeof mi);
+        mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        mi.codeSize = n * 4;
+        mi.pCode = w;
+        if (vkCreateShaderModule(s_dev, &mi, NULL, &mod) != VK_SUCCESS) {
+            ok = 0;
+            break;
+        }
+        memset(&ci, 0, sizeof ci);
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = s_fv_pl[fv_layout(i)];
+        if (vkCreateComputePipelines(s_dev, VK_NULL_HANDLE, 1, &ci, NULL, &s_fv_pipe[i])
+                != VK_SUCCESS)
+            ok = 0;
+        vkDestroyShaderModule(s_dev, mod, NULL);
+    }
+    fprintf(stderr, "[FILMUP] film passes: %s\n", ok ? "ready" : "failed");
+    __atomic_store_n(&s_fv_state, ok ? 1 : -1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* The layouts (as the texture upscaler's: A sampled 0, storage 1, out 4;
+ * B storage 0..2, out 4), the sampler and the query pool here; the
+ * pipelines on a thread of their own. */
+static void fv_init(void)
+{
+    static int started;
+    VkDescriptorSetLayoutBinding b[5];
+    VkDescriptorSetLayoutCreateInfo li;
+    VkPipelineLayoutCreateInfo pi;
+    VkPushConstantRange pr;
+    VkSamplerCreateInfo sc;
+    VkQueryPoolCreateInfo qi;
+    pthread_t th;
+    int l, i;
+    if (started)
+        return;
+    started = 1;
+    for (l = 0; l < 2; l++) {
+        uint32_t n = 0;
+        memset(b, 0, sizeof b);
+        for (i = 0; i < 5; i++) {
+            if (i == 3 || (l == 0 && i == 2))
+                continue;
+            b[n].binding = (uint32_t)i;
+            b[n].descriptorType = l == 0 && i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                   : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            b[n].descriptorCount = 1;
+            b[n].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            n++;
+        }
+        memset(&li, 0, sizeof li);
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = n;
+        li.pBindings = b;
+        memset(&pr, 0, sizeof pr);
+        pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pr.size = sizeof(struct tu_pc);
+        memset(&pi, 0, sizeof pi);
+        pi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pi.setLayoutCount = 1;
+        pi.pSetLayouts = &s_fv_dsl[l];
+        pi.pushConstantRangeCount = 1;
+        pi.pPushConstantRanges = &pr;
+        if (vkCreateDescriptorSetLayout(s_dev, &li, NULL, &s_fv_dsl[l]) != VK_SUCCESS
+                || vkCreatePipelineLayout(s_dev, &pi, NULL, &s_fv_pl[l]) != VK_SUCCESS) {
+            s_fv_state = -1;
+            return;
+        }
+    }
+    memset(&sc, 0, sizeof sc);
+    sc.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sc.magFilter = sc.minFilter = VK_FILTER_NEAREST;
+    sc.addressModeU = sc.addressModeV = sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(s_dev, &sc, NULL, &s_fv_point) != VK_SUCCESS) {
+        s_fv_state = -1;
+        return;
+    }
+    if (C->props.limits.timestampPeriod > 0.0f) {
+        memset(&qi, 0, sizeof qi);
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = FQ_N * 2;
+        if (vkCreateQueryPool(s_dev, &qi, NULL, &s_fq) != VK_SUCCESS)
+            s_fq = VK_NULL_HANDLE;
+        else
+            vkResetQueryPool(s_dev, s_fq, 0, qi.queryCount);
+    }
+    if (pthread_create(&th, NULL, fv_load_main, NULL) != 0) {
+        s_fv_state = -1;
+        return;
+    }
+    pthread_detach(th);
+}
+
+static int fv_state(void)
+{
+    return __atomic_load_n(&s_fv_state, __ATOMIC_ACQUIRE);
+}
+
+/* One set: in[] views (binding 0 sampled with layout A), out at binding 4;
+ * every image in GENERAL. */
+static VkDescriptorSet fv_set(VkFilm *f, VkDescriptorSetLayout dsl, int layout_a,
+                              const VkImageView *in, int nin, VkImageView out)
+{
+    VkDescriptorSetAllocateInfo ai;
+    VkWriteDescriptorSet wr[5];
+    VkDescriptorImageInfo ii[5];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    int k, n = 0;
+    memset(&ai, 0, sizeof ai);
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = f->pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &dsl;
+    if (vkAllocateDescriptorSets(s_dev, &ai, &set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    memset(wr, 0, sizeof wr);
+    memset(ii, 0, sizeof ii);
+    for (k = 0; k <= nin; k++) {
+        int bnd = k == nin ? 4 : k;
+        int sampled = layout_a && bnd == 0;
+        ii[n].sampler = sampled ? s_fv_point : VK_NULL_HANDLE;
+        ii[n].imageView = k == nin ? out : in[k];
+        ii[n].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        wr[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[n].dstSet = set;
+        wr[n].dstBinding = (uint32_t)bnd;
+        wr[n].descriptorCount = 1;
+        wr[n].descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[n].pImageInfo = &ii[n];
+        n++;
+    }
+    vkUpdateDescriptorSets(s_dev, (uint32_t)n, wr, 0, NULL);
+    return set;
+}
+
+/* The film's images and pool, at its first frame. 0: no memory. */
+static int fv_film_make(VkFilm *f, uint32_t w, uint32_t h)
+{
+    VkDescriptorPoolSize ps[2];
+    VkDescriptorPoolCreateInfo pci;
+    int i;
+    f->w = w;
+    f->h = h;
+    if (!nvk_image_new(&f->in, RT_FORMAT, w, h, 1,
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT))
+        return 0;
+    for (i = 0; i < FV_N; i++) {
+        uint32_t k = (i == FV_E2 || i == FV_R2) ? 2u : 1u;
+        if (!nvk_image_new(&f->s[i], VK_FORMAT_R16G16B16A16_SFLOAT, w * k, h * k, 1,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT))
+            return 0;
+    }
+    for (i = 0; i < FILM_RING; i++)
+        if (!nvk_image_new(&f->out[i], VK_FORMAT_R8G8B8A8_UNORM, w * 2, h * 2, 1,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT))
+            return 0;
+    memset(ps, 0, sizeof ps);
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps[0].descriptorCount = 32;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    ps[1].descriptorCount = 4 * 32;
+    memset(&pci, 0, sizeof pci);
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 32;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(s_dev, &pci, NULL, &f->pool) != VK_SUCCESS)
+        return 0;
+    {
+        VkImageView v[3];
+        v[0] = f->in.view; v[1] = f->s[FV_D2].view;
+        f->db[0] = fv_set(f, s_fv_dsl[0], 1, v, 2, f->s[FV_D1].view);
+        v[0] = f->in.view; v[1] = f->s[FV_D1].view;
+        f->db[1] = fv_set(f, s_fv_dsl[0], 1, v, 2, f->s[FV_D2].view);
+        if (!f->db[0] || !f->db[1])
+            return 0;
+    }
+    /* Everything in GENERAL from here (the ring images go to the read
+     * layout after each frame). */
+    ensure_up();
+    nvk_image_to(s_up, &f->in, VK_IMAGE_LAYOUT_GENERAL);
+    for (i = 0; i < FV_N; i++)
+        nvk_image_to(s_up, &f->s[i], VK_IMAGE_LAYOUT_GENERAL);
+    for (i = 0; i < FILM_RING; i++)
+        nvk_image_to(s_up, &f->out[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return 1;
+}
+
+static int fv_cheap_sets(VkFilm *f)
+{
+    VkImageView v[3];
+    int i;
+    if (f->have_cheap)
+        return 1;
+    v[0] = f->s[FV_D2].view; v[1] = f->s[FV_D1].view;
+    f->cheap[0] = fv_set(f, s_fv_dsl[0], 1, v, 2, f->s[FV_E2].view);
+    v[0] = f->s[FV_E2].view;
+    f->cheap[1] = fv_set(f, s_fv_dsl[1], 0, v, 1, f->s[FV_R2].view);
+    if (!f->cheap[0] || !f->cheap[1])
+        return 0;
+    for (i = 0; i < FILM_RING; i++) {
+        v[0] = f->s[FV_D2].view; v[1] = f->s[FV_R2].view;
+        if (!(f->cheap_rc[i] = fv_set(f, s_fv_dsl[0], 1, v, 2, f->out[i].view)))
+            return 0;
+    }
+    f->have_cheap = 1;
+    return 1;
+}
+
+static const int k_fv_fsr_io[13][4] = {
+    { FV_Y, -1, -1, FV_F1 }, { FV_Y, -1, -1, FV_F2 },
+    { FV_F1, FV_F2, -1, FV_A1 }, { FV_F1, FV_F2, -1, FV_A2 },
+    { FV_A1, FV_A2, -1, FV_B1 }, { FV_A1, FV_A2, -1, FV_B2 },
+    { FV_B1, FV_B2, -1, FV_A1 }, { FV_B1, FV_B2, -1, FV_A2 },
+    { FV_A1, FV_A2, -1, FV_B1 }, { FV_A1, FV_A2, -1, FV_B2 },
+    { FV_B1, FV_B2, FV_F1, FV_A1 }, { FV_B1, FV_B2, FV_F2, FV_A2 },
+    { FV_A1, FV_A2, -1, FV_B1 },
+};
+
+/* Best's sets, with the texture upscaler's layouts (its pipelines). */
+static int fv_best_sets(VkFilm *f)
+{
+    VkImageView v[3];
+    int i, k;
+    if (f->have_best)
+        return 1;
+    v[0] = f->s[FV_D2].view; v[1] = f->s[FV_D1].view;
+    f->best_luma = fv_set(f, s_tu_dsl[0], 1, v, 2, f->s[FV_Y].view);
+    if (!f->best_luma)
+        return 0;
+    for (i = 0; i < 13; i++) {
+        for (k = 0; k < 3 && k_fv_fsr_io[i][k] >= 0; k++)
+            v[k] = f->s[k_fv_fsr_io[i][k]].view;
+        if (!(f->best_fsr[i] = fv_set(f, s_tu_dsl[1], 0, v, k, f->s[k_fv_fsr_io[i][3]].view)))
+            return 0;
+    }
+    for (i = 0; i < FILM_RING; i++) {
+        v[0] = f->s[FV_D2].view; v[1] = f->s[FV_B1].view;
+        if (!(f->best_rc[i] = fv_set(f, s_tu_dsl[0], 1, v, 2, f->out[i].view)))
+            return 0;
+    }
+    f->have_best = 1;
+    return 1;
+}
+
+static void fv_dispatch(VkCommandBuffer cb, VkPipeline p, VkPipelineLayout pl, VkDescriptorSet set,
+                        uint32_t dw, uint32_t dh, uint32_t sw, uint32_t sh, int mode)
+{
+    struct tu_pc pc;
+    memset(&pc, 0, sizeof pc);
+    pc.size[0] = (int32_t)sw;
+    pc.size[1] = (int32_t)sh;
+    pc.mode = mode;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cb, (dw + 15) / 16, (dh + 15) / 16, 1);
+    tu_mem_barrier(cb);
+}
+
+static VkFilm *fv_film_of(uint32_t w, uint32_t h)
+{
+    int i;
+    for (i = 0; i < FILM_MAX; i++)
+        if (s_vfilm[i].w == w && s_vfilm[i].h == h)
+            return s_vfilm[i].failed ? NULL : &s_vfilm[i];
+    for (i = 0; i < FILM_MAX; i++)
+        if (!s_vfilm[i].w) {
+            if (!fv_film_make(&s_vfilm[i], w, h)) {
+                fprintf(stderr, "[FILMUP] no memory for a %ux%u film: left as it is\n", w, h);
+                s_vfilm[i].failed = 1;
+                return NULL;
+            }
+            return &s_vfilm[i];
+        }
+    return NULL;
+}
+
+/* The finished timestamp pairs into the cost numbers (never waits). */
+static void fv_poll(void)
+{
+    unsigned i;
+    if (!s_fq)
+        return;
+    for (i = 0; i < FQ_N; i++) {
+        uint64_t ts[2];
+        if (!s_fq_flip[i] || s_presents - s_fq_flip[i] < 2)
+            continue;
+        if (vkGetQueryPoolResults(s_dev, s_fq, i * 2, 2, sizeof ts, ts, 8,
+                                  VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+            continue;          /* not there yet */
+        if (ts[1] > ts[0])
+            nv2a_filmup_frame_done(s_fq_mode[i], (double)(ts[1] - ts[0])
+                                   * C->props.limits.timestampPeriod / 1e6);
+        vkResetQueryPool(s_dev, s_fq, i * 2, 2);
+        s_fq_flip[i] = 0;
+    }
+}
+
+/* At an upload of entry e's new bytes: filter it when it is a playing film.
+ * Sets e->film and e->film_view (the ring image tex_bind returns). */
+static void film_frame(TexEntry *e, const Stage *t, uint64_t flip)
+{
+    int mode = nv2a_filmup_mode(), best, q = -1;
+    VkCommandBuffer cb;
+    VkImageCopy ic;
+    VkFilm *f;
+    VkImageLayout was;
+    uint32_t w = t->width, h = t->height;
+    if (!nv2a_filmup_supported() || t->levels != 1 || stage_signed(t)
+            || !nv2a_filmup_shape(!nv2a_tex_size_from_format(t->color), 0, w, h)
+            || !nv2a_filmup_changed(flip, &e->film_flip, &e->film_n))
+        return;
+    fv_init();
+    if (mode == NV2A_FILMUP_BEST)
+        texup_init();   /* the FSRCNNX shader files (BO-245's) */
+    if (fv_state() != 1 || !e->im.img || !(f = fv_film_of(w, h)))
+        return;
+    best = mode == NV2A_FILMUP_BEST && tu_state() == 1 && fv_best_sets(f);
+    if (!best && !fv_cheap_sets(f))
+        return;
+    ensure_up();
+    cb = s_up;
+    if (s_fq && !s_fq_flip[s_fq_next % FQ_N]) {
+        q = (int)(s_fq_next++ % FQ_N);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_fq, (uint32_t)q * 2);
+    }
+    /* The frame into the film's input image (after its upload's copy). */
+    tu_mem_barrier(cb);
+    was = e->im.layout;
+    nvk_image_to(cb, &e->im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    nvk_image_to(cb, &f->in, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    memset(&ic, 0, sizeof ic);
+    ic.srcSubresource.aspectMask = ic.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource.layerCount = ic.dstSubresource.layerCount = 1;
+    ic.extent.width = w;
+    ic.extent.height = h;
+    ic.extent.depth = 1;
+    vkCmdCopyImage(cb, e->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, f->in.img,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    nvk_image_to(cb, &e->im, was);
+    nvk_image_to(cb, &f->in, VK_IMAGE_LAYOUT_GENERAL);
+    nvk_image_to(cb, &f->out[f->next], VK_IMAGE_LAYOUT_GENERAL);
+    tu_mem_barrier(cb);
+    fv_dispatch(cb, s_fv_pipe[FILM_P_DEBLOCK], s_fv_pl[0], f->db[0], w, h, w, h, 0);
+    fv_dispatch(cb, s_fv_pipe[FILM_P_DEBLOCK], s_fv_pl[0], f->db[1], w, h, w, h, 1);
+    if (best) {
+        int i;
+        fv_dispatch(cb, s_tu_pipe[TP_LUMA], s_tu_pl[0], f->best_luma, w, h, w, h, 0);
+        for (i = 0; i < 13; i++)
+            fv_dispatch(cb, s_tu_pipe[TP_FSR0 + i], s_tu_pl[1], f->best_fsr[i], w, h, w, h, 0);
+        fv_dispatch(cb, s_tu_pipe[TP_RECOMBINE], s_tu_pl[0], f->best_rc[f->next], w * 2, h * 2,
+                    w, h, 0);
+    } else {
+        fv_dispatch(cb, s_fv_pipe[FILM_P_EASU], s_fv_pl[0], f->cheap[0], w * 2, h * 2, w, h, 0);
+        fv_dispatch(cb, s_fv_pipe[FILM_P_RCAS], s_fv_pl[1], f->cheap[1], w * 2, h * 2, w * 2,
+                    h * 2, 0);
+        fv_dispatch(cb, s_fv_pipe[FILM_P_RECOMBINE], s_fv_pl[0], f->cheap_rc[f->next], w * 2,
+                    h * 2, w, h, 0);
+    }
+    nvk_image_to(cb, &f->out[f->next], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (q >= 0) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_fq, (uint32_t)q * 2 + 1);
+        s_fq_flip[q] = s_presents ? s_presents : 1;
+        s_fq_mode[q] = best ? NV2A_FILMUP_BEST : NV2A_FILMUP_CHEAP;
+    }
+    e->film_view = f->out[f->next].view;
+    e->film = (uint8_t)mode;
+    f->next = (f->next + 1) % FILM_RING;
+}
+
+static void film_flip(void)
+{
+    uint64_t now = now_ns();
+    fv_poll();
+    if (s_film_last_ns)
+        nv2a_filmup_flip(s_presents, (double)(now - s_film_last_ns) / 1e6);
+    s_film_last_ns = now;
 }
 
 static VkImageView tex_bind(const Stage *t)
@@ -4654,7 +5560,14 @@ static VkImageView tex_bind(const Stage *t)
                             rt->offset, rt->w, rt->h, rt->pitch * rt->h, t->offset,
                             t->color, t->width, t->height, bytes,
                             (unsigned long long)s_presents);
-                rt_sync(rt, rt->pitch);
+                if (nv2a_split) {
+                    uint64_t y0 = nv2a_split_tick();
+                    rt_sync(rt, rt->pitch);
+                    nv2a_split->syncs++;
+                    nv2a_split->sync_ticks += nv2a_split_tick() - y0;
+                } else {
+                    rt_sync(rt, rt->pitch);
+                }
             }
         }
     }
@@ -4708,20 +5621,36 @@ static VkImageView tex_bind(const Stage *t)
     if (e) {
         /* A replaced texture whose variant changed is uploaded again; so is
          * one whose scale is not the one wanted now. */
+        int pk_on = e->pk == PK_ON;
         int stale = (e->rep && e->rep != nv2a_texrep_generation())
-                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut
+                 /* BO-312, as Metal */
+                 || (pk_on && (e->pk_gen != nv2a_texpack_generation() || e->pk_demote
+                               || (cut && !e->pk_cut)))
+                 || (!pk_on && (e->scale != want || (want && e->salgo != algo) || e->cut != cut))
                  /* BO-245, as Metal */
-                 || (e->tu_add && (e->tgen != nv2a_texup_generation() || e->tu_demote));
+                 || (e->tu_add && (e->tgen != nv2a_texup_generation() || e->tu_demote))
+                 /* BO-136, as Metal */
+                 || (e->film && e->film != nv2a_filmup_mode());
         if (s_draw_2d)
             e->ui = 1;
-        if (e->gen != g->flips || stale) {
-            uint64_t h = tex_hash_pal(mem, t, bytes);
+        if (e->gen != tex_epoch() || stale) {
+            uint64_t h, h0 = nv2a_split ? nv2a_split_tick() : 0;
+            h = tex_hash_pal(mem, t, bytes);
+            if (h0) {
+                nv2a_split->rehash++;
+                nv2a_split->rehash_kb += bytes >> 10;
+                nv2a_split->rehash_ticks += nv2a_split_tick() - h0;
+            }
             s_tex_rehash++;
-            e->gen = g->flips;
+            if (!stale)
+                rehash_note(h != e->hash, t->offset, t->color, t->width, t->height, "texture");
+            e->gen = tex_epoch();
             if (h != e->hash || stale) {
                 struct nvk_image ni;
                 if (e->tu || e->tu_slot || e->tu_add)
                     tu_detach(e, e->tu == TU_SEEN && h != e->hash);
+                if (e->pk || e->pk_token)
+                    pack_detach(e);
                 e->hash = h;
                 s_tex_changed++;
                 if (!tex_upload(t, want, algo, cut, &ni))
@@ -4744,6 +5673,9 @@ static VkImageView tex_bind(const Stage *t)
                 e->skey = s_up_key;
                 e->pgen = g->flips;
                 e->pal_len = t->pal_len;
+                e->film = 0;
+                if (want == 0 && nv2a_filmup_mode() != NV2A_FILMUP_OFF)
+                    film_frame(e, t, g->flips);
             }
         }
     } else {
@@ -4753,6 +5685,12 @@ static VkImageView tex_bind(const Stage *t)
             tex_retire(&e->im);
         if (e->tu || e->tu_slot || e->tu_add)
             tu_detach(e, 0);
+        if (e->pk || e->pk_token) {
+            e->pk_demote = 0;
+            pack_detach(e);
+        }
+        e->pk = PK_NONE;
+        e->pk_retry = 0;
         e->tgen = nv2a_texup_generation();
         memset(&e->im, 0, sizeof e->im);
         e->live = 0;
@@ -4776,8 +5714,17 @@ static VkImageView tex_bind(const Stage *t)
         e->palette = t->palette;
         e->levels = t->levels;
         e->sign = stage_signed(t);
-        e->gen = g->flips;
-        e->hash = tex_hash_pal(mem, t, bytes);
+        e->gen = tex_epoch();
+        {
+            uint64_t h0 = nv2a_split ? nv2a_split_tick() : 0;
+            e->hash = tex_hash_pal(mem, t, bytes);
+            if (h0) {
+                nv2a_split->up_new++;
+                nv2a_split->rehash++;
+                nv2a_split->rehash_kb += bytes >> 10;
+                nv2a_split->rehash_ticks += nv2a_split_tick() - h0;
+            }
+        }
         e->rep = s_tex_rep;
         e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width, t->height,
                                      t->pitch);
@@ -4788,16 +5735,23 @@ static VkImageView tex_bind(const Stage *t)
                                                        t->height, t->pitch);
         e->im = ni;
         e->live = 1;
+        e->film = 0;
+        e->film_n = 0;
+        e->film_flip = 0;
+        if (want == 0 && nv2a_filmup_mode() != NV2A_FILMUP_OFF)
+            film_frame(e, t, g->flips);
     }
     /* BO-245: graphics.texture_upscale's steps (Off: only an entry with a
      * slot still out). */
-    if (nv2a_texup_algo() || e->tu_slot)
+    if (nv2a_texpack_active() || e->pk)
+        pack_bind(e, t, mem, cut);
+    if ((nv2a_texup_algo() || e->tu_slot) && e->pk != PK_WANT && e->pk != PK_JOB && e->pk != PK_ON)
         texup_bind(e, t, mem);
-    s_bind_tu = e->tu_add;
+    s_bind_tu = e->pk == PK_ON ? e->pk_add : e->tu_add;
     /* Its scaled picture was being made: asked for once a flip, swapped in
      * when it is there (as Metal). The old image goes when the frames that
      * may use it are done. */
-    if (e->pend && e->pgen != g->flips && s_swap_flip != g->flips) {
+    if (e->pend && e->pk != PK_ON && e->pgen != g->flips && s_swap_flip != g->flips) {
         e->pgen = g->flips;
         if (!scaled_room(t, e->scale)) {
             e->pend = 0;
@@ -4836,7 +5790,7 @@ static VkImageView tex_bind(const Stage *t)
     s_sn.scaled += e->up_scale != 0;
     if (ui_scale_log())
         ui_scale_use(e, t, mem);
-    return e->im.view;
+    return e->film ? e->film_view : e->im.view;
 }
 
 /* NV2A wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp. */
@@ -4864,8 +5818,10 @@ static VkSampler sampler(const Stage *t, unsigned scale, int add)
 
     if (point < 0)
         point = recomp_env(RENV_VK_POINT) != NULL;
-    mn = !point && nv2a_tex_filter_linear(t->filter, 0);
-    mg = !point && nv2a_tex_filter_linear(t->filter, 1);
+    /* A replaced texture with levels above the title's is filtered linearly
+     * even where the title asks for nearest texels (as Metal, BO-311). */
+    mn = !point && (nv2a_tex_filter_linear(t->filter, 0) || add > 0);
+    mg = !point && (nv2a_tex_filter_linear(t->filter, 1) || add > 0);
     mip = t->levels > 1 ? nv2a_tex_filter_mip(t->filter) : 0;
     /* A scaled 2D texture has the levels down to the title's size, blended
      * between (as Metal). */
@@ -4918,7 +5874,8 @@ static VkSampler sampler(const Stage *t, unsigned scale, int add)
         i = s_smp_n++;
     } else {
         static unsigned next;
-        i = (int)(next++ % SMP_MAX);
+        /* Its sampler is destroyed below: the last-set memo goes too. */
+        i = smp_evict(&next, SMP_MAX, &s_tmemo);
         /* A recorded draw may still use it. */
         if (!flush(1, FL_SAMPLER)) {
             /* Drawing has stopped: the old one stays, the new one is unused. */
@@ -5169,6 +6126,245 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur, VkImageView *
     return self;
 }
 
+/* ---- BO-178: reductions read a title-size copy (Metal's rt_reduced) -----------
+ *
+ * A draw that reads a scaled target into a smaller one (nv2a_rt_reduce_draw)
+ * samples src's area average at its guest size: one full-screen triangle
+ * into src->gim, made again only when src was drawn since. Its own pipeline
+ * layout (the texture set's layout and 16 bytes of push constants), so the
+ * draws' bindings are set again after it (s_dyn_valid). */
+static VkDescriptorSet texture_set(const VkImageView v[4], const VkSampler s[4]);
+
+static const char s_vs_reduce_glsl[] =
+    "#version 450\n"
+    "void main() {\n"
+    "    vec2 t = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+    "    gl_Position = vec4(t * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+/* q.xy host texels per guest texel (1.5, 2, 3...), a part-covered host
+ * texel counted by its share; q.z: alpha reads 1 (a 16-bit surface). */
+static const char s_fs_reduce_glsl[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(push_constant) uniform Q { vec4 q; } pq;\n"
+    "layout(location = 0) out vec4 o_color;\n"
+    "void main() {\n"
+    "    vec2 r = pq.q.xy, p0 = floor(gl_FragCoord.xy) * r, p1 = p0 + r;\n"
+    "    ivec2 a = ivec2(floor(p0)), b = ivec2(ceil(p1)) - 1;\n"
+    "    vec4 sum = vec4(0.0);\n"
+    "    float ws = 0.0;\n"
+    "    for (int y = a.y; y <= b.y; y++) {\n"
+    "        float wy = min(p1.y, float(y + 1)) - max(p0.y, float(y));\n"
+    "        for (int x = a.x; x <= b.x; x++) {\n"
+    "            float w = wy * (min(p1.x, float(x + 1)) - max(p0.x, float(x)));\n"
+    "            sum += texelFetch(src, ivec2(x, y), 0) * w;\n"
+    "            ws += w;\n"
+    "        }\n"
+    "    }\n"
+    "    sum = ws > 0.0 ? sum / ws : vec4(0.0);\n"
+    "    if (pq.q.z != 0.0) sum.a = 1.0;\n"
+    "    o_color = sum;\n"
+    "}\n";
+static VkPipelineLayout s_reduce_layout;
+static VkPipeline       s_reduce_pso;
+
+static int reduce_pipeline(void)
+{
+    static int failed;
+    VkShaderModule vs, fs;
+    VkPipelineLayoutCreateInfo pl;
+    VkPushConstantRange pcr;
+    VkPipelineShaderStageCreateInfo ss[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineDepthStencilStateCreateInfo ds;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineDynamicStateCreateInfo dy;
+    VkPipelineRenderingCreateInfo pr;
+    VkGraphicsPipelineCreateInfo gp;
+    VkFormat cf = RT_FORMAT;
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+
+    if (s_reduce_pso || failed)
+        return s_reduce_pso != VK_NULL_HANDLE;
+    failed = 1;
+    vs = module_from_glsl(NVK_STAGE_VERTEX, s_vs_reduce_glsl, "vs_reduce");
+    fs = module_from_glsl(NVK_STAGE_FRAGMENT, s_fs_reduce_glsl, "fs_reduce");
+    if (!vs || !fs)
+        goto out;
+    memset(&pcr, 0, sizeof pcr);
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.size = 16;
+    memset(&pl, 0, sizeof pl);
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &s_dsl[1];
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(s_dev, &pl, NULL, &s_reduce_layout) != VK_SUCCESS)
+        goto out;
+    memset(ss, 0, sizeof ss);
+    ss[0].sType = ss[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ss[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    ss[0].module = vs;
+    ss[0].pName = "main";
+    ss[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    ss[1].module = fs;
+    ss[1].pName = "main";
+    memset(&vi, 0, sizeof vi);
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    memset(&ia, 0, sizeof ia);
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    memset(&vp, 0, sizeof vp);
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    memset(&rs, 0, sizeof rs);
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    memset(&ms, 0, sizeof ms);
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&ds, 0, sizeof ds);
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    memset(&cba, 0, sizeof cba);
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    memset(&cb, 0, sizeof cb);
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    memset(&dy, 0, sizeof dy);
+    dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    memset(&pr, 0, sizeof pr);
+    pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &cf;
+    memset(&gp, 0, sizeof gp);
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext = &pr;
+    gp.stageCount = 2;
+    gp.pStages = ss;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dy;
+    gp.layout = s_reduce_layout;
+    if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &gp, NULL, &s_reduce_pso) != VK_SUCCESS)
+        s_reduce_pso = VK_NULL_HANDLE;
+    else
+        failed = 0;
+out:
+    if (vs)
+        vkDestroyShaderModule(s_dev, vs, NULL);
+    if (fs)
+        vkDestroyShaderModule(s_dev, fs, NULL);
+    if (failed)
+        XR_ERROR( LOGP "reduction pipeline failed: reductions read the host size\n");
+    return !failed;
+}
+
+/* The view of src at its guest size for a reduction, or VK_NULL_HANDLE
+ * (the draw reads src as before). `smp`: any sampler (texelFetch). */
+static VkImageView rt_reduced(RenderTarget *src, int opaque, VkSampler smp)
+{
+    VkRenderingAttachmentInfo ca;
+    VkRenderingInfo ri;
+    VkImageView v[4];
+    VkSampler sm[4];
+    VkDescriptorSet set;
+    VkViewport vpt;
+    VkRect2D sc;
+    float q[4];
+    int k;
+
+    if (!reduce_pipeline())
+        return VK_NULL_HANDLE;
+    if (src->gim.img && (src->gim.w != src->w || src->gim.h != src->h)) {
+        garbage_push(&src->gim, VK_NULL_HANDLE, NULL);   /* grown since */
+        memset(&src->gim, 0, sizeof src->gim);
+    }
+    if (src->gim.img && src->ggen == src->gen && src->gopaque == opaque)
+        return src->gim.view;
+    if (!src->gim.img
+            && !nvk_image_new(&src->gim, RT_FORMAT, src->w, src->h, 1,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT)) {
+        memset(&src->gim, 0, sizeof src->gim);
+        return VK_NULL_HANDLE;
+    }
+    for (k = 0; k < 4; k++) {
+        v[k] = k ? s_black.view : src->im.view;
+        sm[k] = smp;
+    }
+    set = texture_set(v, sm);
+    if (!set)
+        return VK_NULL_HANDLE;
+    rt_to_sampled(&src->im);
+    end_encoder();
+    ensure_cmd();
+    nvk_image_to(s_cmd, &src->gim, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    memset(&ca, 0, sizeof ca);
+    ca.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    ca.imageView = src->gim.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    memset(&ri, 0, sizeof ri);
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea.extent.width = src->w;
+    ri.renderArea.extent.height = src->h;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(s_cmd, &ri);
+    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_reduce_pso);
+    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_reduce_layout, 0, 1,
+                            &set, 0, NULL);
+    q[0] = (float)src->hw / (float)src->w;
+    q[1] = (float)src->hh / (float)src->h;
+    q[2] = opaque ? 1.0f : 0.0f;
+    q[3] = 0.0f;
+    vkCmdPushConstants(s_cmd, s_reduce_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, q);
+    memset(&vpt, 0, sizeof vpt);
+    vpt.width = (float)src->w;
+    vpt.height = (float)src->h;
+    vpt.maxDepth = 1.0f;
+    vkCmdSetViewport(s_cmd, 0, 1, &vpt);
+    memset(&sc, 0, sizeof sc);
+    sc.extent.width = src->w;
+    sc.extent.height = src->h;
+    vkCmdSetScissor(s_cmd, 0, 1, &sc);
+    vkCmdDraw(s_cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(s_cmd);
+    nvk_image_to(s_cmd, &src->gim, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    s_dyn_valid = 0;            /* another pipeline, viewport and scissor bound */
+    src->ggen = src->gen;
+    src->gopaque = opaque;
+    s_reduce_made++;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X (%ux%u, host %ux%u) read into a smaller"
+                    " target: at its own size (BO-178; RECOMP_DEBUG=rt_reduce=0 is the"
+                    " host size)\n", src->offset, src->w, src->h, src->hw, src->hh);
+    }
+    return src->gim.view;
+}
+
 /* ---- cube maps (BO-8): Metal's cube_bind ---------------------------------------
  *
  * A CUBEMAP stage samples a samplerCube (d3d8_combiners_glsl.c). The six
@@ -5270,7 +6466,7 @@ static VkImageView cube_bind(const Stage *t)
     }
     if (e->side != side || (e->im.img && e->im.format != (any ? RT_FMT : RT_FORMAT)))
         fresh = 1;
-    if (!all && (fresh || e->gen != g->flips)) {
+    if (!all && (fresh || e->gen != tex_epoch())) {
         uint64_t h = NV2A_TEX_HASH_SEED;
         for (f = 0; f < 6; f++)
             if (!frt[f])
@@ -5278,7 +6474,9 @@ static VkImageView cube_bind(const Stage *t)
                                             NV2A_TEX_HASH_SEED);
         if (pal)
             h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
-        e->gen = g->flips;
+        if (!fresh)
+            rehash_note(h != e->hash, t->offset, t->color, w, w, "cube");
+        e->gen = tex_epoch();
         if (h != e->hash)
             fresh = 1;
         e->hash = h;
@@ -5372,6 +6570,8 @@ static VkImageView cube_bind(const Stage *t)
                            e->im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
             e->face_gen[f] = frt[f]->gen;
             s_cube_copies++;
+            if (nv2a_split)
+                nv2a_split->cube_copies++;
         }
     }
     if (e->im.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
@@ -5392,11 +6592,15 @@ static VkDescriptorSet texture_set(const VkImageView v[4], const VkSampler s[4])
     VkDescriptorImageInfo ii[4];
     VkWriteDescriptorSet w;
     VkDescriptorSet set = VK_NULL_HANDLE;
+    uint64_t key[TMEMO_WORDS], last;
     int k;
 
-    if (s_tset_last && !memcmp(v, s_tset_views, sizeof s_tset_views)
-            && !memcmp(s, s_tset_smp, sizeof s_tset_smp))
-        return s_tset_last;
+    memcpy(key, v, 4 * sizeof *key);
+    memcpy(key + 4, s, 4 * sizeof *key);
+    if ((last = tmemo_find(&s_tmemo, key)) != 0) {
+        memcpy(&set, &last, sizeof set);
+        return set;
+    }
     for (;;) {
         if (f->dp_cur < f->ndps) {
             memset(&ai, 0, sizeof ai);
@@ -5441,9 +6645,11 @@ static VkDescriptorSet texture_set(const VkImageView v[4], const VkSampler s[4])
     w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     w.pImageInfo = ii;
     vkUpdateDescriptorSets(s_dev, 1, &w, 0, NULL);
-    memcpy(s_tset_views, v, sizeof s_tset_views);
-    memcpy(s_tset_smp, s, sizeof s_tset_smp);
-    s_tset_last = set;
+    {
+        uint64_t h;
+        memcpy(&h, &set, sizeof h);
+        tmemo_keep(&s_tmemo, key, h);
+    }
     return set;
 }
 
@@ -5761,7 +6967,7 @@ static int hdr_flip_pass(RenderTarget *rt, struct nvk_image *slot, uint32_t hcw,
     nvk_image_barrier(s_cmd, slot->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL,
                       VK_IMAGE_LAYOUT_GENERAL);
     s_dyn_valid = 0;
-    s_tset_last = VK_NULL_HANDLE;
+    tmemo_forget(&s_tmemo);
     s_hdr_maps++;
     return 1;
 }
@@ -6236,12 +7442,28 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     const Stage *rstage = NULL;
     const struct nv2a_texrep_hdr_gain *hgain = NULL;
     int solo = 0;                     /* BO-203: stage 0 is a stage0_only HDR picture */
+    int wide = 0;                     /* BO-385: a line list drawn as quads (vs_pass) */
+    int prog = d->program;            /* the batch runs its program on the GPU */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     VkImageView sview[4];
     VkSampler   ssmp[4];
     VkDescriptorSet tset;
+    /* RECOMP_TRACE=pb_split (BO-282.12): 1 in rate draws has its parts timed. */
+    struct nv2a_split *sp = nv2a_split;
+    uint64_t x0 = 0;
+#define SPM(k) do { if (sp && sp->draw_t) nv2a_split_mark(sp, (k)); } while (0)
+#define SPX(k) do { if (x0) { uint64_t x1_ = nv2a_split_tick(); sp->vkx_ticks[k] += x1_ - x0; \
+                              sp->vkx_calls[k]++; x0 = x1_; } } while (0)
 
+    if (sp) {
+        sp->draws++;
+        sp->draw_t = 0;
+        if (nv2a_split_pick(sp)) {
+            sp->draws_timed++;
+            sp->draw_t = nv2a_split_tick();
+        }
+    }
     if (!init())
         return;
     if (g->color_keep == 0xFFFFFFFFu && !(v->depth_enable && v->depth_mask) && !use_s
@@ -6267,6 +7489,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         for (k = 0; k < VTX_F4; k++)
             slot[nf4++] = s_vtx_attr[k];
     }
+    SPM(VKS_VS);
     rt = surface();
     if (!rt)
         rt = surface_depth_only();
@@ -6274,6 +7497,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         SKIP_DRAW("no render target");
         return;
     }
+    SPM(VKS_SURFACE);
     build_stages();
     nv2a_ps_consts_fill(v, s_stage, &pc.b);
     float host_bias = nv2a_host_lod_bias();   /* RECOMP_GFX_LOD_BIAS; 0 by default */
@@ -6293,7 +7517,14 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         const uint32_t *tr = nv2a_pb_tex_regs();
         for (k = 0; k < 4; k++) {
             const uint32_t *r = &tr[(0x40u * k + 0x28u) / 4];
-            memcpy(pc.bump_mat[k], r, 16);
+            /* The method's words are 00, 01, 11, 10 (xemu pgraph.c
+             * SET_TEXTURE_SET_BUMP_ENV_MAT's swizzle into NV_PGRAPH_BUMPMAT*);
+             * the shaders take 00, 01, 10, 11, as xemu's psh.c uploads
+             * bumpMat (BO-332). */
+            memcpy(&pc.bump_mat[k][0], &r[0], 4);
+            memcpy(&pc.bump_mat[k][1], &r[1], 4);
+            memcpy(&pc.bump_mat[k][2], &r[3], 4);
+            memcpy(&pc.bump_mat[k][3], &r[2], 4);
             memcpy(&pc.bump_lum[k][0], &r[4], 4);
             memcpy(&pc.bump_lum[k][1], &r[5], 4);
             pc.bump_lum[k][2] = pc.bump_lum[k][3] = 0.0f;
@@ -6302,8 +7533,10 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     /* BO-110: the colour bound of the HDR combiners (unread by SDR ones). */
     hdr_draw(rt, pc.hdr);
     s_fs_show_now = fs_show_for(rt);
+    SPM(VKS_STAGES);
     fmod = fs_select(v);
     s_signed_on = fmod != s_fs_basic;   /* fs_basic has no signed channels */
+    SPM(VKS_FS);
     nv2a_idx_range(d->idx, d->idx_count, &lo, &hi);
     count = hi - lo + 1;
     if (d->idx_count * 3u > idx_cap) {
@@ -6325,7 +7558,18 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
             SKIP_DRAW("too few vertices for a primitive");
         return;
     }
-    if (v->cull_enable) {
+    /* BO-385: a line one guest pixel wide at any render scale, as two
+     * triangles a segment through vs_pass (nv2a_lines_expand), as Metal;
+     * wideLines is optional and not on every device this runs on. */
+    if (nv2a_wide_lines(v, topo, rt->w, rt->hw)) {
+        wide = 1;
+        prog = 0;
+        vmod = s_vs_pass;
+        nf4 = VTX_F4;
+        topo = NV2A_TOPO_TRIANGLES;
+        count = 2u * nidx;            /* four corners a segment */
+    }
+    if (v->cull_enable && !wide) {
         if (v->cull_face == 0x405)      cull = 1;   /* BACK */
         else if (v->cull_face == 0x404) cull = 2;   /* FRONT */
         else if (v->cull_face == 0x408) cull_all = 1;
@@ -6334,6 +7578,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         s_draws_culled++;
         return;
     }
+    SPM(VKS_PRIM);
     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
     /* Without a depth buffer no depth is stored, and what keeps or drops a
      * fragment is SET_CLIP_MIN/MAX alone, in depth units. The depth format
@@ -6362,6 +7607,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 end_encoder();
         }
     }
+    SPM(VKS_VPC);
     /* Textures before the pass: a self copy or a layout change is outside
      * one. */
     {
@@ -6382,14 +7628,19 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         }
         for (k = 0; k < 4; k++) {
             const Stage *t = &s_stage[k];
+            RenderTarget *src;
             uint32_t sw, sh;
+            if (sp && sp->draw_t)
+                x0 = nv2a_split_tick();
             sview[k] = s_black.view;
             ssmp[k] = sampler(t, 0, 0);
+            SPX(VKX_SAMPLER);
             if (!t->mode || t->mode == 4)
                 continue;
             textured = 1;
             if (t->mode == 3 && t->cube && fmod != s_fs_basic) {   /* samplerCube */
                 sview[k] = cube_bind(t);
+                SPX(VKX_CUBE);
             } else if (fmod != s_fs_basic && dt_for_texture(t) != NULL) {
                 DepthTarget *sd = dt_for_texture(t);   /* a shadow buffer we drew */
                 rt_to_sampled(&sd->im);
@@ -6402,16 +7653,32 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 pc.b.tex_scale[k][1] = 1.0f / (float)sd->h;
                 s_zcolor_binds++;
             } else if ((t->mode == 3 || !stage_signed(t))
-                       && rt_texture(t, rt, &sview[k], &sw, &sh) != NULL) {
+                       && (src = rt_texture(t, rt, &sview[k], &sw, &sh)) != NULL) {
+                SPX(VKX_RTTEX);
+                /* BO-178: a reduction reads the title-size copy; the
+                 * coordinates below are the same for it. */
+                if (src->im.img && sview[k] != s_self.view
+                        && nv2a_rt_reduce_draw(src->w, src->h, src->hw, src->hh,
+                                               rt->w, rt->h)
+                        && nv2a_rt_reduce_on(nv2a_pb_gpu_state()->flips)) {
+                    VkImageView gv = rt_reduced(src, sview[k] == src->opaque, ssmp[k]);
+                    if (gv) {
+                        sview[k] = gv;
+                        s_reduce_binds++;
+                    }
+                }
                 if (!nv2a_tex_size_from_format(t->color)) {
                     pc.b.tex_scale[k][0] = 1.0f / (float)sw;
                     pc.b.tex_scale[k][1] = 1.0f / (float)sh;
                 }
                 s_rtt_binds++;
             } else {
+                if (t->mode == 3 || !stage_signed(t))
+                    SPX(VKX_RTTEX);     /* the lookup that found no target */
                 sview[k] = tex_bind(t);
                 if (s_bind_scale || s_bind_tu)
                     ssmp[k] = sampler(t, s_bind_scale, s_bind_tu);
+                SPX(VKX_TEXBIND);
                 if (zbias == 0.0f)
                     zbias = s_bind_zbias;
                 if (!rhash) {
@@ -6435,6 +7702,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                     sview[k] = s_clear.view;
             }
     }
+    SPM(VKS_TEX);
+    x0 = 0;
     /* BO-110: a registered light texture's gain, on its scene draws. */
     if (hgain && s_hdr && pc.hdr[0] > 1.0f) {
         int mode;
@@ -6476,14 +7745,16 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
 
     /* Rings: an overflow flushes (ending the pass and resetting every
      * ring), so on a flush the placement starts over. */
+    SPM(VKS_HDRZ);
     vbytes = (VkDeviceSize)count * nf4 * 16u;
     if (vbytes < 16)
         vbytes = 16;
     for (tries = 0; tries < 2; tries++) {
         uint64_t fl = s_flushes;
         vf = (float *)ring_alloc(RING_VB, vbytes, 16, &vb_off);
-        ip = vf ? ring_alloc(RING_IB, (VkDeviceSize)nidx * 4u, 16, &ib_off) : NULL;
-        if (vf && ip && d->program && !ubo_place(0, v->c, VS_C_BYTES, &uo[0]))
+        ip = vf ? ring_alloc(RING_IB, (VkDeviceSize)(wide ? 3u * nidx : nidx) * 4u, 16, &ib_off)
+                : NULL;
+        if (vf && ip && prog && !ubo_place(0, v->c, VS_C_BYTES, &uo[0]))
             ip = NULL;
         if (vf && ip && !ubo_place(1, &vc, VP_C_BYTES, &uo[1]))
             ip = NULL;
@@ -6498,25 +7769,39 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         SKIP_DRAW("no ring space");
         return;
     }
-    if (!d->program)
+    if (!prog)
         uo[0] = s_umemo.valid[0] ? s_umemo.off[0] : 0;
-    if (!hud_squeeze(d, slot, nf4, lo, count, v->inl, idx, nidx, topo, vf))
-        nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
-                        (const uint8_t *)xbox_GetMemoryOffset(), vf);
-    memcpy(ip, idx, (size_t)nidx * 4u);
+    SPM(VKS_UBO);
+    if (wide) {
+        nidx = nv2a_lines_expand(d, v, idx, nidx, lo, hi - lo + 1,
+                                 (const uint8_t *)xbox_GetMemoryOffset(), vf, (uint32_t *)ip);
+        if (!nidx) {
+            s_draws_skipped++;
+            return;
+        }
+    } else {
+        if (!hud_squeeze(d, slot, nf4, lo, count, v->inl, idx, nidx, topo, vf))
+            nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
+                            (const uint8_t *)xbox_GetMemoryOffset(), vf);
+        memcpy(ip, idx, (size_t)nidx * 4u);
+    }
+    SPM(VKS_GATHER);
     tset = texture_set(sview, ssmp);
     if (!tset) {
         SKIP_DRAW("no texture set");
         return;
     }
+    SPM(VKS_TSET);
 
     if (!s_pass || s_enc_rt != rt)
         begin_encoder(rt, 0, NULL);
+    SPM(VKS_ENC);
     pso = pipeline(vmod, fmod, nf4, topo);
     if (!pso) {
         SKIP_DRAW("no pipeline");
         return;
     }
+    SPM(VKS_PSO);
     {
         /* The draw's dynamic state, and what of it differs from what this
          * command buffer already has (every pipeline here leaves the same
@@ -6647,6 +7932,9 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     rt->gen = ++s_rt_seq;
     if (rt->dt && use_z && (v->depth_mask || use_s))
         rt->dt->gen = rt->gen;
+    SPM(VKS_CMD);
+#undef SPM
+#undef SPX
 }
 
 /* ---- flip ---------------------------------------------------------------------- */
@@ -7005,8 +8293,11 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
 
     if (!rt->im.img || !rt->dirty || !pitch || pitch < rt->w * 2u)
         return;
-    if ((px = host_readback(rt)) != NULL)
+    if ((px = host_readback(rt)) != NULL) {
+        if (rt->hw != rt->w)
+            nv2a_pb_dump_host_px(px, rt->hw, rt->hh);   /* fb_dump_host (BO-385) */
         write_back_px(rt, px, rt->addr, pitch);
+    }
     rt->dirty = 0;
     rt_own_reset(rt);
 }
@@ -7400,7 +8691,7 @@ static void frame_advance(void)
     if (s_hf_pool[s_fi])
         vkResetDescriptorPool(s_dev, s_hf_pool[s_fi], 0);
     f->dp_cur = 0;
-    s_tset_last = VK_NULL_HANDLE;
+    tmemo_forget(&s_tmemo);
     rings_reset();
     garbage_collect();
     occ_after_wait();
@@ -7544,32 +8835,63 @@ static void pcache_save(void)
     pthread_mutex_unlock(&s_pcs_mu);
 }
 
+/* One long-lived saver thread, woken for each periodic save. It used to be a
+ * new detached thread per save, one every 600 presents while pipelines were
+ * still being added (about 6 a minute at 60 Hz). On Windows every thread
+ * winpthreads creates and lets go of leaves Event handles behind (the count
+ * grew by about 6 a minute for as long as the game ran, BO-283); one thread
+ * for the life of the process leaves none. */
+static pthread_mutex_t s_pcw_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_pcw_cv = PTHREAD_COND_INITIALIZER;
+static int s_pcw_req;                    /* a save is asked for (under s_pcw_mu) */
+static int s_pcw_started;                /* the saver thread exists (under s_pcw_mu) */
+
 static void *pcache_save_main(void *arg)
 {
     (void)arg;
-    pcache_save();
-    __atomic_store_n(&s_pcs_running, 0, __ATOMIC_RELEASE);
+    for (;;) {
+        pthread_mutex_lock(&s_pcw_mu);
+        while (!s_pcw_req)
+            pthread_cond_wait(&s_pcw_cv, &s_pcw_mu);
+        s_pcw_req = 0;
+        pthread_mutex_unlock(&s_pcw_mu);
+        pcache_save();
+        __atomic_store_n(&s_pcs_running, 0, __ATOMIC_RELEASE);
+    }
     return NULL;
 }
 
 /* The flip's save (BO-245): the cache file is written off the render
  * thread. On the Deck's SD card that fopen/fwrite/rename could wait tens of
- * ms behind other writes; the render thread now only starts the thread. */
+ * ms behind other writes; the render thread now only wakes the saver. */
 static int s_quiesced;                   /* nvk_backend_quiesce saved the cache (below) */
 
 static void pcache_save_async(void)
 {
-    pthread_t th;
+    int ok = 1;
     if (s_quiesced)
         return;                          /* the way out has saved it */
     if (__atomic_exchange_n(&s_pcs_running, 1, __ATOMIC_ACQ_REL))
         return;                          /* one is still writing: next time */
-    if (pthread_create(&th, NULL, pcache_save_main, NULL) != 0) {
+    pthread_mutex_lock(&s_pcw_mu);
+    if (!s_pcw_started) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, pcache_save_main, NULL) == 0) {
+            pthread_detach(th);
+            s_pcw_started = 1;
+        } else {
+            ok = 0;
+        }
+    }
+    if (ok) {
+        s_pcw_req = 1;
+        pthread_cond_signal(&s_pcw_cv);
+    }
+    pthread_mutex_unlock(&s_pcw_mu);
+    if (!ok) {
         __atomic_store_n(&s_pcs_running, 0, __ATOMIC_RELEASE);
         pcache_save();
-        return;
     }
-    pthread_detach(th);
 }
 
 static int s_blob_cold;                  /* pcache_load: the driver kept nothing */
@@ -8489,6 +9811,10 @@ static int init(void)
             && (f16.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
             && (fb.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
             && (fb.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT));
+        /* BO-136: graphics.film_upscale needs the same storage formats. */
+        nv2a_filmup_set_supported(
+            (f8.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+            && (f16.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT));
     }
 #endif
     /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
@@ -8570,7 +9896,7 @@ static void vf_open(void)
             "s_sampler,s_readback,s_batch,submit_ms,submit_max_ms,qlock_ms,polls,poll_ms,"
             "poll_max_ms,waits,wait_ms,qres,qres_ms,endpass_ms,f_total,f_back,f_copy,"
             "f_submit,f_pub,f_adv,ready_done,g_n,g_first_ms,g_last_ms,g_active_ms,"
-            "d_main,d_square,d_other\n");
+            "d_main,d_square,d_other,rt_hashes\n");
     memset(s_vfr, 0, sizeof s_vfr);
     s_vf = &s_vfr[0];
     fprintf(stderr, LOGP "vk_frame: one line per flip into %s (GPU timestamps %s)\n", path,
@@ -8588,6 +9914,12 @@ static void vf_flip(void)
 
     done->present = s_presents;
     done->flip = nv2a_pb_gpu_state()->flips;
+    {
+        static uint64_t prev_rh;
+        uint64_t rh = nv2a_rt_own_hashes();
+        done->rt_hashes = (uint32_t)(rh - prev_rh);
+        prev_rh = rh;
+    }
     done->t_ns = now_ns();
     w = &s_vfr[wi];
     if (w->t_ns) {
@@ -8614,7 +9946,7 @@ static void vf_flip(void)
         }
         fprintf(s_vf_out, "%llu,%u,%.3f,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"
                 "%.3f,%.3f,%.3f,%u,%.3f,%.3f,%u,%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                "%.3f,%u,%u,%.3f,%.3f,%.3f,%u,%u,%u\n",
+                "%.3f,%u,%u,%.3f,%.3f,%.3f,%u,%u,%u,%u\n",
                 (unsigned long long)w->present, w->flip, w->t_ns / 1e6, w->draws, w->passes,
                 w->p_clear, w->p_load, w->p_resumed, w->p_empty, w->p_maxdraws, w->rt_switch,
                 w->zload, w->zresumed, w->sub[FL_FLIP], w->sub[FL_READY], w->sub[FL_REPORT],
@@ -8624,7 +9956,8 @@ static void vf_flip(void)
                 w->poll_ns / 1e6, w->poll_max_ns / 1e6, w->waits, w->wait_ns / 1e6, w->qres,
                 w->qres_ns / 1e6, w->endpass_ns / 1e6, w->f_total / 1e6, w->f_back / 1e6,
                 w->f_copy / 1e6, w->f_submit / 1e6, w->f_pub / 1e6, w->f_adv / 1e6,
-                w->ready_done, n, first, last, act, w->d_main, w->d_square, w->d_other);
+                w->ready_done, n, first, last, act, w->d_main, w->d_square, w->d_other,
+                w->rt_hashes);
         if ((w->present & 63) == 0)
             fflush(s_vf_out);
     }
@@ -8685,7 +10018,7 @@ static void hdr_flip(void)
     __atomic_store_n(&s_hdr, want, __ATOMIC_RELEASE);
     nv2a_texrep_set_hdr(want);          /* BO-203: textures with an HDR picture upload again */
     s_dyn_valid = 0;
-    s_tset_last = VK_NULL_HANDLE;
+    tmemo_forget(&s_tmemo);
     /* The targets a flip has shown come back at once, in the new format,
      * at their old size, from the bytes rt_free wrote back. Left to the next
      * draw, one is made at that draw's clip: Burnout 3's loading and menu
@@ -8987,6 +10320,8 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 vf_flip();
             }
             texup_flip();   /* BO-245: chunks behind the frame, swaps budgeted */
+            pack_flip();    /* BO-312: the pack swaps' upload budget */
+            film_flip();    /* BO-136: the films' cost numbers */
             if (prof) {
                 s_pa.wait += now_ns() - t;
                 s_pa.waits += s_frame_waits - w0;
@@ -9016,6 +10351,9 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
     flip_log(surface_offset, rt);
     if (s_presents == 1 || (s_presents % 300) == 0)
         pc_log(s_presents);
+    if ((s_presents == 1 || (s_presents % 300) == 0) && s_reduce_made)
+        fprintf(stderr, LOGP "BO-178 reductions: %llu title-size copies made, %llu binds\n",
+                (unsigned long long)s_reduce_made, (unsigned long long)s_reduce_binds);
     if (s_presents == 1 || (s_presents % 300) == 0) {
         uint64_t sh = 0, sc = 0;
         nvk_glsl_stats(&sh, &sc);

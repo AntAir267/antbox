@@ -197,12 +197,17 @@ endif()
 # GNU ld reads an archive once, in order, and the runtime's libraries call
 # each other both ways: the kernel's bridge calls into the window and the
 # movie player (xbox_video), its fault path into the APU hook (xbox_apu),
-# the executor into the GPU backends (xbox_d3d8). macOS ld64 and lld resolve
-# that by themselves; for GNU ld the edges are declared, and CMake repeats
-# the cycle of static libraries on the link line (the native Linux / Steam
-# Deck build). dladdr is in libdl before glibc 2.34 (the Steam Runtime's).
+# the executor into the GPU backends (xbox_d3d8), and the GPU backends back
+# into the kernel's texture replacement and texture packs (nv2a_texrep.c,
+# nv2a_texpack.c). macOS ld64 and lld resolve that by themselves; for GNU ld
+# the edges are declared, and CMake repeats the cycle of static libraries on
+# the link line (the native Linux / Steam Deck build). dladdr is in libdl
+# before glibc 2.34 (the Steam Runtime's).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(xbox_kernel PUBLIC xbox_video xbox_apu xbox_d3d8 ${CMAKE_DL_LIBS})
+    # A test that links only the runtime (pb_tex_cache, nv2a_backend_smoke,
+    # nv2a_pb_walk) had libxbox_d3d8.a last, after the kernel's final copy.
+    target_link_libraries(xbox_d3d8 PUBLIC xbox_kernel)
     set_property(TARGET xbox_kernel xbox_video xbox_apu xbox_d3d8
                  PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
     if(XBOXRECOMP_HAVE_OVERLAY)

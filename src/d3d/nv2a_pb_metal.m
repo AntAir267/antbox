@@ -51,9 +51,10 @@
  * Depth/stencil and render-to-texture as the D3D11 backend (M2); visibility
  * tests (GET_REPORT) from Metal visibility results through the shared
  * tracker (M3, "Visibility tests" below). Near clipping needs nothing extra:
- * the vertex programs hand Metal clip-space positions (w kept, as for D3D11)
- * and the default MTLDepthClipModeClip clips at the near and far planes, as
- * D3D11's DepthClipEnable does. Not yet: swizzled render targets. The mip
+ * the vertex programs hand Metal clip-space positions (w kept, as for D3D11).
+ * Depth is clamped, not clipped at the near and far planes, and the vertex
+ * programs cull window z outside the title's SET_CLIP_MIN/MAX themselves, as
+ * xemu draws (BO-332, clip_range_on). Not yet: swizzled render targets. The mip
  * LOD bias is a sample() argument (MsPsConsts.tex_bias), not a sampler
  * field, so every macOS takes the same path.
  *
@@ -87,9 +88,11 @@
 #include "nv2a_texrep.h"
 #include "nv2a_texscale.h"
 #include "nv2a_texmip.h"
+#include "nv2a_texpack.h"
 #include "kernel_pause.h"
 #include "kernel_pacing.h"
 #include "nv2a_texup.h"
+#include "nv2a_filmup.h"
 #import "nv2a_texup_metal.h"
 #include "recomp_exe_dir.h"
 #include <pthread.h>
@@ -175,7 +178,7 @@ _Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size change
 typedef struct {
     struct nv2a_ps_consts b;
     float tex_bias[4];
-    float bump_mat[4][4];   /* per stage: SET_TEXTURE_SET_BUMP_ENV_MAT 00 01 10 11 */
+    float bump_mat[4][4];   /* per stage: BUMPMAT 00 01 10 11 (the method's words 0, 1, 3, 2) */
     float bump_lum[4][4];   /* per stage: x bump-env luminance scale, y offset */
     float hdr[4];           /* BO-110: x the colour bound of the HDR combiners (unread by SDR ones) */
 } MsPsConsts;
@@ -254,14 +257,37 @@ static const char s_msl[] =
     "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
     "    return o;\n"
     "}\n"
-    "fragment float4 fs_clear(constant float4 &c [[buffer(0)]]) { return c; }\n";
+    "fragment float4 fs_clear(constant float4 &c [[buffer(0)]]) { return c; }\n"
+    /* BO-178 (rt_reduced): one guest texel of a scaled target, the area
+     * average of the host texels under it; r is host texels per guest
+     * texel (2 at 2x, 1.5 at 1.5x), so a part-covered host texel counts by
+     * its share; q.z: alpha reads 1 (a 16-bit surface, rt_opaque). */
+    "fragment float4 fs_reduce(ClearV i [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "                          constant float4 &q [[buffer(0)]]) {\n"
+    "    float2 r = q.xy, p0 = floor(i.pos.xy) * r, p1 = p0 + r;\n"
+    "    int2 a = int2(floor(p0)), b = int2(ceil(p1)) - 1;\n"
+    "    float4 sum = float4(0.0);\n"
+    "    float ws = 0.0;\n"
+    "    for (int y = a.y; y <= b.y; y++) {\n"
+    "        float wy = min(p1.y, float(y + 1)) - max(p0.y, float(y));\n"
+    "        for (int x = a.x; x <= b.x; x++) {\n"
+    "            float w = wy * (min(p1.x, float(x + 1)) - max(p0.x, float(x)));\n"
+    "            sum += src.read(uint2(x, y)) * w;\n"
+    "            ws += w;\n"
+    "        }\n"
+    "    }\n"
+    "    sum = ws > 0.0 ? sum / ws : float4(0.0);\n"
+    "    if (q.z != 0.0) sum.a = 1.0;\n"
+    "    return sum;\n"
+    "}\n";
 
 /* ---- device ---------------------------------------------------------------- */
 
 static id<MTLDevice>               s_dev;
 static id<MTLCommandQueue>         s_queue;
 static id<MTLFunction>             s_vs_pass, s_fs_basic;
-static id<MTLFunction>             s_vs_clear, s_fs_clear;
+static id<MTLFunction>             s_vs_clear, s_fs_clear, s_fs_reduce;
+static id<MTLRenderPipelineState>  s_reduce_pso;     /* rt_reduced, made on first use */
 static id<MTLRenderPipelineState>  s_clear_pso[2];   /* partial clears: without, with depth */
 static id<MTLRenderPipelineState>  s_clear_pso_hdr[2];   /* the same for half-float targets (BO-110) */
 static MTLCompileOptions          *s_opts;     /* fast math off, kept for M2's shaders */
@@ -339,6 +365,9 @@ typedef struct {
     uint64_t       gen;        /* s_rt_seq at its last clear or draw */
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
+    id<MTLTexture> gtex;       /* BO-178: tex area-averaged to w x h (rt_reduced), or nil */
+    uint64_t       ggen;       /* gen gtex was made at */
+    int            gopaque;    /* gtex made with alpha 1 (a 16-bit surface) */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
@@ -348,6 +377,7 @@ static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
 static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
+static uint64_t      s_reduce_binds, s_reduce_made;   /* BO-178, rt_reduced */
 static uint64_t      s_stale_drops, s_retired;
 static uint64_t      s_grows, s_partial_clears;   /* rt_grow, metal_on_clear */
 
@@ -668,13 +698,16 @@ static void mf_flip(void)
     if (s_mf_on <= 0)
         return;
     for (i = 0; i < s_mf_n; i++)
-        if (s_mf[i].kind == 'X') copies++; else passes++;
+        if (s_mf[i].kind == 'X' || s_mf[i].kind == 'R') copies++; else passes++;
     n += snprintf(line + n, sizeof line - (size_t)n, "frame %llu: %d passes %d copies",
                   (unsigned long long)s_presents, passes + s_mf_over, copies);
     for (i = 0; i < s_mf_n; i++) {
         if (s_mf[i].kind == 'X')
             n += snprintf(line + n, sizeof line - (size_t)n, " | copy %ux%u",
                           s_mf[i].w, s_mf[i].h);
+        else if (s_mf[i].kind == 'R')   /* BO-178: rt_reduced */
+            n += snprintf(line + n, sizeof line - (size_t)n, " | reduce 0x%08X %ux%u<%ux%u",
+                          s_mf[i].off, s_mf[i].w, s_mf[i].h, s_mf[i].hw, s_mf[i].hh);
         else
             n += snprintf(line + n, sizeof line - (size_t)n, " | 0x%08X %ux%u %c %u >%ux%u i%u",
                           s_mf[i].off, s_mf[i].w, s_mf[i].h, s_mf[i].kind, s_mf[i].draws,
@@ -688,6 +721,24 @@ static void mf_flip(void)
  * pass attaches rt->dt when it has one; zmask (CLEAR_SURFACE's bit 0 depth,
  * bit 1 stencil) clears it to z / st, and a fresh buffer clears to the far
  * plane and stencil 0, where the CPU path starts its own. */
+/* BO-332: depth is clamped, not clipped at the near and far planes, and the
+ * vertex programs cull window z outside the title's SET_CLIP_MIN/MAX
+ * themselves (D3D8_MSL_CLIP_RANGE), as xemu draws (pgraph/vk/draw.c
+ * depthClampEnable, pgraph/glsl/psh.c depth_clipping). Island Paradise's
+ * water samples a 128x128 R5G6B5 sky target whose surface says Z16 while the
+ * title's transform and clip range are Z24's: past the Z16 far plane the
+ * whole sky was clipped and the sea was drawn from black.
+ * RECOMP_DEBUG=zclamp=0 restores the old clip, for comparisons. */
+static int clip_range_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_ZCLAMP);
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static void begin_pass(RenderTarget *rt, int clear, const double c[4],
                        unsigned zmask, float z, uint32_t st)
 {
@@ -721,6 +772,8 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     }
     rp.visibilityResultBuffer = s_vis;
     s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
+    if (clip_range_on())
+        [s_enc setDepthClipMode:MTLDepthClipModeClamp];   /* BO-332 */
     s_enc_rt = rt;
     s_enc_dt = dt;
     occ_pass_begin();
@@ -787,8 +840,9 @@ static int init(void)
         s_fs_basic = [lib newFunctionWithName:@"fs_basic"];
         s_vs_clear = [lib newFunctionWithName:@"vs_clear"];
         s_fs_clear = [lib newFunctionWithName:@"fs_clear"];
+        s_fs_reduce = [lib newFunctionWithName:@"fs_reduce"];
         [lib release];
-        if (!s_vs_pass || !s_fs_basic || !s_vs_clear || !s_fs_clear) {
+        if (!s_vs_pass || !s_fs_basic || !s_vs_clear || !s_fs_clear || !s_fs_reduce) {
             XR_ERROR( LOGP "MSL functions missing\n");
             return 0;
         }
@@ -828,6 +882,7 @@ static int init(void)
     /* BO-245: graphics.texture_upscale on Apple silicon (its results are
      * shared-storage textures the CPU reads back for the disk cache). */
     nv2a_texup_set_supported(s_unified);
+    nv2a_filmup_set_supported(1);   /* BO-136 */
     /* graphics.ui_scale switched on in the overlay: the loaded 2D textures
      * are prepared while the title is held (scale_prepare_loaded). */
     xbox_HostPauseIdleFn(scale_prepare_loaded);
@@ -913,6 +968,7 @@ static void rt_free(RenderTarget *rt)
         end_encoder();
     [rt->opaque release];
     [rt->tex release];
+    [rt->gtex release];
     memset(rt, 0, sizeof *rt);
 }
 
@@ -1821,6 +1877,19 @@ typedef struct {
     uint8_t        tu, tu_slot, tu_add, tu_demote;
     uint32_t       tgen, tu_flip;
     uint64_t       tu_hash, tu_bytes;
+    /* texture packs (BO-312): the step it is at (PK_*), the levels its
+     * texture has above the title's, to go back to the title's (the budget),
+     * the pack generation it was looked at with, its entry in the pack index,
+     * the job's token, the flip it was last asked at and the flip to ask again
+     * from, the alpha test its levels were made for, its texture's bytes. */
+    uint8_t        pk, pk_add, pk_demote;
+    uint32_t       pk_gen, pk_id, pk_token, pk_flip, pk_retry, pk_cut;
+    uint64_t       pk_bytes;
+    /* graphics.film_upscale (BO-136, nv2a_filmup.h): the mode its texture
+     * was filtered with (0: the title's frame), the flip of its last change
+     * and the changes counted (nv2a_filmup_changed). */
+    uint8_t        film, film_n;
+    uint64_t       film_flip;
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
@@ -2017,6 +2086,9 @@ static id<MTLTexture> tex_upload(const Stage *t, unsigned scale, int algo, uint3
         pal = (const uint32_t *)(mem + t->palette);
     nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                     t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    /* texrep_dump: the texture as decoded, before any replacement, as a pack file. */
+    nv2a_texpack_dump(mem + t->offset, t->color, t->width, t->height, t->pitch, t->levels,
+                      (const uint8_t *)pal, pal ? t->pal_len : 0, s_texels);
     /* The title's button prompts as the pad in use prints them (input.glyphs,
      * nv2a_texrep.h): rectangles of a registered texture replaced here. */
     s_tex_rep = nv2a_texrep_apply(mem + t->offset, t->color, t->width, t->height,
@@ -2868,6 +2940,355 @@ static unsigned tc_hint_key(const Stage *t)
     return h & (TC_HINT - 1);
 }
 
+/* ---- texture packs (BO-312, nv2a_texpack.h) ---------------------------------
+ *
+ * A texture whose key (nv2a_texpack_key: the hash of its level-0 guest bytes,
+ * for P8 and the palette's) is in a pack mod is shown from the pack's PNG at
+ * the PNG's own size. The title's texture is uploaded as always and shown
+ * until a worker thread has the replacement ready (decoded, scaled, mipped,
+ * compressed); the swap is a new MTLTexture at a bind, within a per-flip
+ * upload budget. The bytes kept are bounded (nv2a_texpack_cap_bytes): over it
+ * the least recently bound replacement goes back to the title's texture at
+ * its next bind. Off (no pack): nothing is hashed or asked.
+ *
+ * The entry's steps (TexEntry.pk): PK_NONE not looked at, PK_NO no pack has
+ * it (or not a texture a pack can replace), PK_WANT in a pack but no job yet,
+ * PK_JOB a job is out, PK_ON replaced, PK_CAPPED sent back by the budget (asks
+ * again later). */
+enum { PK_NONE = 0, PK_NO, PK_WANT, PK_JOB, PK_ON, PK_CAPPED };
+
+static uint64_t  s_pk_resident;
+static size_t    s_pk_left;
+static uint32_t *s_pk_dec;
+static uint8_t  *s_pk_alpha;
+static size_t    s_pk_dec_cap;
+
+static void pack_init(void)
+{
+    static int done;
+    char dir[900], sub[1000];
+    if (done)
+        return;
+    done = 1;
+    if ([s_dev supportsBCTextureCompression])
+        nv2a_texpack_set_formats(1u << NV2A_TEXPACK_FMT_BC1 | 1u << NV2A_TEXPACK_FMT_BC3);
+    if (nv2a_pcache_dir(nv2a_host_opts()->shader_cache, nv2a_pcache_app(), dir, sizeof dir)) {
+        snprintf(sub, sizeof sub, "%s/texpack", dir);
+        nv2a_texpack_cache_dir(sub);
+    }
+}
+
+/* The entry's pack state goes (its content changed, the packs changed, the
+ * budget took it back): the job is let go and a replacement's bytes are no
+ * longer counted. */
+static void pack_detach(TexEntry *e)
+{
+    if (e->pk_token) {
+        nv2a_texpack_release(e->pk_token);
+        e->pk_token = 0;
+    }
+    if (e->pk == PK_ON) {
+        s_pk_resident -= e->pk_bytes;
+        nv2a_texpack_stats_rw()->resident_bytes = s_pk_resident;
+    }
+    e->pk = (uint8_t)(e->pk_demote ? PK_CAPPED : PK_NONE);
+    e->pk_retry = e->pk_demote ? nv2a_pb_gpu_state()->flips + 600u : 0;
+    e->pk_add = 0;
+    e->pk_demote = 0;
+    e->pk_bytes = 0;
+    e->pk_cut = 0;
+    e->pk_gen = nv2a_texpack_generation();
+}
+
+/* Room for bytes more under the cap: the least recently bound replacements
+ * go back to the title's at their next bind. 0: no room. */
+static int pack_room(uint64_t bytes, const TexEntry *keep)
+{
+    uint64_t cap = nv2a_texpack_cap_bytes();
+    while (s_pk_resident + bytes > cap) {
+        TexEntry *lru = NULL;
+        int i;
+        for (i = 0; i < TEX_CACHE; i++) {
+            TexEntry *c = &s_tc[i];
+            if (c->live && c->pk == PK_ON && !c->pk_demote && c != keep
+                    && (!lru || c->used < lru->used))
+                lru = c;
+        }
+        if (!lru)
+            return 0;
+        lru->pk_demote = 1;
+        s_pk_resident -= lru->pk_bytes;
+        lru->pk_bytes = 0;
+        nv2a_texpack_stats_rw()->demoted++;
+        nv2a_texpack_stats_rw()->resident_bytes = s_pk_resident;
+    }
+    return 1;
+}
+
+static id<MTLTexture> pack_texture(const struct nv2a_texpack_img *img)
+{
+    MTLPixelFormat pf = img->fmt == NV2A_TEXPACK_FMT_BC1 ? MTLPixelFormatBC1_RGBA
+                      : img->fmt == NV2A_TEXPACK_FMT_BC3 ? MTLPixelFormatBC3_RGBA
+                                                         : MTLPixelFormatBGRA8Unorm;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                   width:img->w
+                                                                                  height:img->h
+                                                                               mipmapped:img->levels > 1];
+    id<MTLTexture> tex;
+    const uint8_t *src = img->data;
+    uint32_t l;
+
+    if (img->levels > 1)
+        td.mipmapLevelCount = img->levels;
+    td.usage = MTLTextureUsageShaderRead;
+    tex = [s_dev newTextureWithDescriptor:td];
+    if (!tex)
+        return nil;
+    for (l = 0; l < img->levels; l++) {
+        uint32_t lw = nv2a_texpack_level_dim(img->w, l), lh = nv2a_texpack_level_dim(img->h, l);
+        size_t row = img->fmt == NV2A_TEXPACK_FMT_BGRA8 ? (size_t)lw * 4
+                   : (size_t)((lw + 3) / 4) * (img->fmt == NV2A_TEXPACK_FMT_BC1 ? 8u : 16u);
+        [tex replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l withBytes:src
+               bytesPerRow:row];
+        src += nv2a_texpack_level_bytes(img->fmt, lw, lh);
+    }
+    return tex;
+}
+
+/* The title's level-0 alpha as bytes (NULL when it is all 255), for a
+ * file without alpha or a pack that asks for the title's. */
+static const uint8_t *pack_title_alpha(const Stage *t, const uint8_t *mem)
+{
+    size_t n = (size_t)t->width * t->height, i;
+    const uint32_t *pal = NULL;
+    int any = 0;
+
+    if (n > s_pk_dec_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_pk_dec, n * 4);
+        uint8_t *a = (uint8_t *)realloc(s_pk_alpha, n);
+        if (p)
+            s_pk_dec = p;
+        if (a)
+            s_pk_alpha = a;
+        if (!p || !a)
+            return NULL;
+        s_pk_dec_cap = n;
+    }
+    if (t->color == NV2A_TEX_P8)
+        pal = (const uint32_t *)(mem + t->palette);
+    nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch, 1, pal,
+                    pal ? t->pal_len : 0, s_pk_dec);
+    for (i = 0; i < n; i++) {
+        s_pk_alpha[i] = (uint8_t)(s_pk_dec[i] >> 24);
+        any |= s_pk_alpha[i] != 255;
+    }
+    return any ? s_pk_alpha : NULL;
+}
+
+static void pack_bind(TexEntry *e, const Stage *t, const uint8_t *mem, uint32_t cut)
+{
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
+    struct nv2a_texpack_stats *st = nv2a_texpack_stats_rw();
+    const struct nv2a_texpack_img *img = NULL;
+    struct nv2a_texpack_req rq;
+    id<MTLTexture> nt;
+    uint32_t gen = nv2a_texpack_generation();
+    int r;
+
+    if (e->pk_gen != gen) {        /* the packs changed: look again */
+        if (e->pk_token) {
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+        }
+        e->pk = PK_NONE;
+        e->pk_gen = gen;
+    }
+    switch (e->pk) {
+    case PK_NONE: {
+        uint64_t hash, palh;
+        uint32_t id = 0;
+        pack_init();
+        if (nv2a_tex_size_from_format(t->color) && !stage_signed(t)
+                && nv2a_texpack_key(mem + t->offset, t->color, t->width, t->height, t->pitch,
+                                    mem + t->palette, t->pal_len, &hash, &palh))
+            id = nv2a_texpack_find(hash, palh);
+        if (!id) {
+            e->pk = PK_NO;
+            return;
+        }
+        e->pk_id = id;
+        e->pk = PK_WANT;
+        if (nv2a_texpack_log())
+            fprintf(stderr, "[TEXPACK] seen %016llx%s %ux%u (pack %d), filter 0x%08x, flip %llu\n",
+                    (unsigned long long)hash, palh ? "-pal" : "", t->width, t->height,
+                    nv2a_texpack_pack_of(id), (unsigned)t->filter, (unsigned long long)s_presents);
+    }
+    /* fall through */
+    case PK_WANT:
+        if (g->flips < e->pk_retry)
+            return;
+        memset(&rq, 0, sizeof rq);
+        rq.id = e->pk_id;
+        rq.w = t->width;
+        rq.h = t->height;
+        rq.levels = t->levels;
+        rq.cut = cut;
+        rq.alpha = pack_title_alpha(t, mem);
+        rq.gen = e->pk_gen;          /* the packs the id was found in */
+        e->pk_token = nv2a_texpack_request(&rq);
+        if (!e->pk_token) {            /* the queue is full: a little later */
+            e->pk_retry = g->flips + 15u;
+            return;
+        }
+        e->pk = PK_JOB;
+        e->pk_cut = cut;
+        e->pk_flip = g->flips;
+        return;
+    case PK_JOB:
+        if (e->pk_flip == g->flips)
+            return;
+        e->pk_flip = g->flips;
+        r = nv2a_texpack_poll(e->pk_token, &img);
+        if (r == NV2A_TEXPACK_PENDING)
+            return;
+        if (r != NV2A_TEXPACK_READY) {
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+            e->pk = PK_NO;             /* the title's texture stays */
+            return;
+        }
+        if (!nv2a_texpack_swap_fits(img->bytes, s_pk_left))
+            return;                    /* this flip's upload budget is spent */
+        if (!pack_room(img->bytes, e)) {
+            st->over_cap++;
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+            e->pk = PK_NO;
+            return;
+        }
+        nt = pack_texture(img);
+        if (!nt) {
+            nv2a_texpack_release(e->pk_token);
+            e->pk_token = 0;
+            e->pk = PK_NO;
+            return;
+        }
+        s_pk_left = img->bytes < s_pk_left ? s_pk_left - img->bytes : 0;
+        if (e->tu || e->tu_slot || e->tu_add)
+            tu_detach(e, 0);           /* the upscaler leaves a pack texture alone */
+        [e->tex release];
+        e->tex = nt;
+        e->up_scale = 0;               /* not the 2D scaler's picture any more */
+        e->pend = 0;
+        e->pk_add = (uint8_t)img->add;
+        e->pk_bytes = img->bytes;
+        e->pk = PK_ON;
+        s_pk_resident += img->bytes;
+        st->resident_bytes = s_pk_resident;
+        st->original_bytes += nv2a_tex_texels(t->width, t->height, t->levels) * 4u;
+        st->swaps++;
+        s_tex_uploads++;
+        if (nv2a_texpack_log())
+            fprintf(stderr, "[TEXPACK] swap %ux%u -> %ux%u (%u levels, +%u), %.2f MB, resident %.1f MB, flip %llu\n",
+                    t->width, t->height, img->w, img->h, img->levels, img->add,
+                    (double)img->bytes / 1048576.0, (double)s_pk_resident / 1048576.0,
+                    (unsigned long long)s_presents);
+        nv2a_texpack_release(e->pk_token);
+        e->pk_token = 0;
+        return;
+    default:
+        return;
+    }
+}
+
+/* Once a flip: the swap budget. */
+static void pack_flip(void)
+{
+    static uint64_t last_log;
+    s_pk_left = nv2a_texpack_swap_bytes();
+    if (nv2a_texpack_log() && s_presents - last_log >= 600 && nv2a_texpack_active()) {
+        struct nv2a_texpack_stats x;
+        last_log = s_presents;
+        nv2a_texpack_stats(&x);
+        fprintf(stderr, "[TEXPACK] flip %llu: %llu swaps, %.1f MB resident, %.1f MB held for jobs,"
+                " %llu decoded, %llu from cache, %llu failed, %llu demoted, %llu over the cap,"
+                " decode %.0f ms, compress %.0f ms\n", (unsigned long long)s_presents,
+                (unsigned long long)x.swaps, (double)x.resident_bytes / 1048576.0,
+                (double)x.cpu_bytes / 1048576.0, (unsigned long long)x.decoded,
+                (unsigned long long)x.from_cache, (unsigned long long)x.failed,
+                (unsigned long long)x.demoted, (unsigned long long)x.over_cap, x.decode_ms,
+                x.compress_ms);
+    }
+}
+
+/* ---- graphics.film_upscale (BO-136, nv2a_filmup.h) -------------------------
+ *
+ * A film frame (a linear 640x480 or 640x352 texture whose bytes change from
+ * flip to flip) is filtered once at its upload: a command buffer of its own,
+ * committed at once, so it runs before the frame's (s_cmd is committed at
+ * the flush) and the draws that bind the result read it done. The result
+ * (2x, one level, from the film's ring) replaces the entry's texture; the
+ * draw's own filter fits it to the screen (the coordinates are normalized,
+ * nv2a_backend_common.h's tex_scale, so a larger texture drops in). Off:
+ * film_frame is never called. */
+#define FILM_MAX 2
+static TumFilm *s_film[FILM_MAX];
+static uint64_t s_film_last_ns;
+
+static TumFilm *film_of(uint32_t w, uint32_t h)
+{
+    int i;
+    for (i = 0; i < FILM_MAX; i++)
+        if (s_film[i] && tum_film_w(s_film[i]) == w && tum_film_h(s_film[i]) == h)
+            return s_film[i];
+    for (i = 0; i < FILM_MAX; i++)
+        if (!s_film[i])
+            return s_film[i] = tum_film_new(s_dev, w, h);
+    return NULL;
+}
+
+static void texup_init(void);
+
+static void film_frame(TexEntry *e, const Stage *t, uint64_t flip)
+{
+    int mode = nv2a_filmup_mode(), ran = 0, sample = -1;
+    id<MTLCommandBuffer> cb;
+    id<MTLTexture> out;
+    TumFilm *f;
+    if (t->levels != 1 || stage_signed(t)
+            || !nv2a_filmup_shape(!nv2a_tex_size_from_format(t->color), 0, t->width, t->height)
+            || !nv2a_filmup_changed(flip, &e->film_flip, &e->film_n))
+        return;
+    tum_film_load_async(s_dev);
+    if (mode == NV2A_FILMUP_BEST)
+        texup_init();   /* the FSRCNNX shader files (BO-245's) */
+    if (tum_film_state() != 1 || !(f = film_of(t->width, t->height)))
+        return;
+    cb = [s_queue commandBuffer];
+    out = tum_film_encode(f, cb, e->tex, mode, &ran, &sample);
+    if (!out)
+        return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        double ms = tum_film_sample_ms(sample);
+        if (ms < 0)
+            ms = ([c GPUEndTime] - [c GPUStartTime]) * 1000.0;
+        if ([c status] == MTLCommandBufferStatusCompleted)
+            nv2a_filmup_frame_done(ran, ms);
+    }];
+    [cb commit];
+    [e->tex release];
+    e->tex = [out retain];
+    e->film = (uint8_t)mode;
+}
+
+static void film_flip(void)
+{
+    uint64_t now = xbox_HostNowNs();
+    if (s_film_last_ns)
+        nv2a_filmup_flip(s_presents, (double)(now - s_film_last_ns) / 1e6);
+    s_film_last_ns = now;
+}
+
 static id<MTLTexture> tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -2958,11 +3379,20 @@ static id<MTLTexture> tex_bind(const Stage *t)
     if (e) {
         /* A replaced texture whose variant changed is uploaded again; so is
          * one whose scale is not the one wanted now. */
+        int pk_on = e->pk == PK_ON;
         int stale = (e->rep && e->rep != nv2a_texrep_generation())
-                 || e->scale != want || (want && e->salgo != algo) || e->cut != cut
+                 /* BO-312: a pack texture is not the 2D scaler's, nor made for the
+                  * alpha test of the title's levels; it goes back to the title's
+                  * when the packs change, the budget asks, or an alpha-tested draw
+                  * binds it first now */
+                 || (pk_on && (e->pk_gen != nv2a_texpack_generation() || e->pk_demote
+                               || (cut && !e->pk_cut)))
+                 || (!pk_on && (e->scale != want || (want && e->salgo != algo) || e->cut != cut))
                  /* BO-245: an upscaled texture goes back to the title's when
                   * the setting changes or the memory cap asks for it. */
-                 || (e->tu_add && (e->tgen != nv2a_texup_generation() || e->tu_demote));
+                 || (e->tu_add && (e->tgen != nv2a_texup_generation() || e->tu_demote))
+                 /* BO-136: a filtered film frame when the setting changed. */
+                 || (e->film && e->film != nv2a_filmup_mode());
         if (s_draw_2d)
             e->ui = 1;
         if (e->gen != g->flips || stale) {
@@ -2976,6 +3406,8 @@ static id<MTLTexture> tex_bind(const Stage *t)
                 id<MTLTexture> nt;
                 if (e->tu || e->tu_slot || e->tu_add)
                     tu_detach(e, e->tu == TU_SEEN && h != e->hash);
+                if (e->pk || e->pk_token)
+                    pack_detach(e);
                 tp = prof_t();
                 nt = tex_upload(t, want, algo, cut);
                 prof_add(&s_pa.texup, tp);
@@ -2992,6 +3424,9 @@ static id<MTLTexture> tex_bind(const Stage *t)
                     return s_black;
                 [e->tex release];
                 e->tex = nt;
+                e->film = 0;
+                if (want == 0 && nv2a_filmup_mode() != NV2A_FILMUP_OFF)
+                    film_frame(e, t, g->flips);
                 /* The factor wanted, also when the scaler refused: it is
                  * not asked again until the bytes or the setting change. */
                 e->scale = (uint8_t)want;
@@ -3011,6 +3446,12 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->live = 0;
         if (e->tu || e->tu_slot || e->tu_add)
             tu_detach(e, 0);
+        if (e->pk || e->pk_token) {
+            e->pk_demote = 0;
+            pack_detach(e);
+        }
+        e->pk = PK_NONE;
+        e->pk_retry = 0;
         e->tgen = nv2a_texup_generation();
         {
             uint64_t tp = prof_t();
@@ -3047,16 +3488,23 @@ static id<MTLTexture> tex_bind(const Stage *t)
                                                        t->height, t->pitch);
         e->tex = nt;
         e->live = 1;
+        e->film = 0;
+        e->film_n = 0;
+        e->film_flip = 0;
+        if (want == 0 && nv2a_filmup_mode() != NV2A_FILMUP_OFF)
+            film_frame(e, t, g->flips);
     }
     /* BO-245: graphics.texture_upscale's steps for this texture (Off: only
      * an entry with a job still out). */
-    if (nv2a_texup_algo() || e->tu_slot)
+    if (nv2a_texpack_active() || e->pk)
+        pack_bind(e, t, mem, cut);
+    if ((nv2a_texup_algo() || e->tu_slot) && e->pk != PK_WANT && e->pk != PK_JOB && e->pk != PK_ON)
         texup_bind(e, t, mem);
-    s_bind_tu = e->tu_add;
+    s_bind_tu = e->pk == PK_ON ? e->pk_add : e->tu_add;
     /* Its scaled picture was being made: asked for once a flip, swapped in
      * when it is there, one texture a flip. A new MTLTexture, so a draw encoded with the unscaled
      * one keeps it. */
-    if (e->pend && e->pgen != g->flips && s_swap_flip != g->flips) {
+    if (e->pend && e->pk != PK_ON && e->pgen != g->flips && s_swap_flip != g->flips) {
         e->pgen = g->flips;
         if (!scaled_room(t, e->scale)) {
             e->pend = 0;
@@ -3125,8 +3573,13 @@ static id<MTLSamplerState> sampler(const Stage *t, unsigned scale, int add)
 
     if (point < 0)
         point = recomp_env(RENV_METAL_POINT) != NULL;
-    mn = !point && filter_linear(t->filter, 0);
-    mg = !point && filter_linear(t->filter, 1);
+    /* A replaced texture with levels above the title's (a pack's PNG at 2x,
+     * 4x, the live upscaler's) is filtered linearly even where the title asks
+     * for nearest texels: the title's nearest was for its own texel size
+     * (Burnout 3's Crash Nav zoom tiles, magnified many times), and at a finer
+     * size it only shows smaller blocks (BO-311). */
+    mn = !point && (filter_linear(t->filter, 0) || add > 0);
+    mg = !point && (filter_linear(t->filter, 1) || add > 0);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
     /* A scaled 2D texture (one level in the title) has the levels down to
      * the title's size: blended between, so its look does not step with the
@@ -3247,7 +3700,8 @@ static id<MTLFunction> vs_build(const uint32_t *slots, int n, uint32_t hash,
     snprintf(what, sizeof what, "program %08X", hash);
     if (parsed && msl) {
         d3d8_vsh_parse(slots, n, parsed);
-        if (d3d8_vsh_generate_msl(parsed, D3D8_MSL_SCREEN_SPACE, msl, 65536) <= 0) {
+        if (d3d8_vsh_generate_msl(parsed, D3D8_MSL_SCREEN_SPACE
+                                  | (clip_range_on() ? D3D8_MSL_CLIP_RANGE : 0u), msl, 65536) <= 0) {
             __atomic_add_fetch(&s_compile_errors, 1, __ATOMIC_RELAXED);
             fprintf(stderr, LOGP "%s: no MSL\n", what);
         } else if ((fn = compile_fn(msl, @"vs_main", what)) != nil) {
@@ -4344,6 +4798,93 @@ static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
     return &s_self;
 }
 
+/* The target whose opaque view rt_opaque handed out in s_opaque. */
+static RenderTarget *rt_of_opaque(void)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].opaque && s_rt[i].opaque == s_opaque.tex)
+            return &s_rt[i];
+    return NULL;
+}
+
+/* BO-178: src at its guest size, each texel the area average of the host
+ * texels under it (fs_reduce), for a draw that reads src into a smaller
+ * target (nv2a_rt_reduce_draw). Made again only when src was drawn since;
+ * a pass of its own, so the open one ends. nil when it cannot be made: the
+ * draw reads src as before. */
+static id<MTLTexture> rt_reduced(RenderTarget *src, int opaque)
+{
+    static int failed;
+    float r[4];
+
+    if (failed)
+        return nil;
+    if (src->gtex && (src->gtex.width != src->w || src->gtex.height != src->h)) {
+        [src->gtex release];          /* grown since: an encoded pass keeps its own */
+        src->gtex = nil;
+    }
+    if (src->gtex && src->ggen == src->gen && src->gopaque == opaque)
+        return src->gtex;
+    if (!s_reduce_pso) {
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        NSError *err = nil;
+        pd.vertexFunction = s_vs_clear;
+        pd.fragmentFunction = s_fs_reduce;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        s_reduce_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        [pd release];
+        if (!s_reduce_pso) {
+            failed = 1;
+            XR_ERROR( LOGP "reduction pipeline failed (%s): reductions read the host size\n",
+                    err ? [[err localizedDescription] UTF8String] : "?");
+            return nil;
+        }
+    }
+    if (!src->gtex) {
+        MTLTextureDescriptor *td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               width:src->w height:src->h
+                                                           mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        src->gtex = [s_dev newTextureWithDescriptor:td];
+        if (!src->gtex)
+            return nil;
+    }
+    {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        id<MTLRenderCommandEncoder> e;
+        end_encoder();
+        ensure_cmd();
+        rp.colorAttachments[0].texture = src->gtex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        e = [s_cmd renderCommandEncoderWithDescriptor:rp];
+        r[0] = (float)src->hw / (float)src->w;
+        r[1] = (float)src->hh / (float)src->h;
+        r[2] = opaque ? 1.0f : 0.0f;   /* a 16-bit surface's alpha reads 1 (rt_opaque) */
+        r[3] = 0.0f;
+        [e setRenderPipelineState:s_reduce_pso];
+        [e setFragmentTexture:src->tex atIndex:0];
+        [e setFragmentBytes:r length:sizeof r atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+    }
+    src->ggen = src->gen;
+    src->gopaque = opaque;
+    s_reduce_made++;
+    mf_add('R', src);
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "surface 0x%08X (%ux%u, host %ux%u) read into a smaller"
+                    " target: at its own size (BO-178; RECOMP_DEBUG=rt_reduce=0 is the"
+                    " host size)\n", src->offset, src->w, src->h, src->hw, src->hh);
+    }
+    return src->gtex;
+}
+
 /* ---- draws ------------------------------------------------------------------- */
 
 /* The scissor a draw takes: the surface clip (SET_SURFACE_CLIP_HORIZONTAL/
@@ -4400,6 +4941,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int cull = 0, cull_all = 0, zb_split = 0;
     float zbias = 0.0f, zb_applied = 0.0f;
     int solo = 0;                 /* BO-203: stage 0 is a stage0_only HDR picture */
+    int wide = 0;                 /* BO-385: a line list drawn as quads (vs_pass) */
+    int prog = d->program;        /* the batch runs its program on the GPU */
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
@@ -4465,7 +5008,14 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             const uint32_t *tr = nv2a_pb_tex_regs();
             for (k = 0; k < 4; k++) {
                 const uint32_t *r = &tr[(0x40u * k + 0x28u) / 4];
-                memcpy(mpc.bump_mat[k], r, 16);
+                /* The method's words are 00, 01, 11, 10 (xemu pgraph.c
+                 * SET_TEXTURE_SET_BUMP_ENV_MAT's swizzle into
+                 * NV_PGRAPH_BUMPMAT*); the shader takes 00, 01, 10, 11, as
+                 * xemu's psh.c uploads bumpMat (BO-332). */
+                memcpy(&mpc.bump_mat[k][0], &r[0], 4);
+                memcpy(&mpc.bump_mat[k][1], &r[1], 4);
+                memcpy(&mpc.bump_mat[k][2], &r[3], 4);
+                memcpy(&mpc.bump_mat[k][3], &r[2], 4);
                 memcpy(&mpc.bump_lum[k][0], &r[4], 4);
                 memcpy(&mpc.bump_lum[k][1], &r[5], 4);
                 mpc.bump_lum[k][2] = mpc.bump_lum[k][3] = 0.0f;
@@ -4501,10 +5051,20 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             s_draws_skipped++;
             return;
         }
+        /* BO-385: a line one guest pixel wide at any render scale, as two
+         * triangles a segment through vs_pass (nv2a_lines_expand). */
+        if (nv2a_wide_lines(v, topo, rt->w, rt->hw)) {
+            wide = 1;
+            prog = 0;
+            vfn = s_vs_pass;
+            vid = PC_VS_PASS;
+            nf4 = VTX_F4;
+            topo = NV2A_TOPO_TRIANGLES;
+        }
         ptype = topo == NV2A_TOPO_POINTS ? MTLPrimitiveTypePoint
               : topo == NV2A_TOPO_LINES  ? MTLPrimitiveTypeLine
               :                            MTLPrimitiveTypeTriangle;
-        if (v->cull_enable) {     /* as the D3D11 backend's rasterizer_state */
+        if (v->cull_enable && !wide) {     /* as the D3D11 backend's rasterizer_state */
             if (v->cull_face == 0x405)      cull = 1;   /* BACK */
             else if (v->cull_face == 0x404) cull = 2;   /* FRONT */
             else if (v->cull_face == 0x408) cull_all = 1;
@@ -4515,13 +5075,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
 
         /* Rings first: an overflow flushes, which ends the open pass. */
+        if (wide)
+            count = 2u * nidx;            /* four corners a segment */
         vbytes = (NSUInteger)count * nf4 * 16u;
         if (vbytes < 16)
             vbytes = 16;
         vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos, vbytes, &vb_off);
         {
             uint64_t fl = s_flushes;
-            ip = vf ? ring_alloc(s_ib, s_ib_size, &s_ib_pos, (NSUInteger)nidx * 4u, &ib_off)
+            ip = vf ? ring_alloc(s_ib, s_ib_size, &s_ib_pos,
+                                 (NSUInteger)(wide ? 3u * nidx : nidx) * 4u, &ib_off)
                     : NULL;
             if (vf && ip && fl != s_flushes) {
                 /* The index ring overflowed after the vertices were placed,
@@ -4535,9 +5098,19 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* Each input as float4, fetched as the CPU path does; a disabled
          * one (or one without data) is its SET_VERTEX_DATA value. */
-        nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
-                        (const uint8_t *)xbox_GetMemoryOffset(), vf);
-        memcpy(ip, idx, (size_t)nidx * 4u);
+        if (wide) {
+            nidx = nv2a_lines_expand(d, v, idx, nidx, lo, hi - lo + 1,
+                                     (const uint8_t *)xbox_GetMemoryOffset(), vf,
+                                     (uint32_t *)ip);
+            if (!nidx) {
+                s_draws_skipped++;
+                return;
+            }
+        } else {
+            nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
+                            (const uint8_t *)xbox_GetMemoryOffset(), vf);
+            memcpy(ip, idx, (size_t)nidx * 4u);
+        }
 
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
 
@@ -4580,6 +5153,19 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 } else if ((t->mode == 3 || !stage_signed(t))
                            && (src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
+                    /* BO-178: a reduction reads the title-size copy; the
+                     * coordinates below are the same for it. */
+                    RenderTarget *own = src == &s_opaque ? rt_of_opaque() : src;
+                    if (own && own >= s_rt && own < s_rt + RT_MAX
+                            && nv2a_rt_reduce_draw(own->w, own->h, own->hw, own->hh,
+                                                   rt->w, rt->h)
+                            && nv2a_rt_reduce_on(nv2a_pb_gpu_state()->flips)) {
+                        id<MTLTexture> gt = rt_reduced(own, src == &s_opaque);
+                        if (gt) {
+                            stex[k] = gt;
+                            s_reduce_binds++;
+                        }
+                    }
                     /* Linear coordinates are texels of the surface as drawn. */
                     if (!nv2a_tex_size_from_format(t->color)) {
                         mpc.b.tex_scale[k][0] = 1.0f / (float)src->w;
@@ -4670,7 +5256,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
         }
         [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
-        if (d->program) {
+        if (prog) {
             /* c[192] is 3 KB: under setVertexBytes' 4 KB. */
             [s_enc setVertexBytes:v->c length:sizeof v->c atIndex:1];
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
@@ -4686,7 +5272,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         if (zb_split) {
             vc.c[3] -= zb_applied;
-            if (d->program)
+            if (prog)
                 [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
             else
                 [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
@@ -4696,7 +5282,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         s_draws++;
         rt->gen = ++s_rt_seq;
-        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X') {
+        if (s_mf_on > 0 && s_mf_n && s_mf[s_mf_n - 1].kind != 'X' && s_mf[s_mf_n - 1].kind != 'R') {
             s_mf[s_mf_n - 1].draws++;
             s_mf[s_mf_n - 1].idx += (uint32_t)nidx;
         }
@@ -4924,8 +5510,10 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
         s_ib_pos = ib;
         if (rt->hw == rt->w)
             write_back(rt, rt->addr, pitch);
-        else if ((px = host_readback(rt)) != NULL)
+        else if ((px = host_readback(rt)) != NULL) {
+            nv2a_pb_dump_host_px(px, rt->hw, rt->hh);
             write_back_scaled(rt, px, rt->addr, pitch);
+        }
         rt->dirty = 0;
         rt_own_reset(rt);
     }
@@ -5938,6 +6526,8 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
             frame_advance();
             prof_add(&s_pa.wait, t);
             texup_flip();   /* BO-245: chunks after the frame, swaps budgeted */
+            pack_flip();    /* BO-312: the pack swaps' upload budget */
+            film_flip();    /* BO-136: the films' cost numbers */
         }
     }
     hdr_flip();
@@ -5971,8 +6561,12 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
                 s_layer ? "CAMetalLayer slots" : "texture readback",
                 (unsigned long long)s_flushes, (unsigned long long)s_report_commits,
                 frames_in_flight(), (unsigned long long)s_frame_waits);
-    if (s_presents == 1 || (s_presents % 300) == 0)
+    if (s_presents == 1 || (s_presents % 300) == 0) {
         pc_log(s_presents);
+        if (s_reduce_made)
+            fprintf(stderr, LOGP "BO-178 reductions: %llu title-size copies made, %llu binds\n",
+                    (unsigned long long)s_reduce_made, (unsigned long long)s_reduce_binds);
+    }
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {

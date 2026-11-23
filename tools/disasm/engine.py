@@ -293,6 +293,35 @@ class DisasmEngine:
                     break
                 entries += 1
             start = tbl
+            if entries == 0:
+                # Indexed from slot 1 (upstream f820d2f). MSVC's memcpy/memmove
+                # dispatch their lead bytes through
+                #
+                #     jmp  [eax*4 + LeadUpVec - 4]      ; eax 1..3
+                #
+                # so slot 0 is whatever sits in front of the table (the tail
+                # of the previous jmp, a nop) and is never read. The lifter
+                # already reads one slot on (_analyze_switch_table); measure
+                # the table from there too, or the function ends at its own
+                # dispatch and every arm after the table becomes an indirect
+                # jump nothing resolves (upstream: MechAssault's memmove at
+                # 0x001D0580 ended at 0x001D05E4). Slot 0 stays code. Arms sit
+                # near each other, so only targets close to the first count.
+                first = self.image.read_u32_at_va(tbl + 4)
+                ahead = 0
+                while (first is not None and lo <= first < hi
+                       and ahead < max_entries):
+                    slot = tbl + 4 + ahead * 4
+                    if slot in self.byte_tables:
+                        break
+                    target = self.image.read_u32_at_va(slot)
+                    if (target is None or not (lo <= target < hi)
+                            or abs(target - first) > 0x400):
+                        break
+                    ahead += 1
+                if ahead >= min_entries:
+                    start = tbl + 4
+                    entries = ahead + 1      # end = tbl + entries * 4, below
             if entries < min_entries:
                 # A table indexed downward from its displacement. MSVC's
                 # memcpy/memmove unwind their last dwords with

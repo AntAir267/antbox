@@ -62,7 +62,13 @@ static void test_keycodes(void)
         { SDLK_LEFT, 0x25 }, { SDLK_UP, 0x26 }, { SDLK_RIGHT, 0x27 }, { SDLK_DOWN, 0x28 },
         { SDLK_ESCAPE, 0x1B }, { SDLK_SPACE, 0x20 },
         { SDLK_KP_2, 0 }, { SDLK_KP_8, 0 },    /* the keypad is not in the map any more */
-        { SDLK_F1, 0 }, { SDLK_F12, 0 }, { SDLK_LGUI, 0 }, { SDLK_KP_5, 0 }, { SDLK_TAB, 0 },
+        { SDLK_F1, 0 }, { SDLK_F12, 0 }, { SDLK_LGUI, 0 }, { SDLK_KP_5, 0 },
+        /* the keys a player may bind (keyboard.h) */
+        { SDLK_TAB, 0x09 }, { SDLK_PAGEUP, 0x21 }, { SDLK_PAGEDOWN, 0x22 }, { SDLK_END, 0x23 },
+        { SDLK_HOME, 0x24 }, { SDLK_INSERT, 0x2D }, { SDLK_SEMICOLON, 0xBA }, { SDLK_EQUALS, 0xBB },
+        { SDLK_COMMA, 0xBC }, { SDLK_MINUS, 0xBD }, { SDLK_PERIOD, 0xBE }, { SDLK_SLASH, 0xBF },
+        { SDLK_BACKQUOTE, 0xC0 }, { SDLK_LEFTBRACKET, 0xDB }, { SDLK_BACKSLASH, 0xDC },
+        { SDLK_RIGHTBRACKET, 0xDD }, { SDLK_QUOTE, 0xDE }, { SDLK_DELETE, 0 },
     };
     for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++)
         CHECK(xbox_InputSdlKeyToVk(rows[i].sym) == rows[i].vk,

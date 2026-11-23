@@ -34,12 +34,32 @@ class Instruction:
     # Operand details (populated from Capstone)
     operands: list = field(default_factory=list)
 
+    # The LOCK prefix. Capstone spells it into the mnemonic ("lock add"), and
+    # every table in the lifter and the translator is keyed on the bare
+    # mnemonic, so a locked instruction matched nothing: "lock add" was not
+    # "add" to the dispatch (it fell through to RECOMP_UNIMPL and the add was
+    # dropped), not a flag setter to the tracker, not CF-tracked. The prefix
+    # is taken off here, once, and kept as this flag; the lifter emits the
+    # memory read-modify-write atomically when it is set.
+    locked: bool = False
+
     # Resolved targets
     call_target: Optional[int] = None
     jump_target: Optional[int] = None
     memory_refs: list = field(default_factory=list)
     imm_values: list = field(default_factory=list)
     regs_written: list = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.mnemonic.startswith("lock "):
+            self.mnemonic = self.mnemonic[5:]
+            self.locked = True
+
+    @property
+    def text(self):
+        """The instruction as the disassembly spells it, prefix included."""
+        return (f"{'lock ' if self.locked else ''}{self.mnemonic} "
+                f"{self.op_str}").strip()
 
     @property
     def is_call(self):

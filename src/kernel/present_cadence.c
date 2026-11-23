@@ -32,7 +32,9 @@ int pc_setting(const char *text)
 {
     if (!text)
         return PC_SET_LEGACY;
-    if (!strcmp(text, "auto"))
+    if (!strcmp(text, "auto") || !strcmp(text, "link"))
+        return PC_SET_LINK;
+    if (!strcmp(text, "aimed"))
         return PC_SET_AUTO;
     if (!strcmp(text, "lock"))
         return PC_SET_LOCK;
@@ -50,6 +52,8 @@ int pc_pick(const pc_display *d, int setting)
         return PC_LEGACY;
     case PC_SET_TIMED:
         return PC_TIMED;
+    case PC_SET_LINK:
+        return PC_LINK;
     case PC_SET_LOCK:
         /* A lock needs a grid: without a rate there is none. */
         return d && d->refresh_hz > 0.0 ? PC_LOCK : PC_TIMED;
@@ -67,6 +71,7 @@ const char *pc_strategy_name(int strategy)
     case PC_LOCK:      return "lock";
     case PC_TIMED:     return "timed";
     case PC_TIMED_ODD: return "timed (not a multiple of 60)";
+    case PC_LINK:      return "display link";
     default:           return "legacy";
     }
 }
@@ -100,10 +105,32 @@ void pc_pacer_set_handover(pc_pacer *p, uint64_t handover_ns)
     p->handover_ns = handover_ns;
 }
 
+uint64_t pc_pacer_lead_max(const pc_pacer *p)
+{
+    uint64_t m = PC_LEAD_MAX_NS;
+    if (p->frame_ns && p->frame_ns * PC_INFLIGHT > PC_INFLIGHT_MARGIN_NS) {
+        uint64_t f = p->frame_ns * PC_INFLIGHT - PC_INFLIGHT_MARGIN_NS;
+        if (f < m)
+            m = f;
+    }
+    return m;
+}
+
+void pc_pacer_set_frame(pc_pacer *p, uint64_t frame_ns)
+{
+    uint64_t m;
+    p->frame_ns = frame_ns;
+    m = pc_pacer_lead_max(p);
+    if (p->lead_ns > m)
+        p->lead_ns = m;
+}
+
 void pc_pacer_relearn(pc_pacer *p)
 {
     p->depth = p->depth0;
     p->lead_ns = p->lead0_ns;
+    if (p->lead_ns > pc_pacer_lead_max(p))
+        p->lead_ns = pc_pacer_lead_max(p);
     p->grace = PC_GRACE_FRAMES;
     p->decay_frames = PC_DECAY_FRAMES;
     p->since_back = 1 << 30;
@@ -186,6 +213,8 @@ int pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns)
 {
     int raised = 0;
 
+    uint64_t prev_glass = p->grid_ns;    /* the frame shown before this one */
+
     if (!glass_ns)
         return 0;
     if (p->strategy == PC_LOCK || p->strategy == PC_TIMED_ODD)
@@ -194,9 +223,15 @@ int pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns)
         p->grace--;
     else if (aim && aim->target_ns && !aim->late) {
         if (p->strategy == PC_LOCK && glass_ns > aim->target_ns + p->period_ns / 2) {
-            p->slips++;
-            p->slips_all++;
-            p->calm = 0;
+            /* Late. Its refresh taken by the frame before it (shown at or
+             * after this one's target): forced, not a slip of its own. */
+            if (prev_glass && prev_glass + p->period_ns / 4 >= aim->target_ns) {
+                p->forced_all++;
+            } else {
+                p->slips++;
+                p->slips_all++;
+                p->calm = 0;
+            }
         } else if (p->strategy == PC_LOCK && glass_ns + p->period_ns / 2 < aim->target_ns) {
             /* Shown before its refresh: the hand-over named an earlier one. */
             p->earlies_all++;
@@ -241,7 +276,7 @@ int pc_pacer_glass(pc_pacer *p, const pc_aim *aim, uint64_t glass_ns)
         p->calm = 0;
         p->frames = p->slips = 0;
     } else if (p->strategy == PC_TIMED && p->lates >= PC_LATES_RAISE) {
-        if (p->lead_ns + PC_LEAD_STEP_NS <= PC_LEAD_MAX_NS) {
+        if (p->lead_ns + PC_LEAD_STEP_NS <= pc_pacer_lead_max(p)) {
             p->lead_ns += PC_LEAD_STEP_NS;
             p->raised++;
             raised = 1;
@@ -261,6 +296,171 @@ uint64_t pc_pacer_lock_report(const pc_pacer *p, uint64_t glass_ns)
     if (p->strategy != PC_LOCK || !glass_ns || glass_ns <= p->phase_ns)
         return 0;
     return glass_ns - p->phase_ns;
+}
+
+/* ── the display link ────────────────────────────────────── */
+
+void pc_link_init(pc_link *l, uint64_t phase_ns, uint64_t guard_ns)
+{
+    memset(l, 0, sizeof *l);
+    l->phase_ns = l->phase0_ns = phase_ns;
+    l->guard_ns = guard_ns;
+    l->grace = PC_GRACE_FRAMES;
+    l->decay_frames = PC_DECAY_FRAMES;
+    l->since_back = 1 << 30;
+    l->slack_ns = PC_LINK_SLACK_AUTO;
+}
+
+void pc_link_reset(pc_link *l)
+{
+    l->n_iv = l->i_iv = 0;
+    l->n_ld = l->i_ld = 0;
+    l->period_ns = 0;
+    l->lead_ns = 0;
+    l->last_tpt_ns = 0;
+    l->grace = PC_GRACE_FRAMES;
+    l->frames = l->misses = 0;
+    l->calm = 0;
+}
+
+uint64_t pc_link_phase_max(const pc_link *l)
+{
+    /* At most the period less the guard and 1 ms: the vblank stays after
+     * the deadline of the refresh before. Never under the phase asked. */
+    uint64_t m = l->period_ns > l->guard_ns + 1000000ull
+               ? l->period_ns - l->guard_ns - 1000000ull : 0;
+    return m > l->phase0_ns ? m : l->phase0_ns;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+uint64_t pc_link_tick(pc_link *l, uint64_t tt_ns, uint64_t tpt_ns, int prev_empty,
+                      uint64_t *period_ns)
+{
+    if (l->last_tpt_ns && tpt_ns > l->last_tpt_ns) {
+        uint64_t d = tpt_ns - l->last_tpt_ns;
+        if (d >= 2000000ull && d <= 50000000ull) {
+            l->iv[l->i_iv] = d;
+            l->i_iv = (l->i_iv + 1) % PC_LINK_IV;
+            if (l->n_iv < PC_LINK_IV)
+                l->n_iv++;
+            if (l->n_iv >= 5) {
+                /* The median: a callback the system left out (two
+                 * refreshes) or a late one does not move it. */
+                uint64_t s[PC_LINK_IV];
+                memcpy(s, l->iv, sizeof s[0] * (size_t)l->n_iv);
+                qsort(s, (size_t)l->n_iv, sizeof s[0], cmp_u64);
+                l->period_ns = s[l->n_iv / 2];
+            }
+        }
+    }
+    l->last_tpt_ns = tpt_ns;
+    if (l->phase_ns > pc_link_phase_max(l))
+        l->phase_ns = pc_link_phase_max(l);
+    l->prev_empty = prev_empty;
+    *period_ns = l->period_ns;
+    /* The link's lead (deadline to glass): the median of its last ones, so
+     * one odd callback does not move the slack, and with it the grid the
+     * vblank is reported on. */
+    if (tpt_ns > tt_ns && tpt_ns - tt_ns <= 100000000ull) {
+        l->ld[l->i_ld] = tpt_ns - tt_ns;
+        l->i_ld = (l->i_ld + 1) % PC_LINK_IV;
+        if (l->n_ld < PC_LINK_IV)
+            l->n_ld++;
+        if (l->n_ld >= 5) {
+            uint64_t s[PC_LINK_IV];
+            memcpy(s, l->ld, sizeof s[0] * (size_t)l->n_ld);
+            qsort(s, (size_t)l->n_ld, sizeof s[0], cmp_u64);
+            l->lead_ns = s[l->n_ld / 2];
+        } else {
+            l->lead_ns = tpt_ns - tt_ns;
+        }
+    }
+    /* The slack this refresh leaves room for: the deadline stays at least
+     * PC_LINK_SLACK_ROOM_NS before its time on the glass. */
+    {
+        uint64_t room = tpt_ns > tt_ns + PC_LINK_SLACK_ROOM_NS
+                      ? tpt_ns - tt_ns - PC_LINK_SLACK_ROOM_NS : 0;
+        uint64_t want = l->slack_ns;
+        if (want == PC_LINK_SLACK_AUTO)
+            want = l->lead_ns > PC_LINK_COMMIT_MIN_NS ? l->lead_ns - PC_LINK_COMMIT_MIN_NS : 0;
+        l->slack_eff_ns = want < room ? want : room;
+    }
+    tt_ns += l->slack_eff_ns;
+    /* For pc_link_frame: the refresh before this one. */
+    l->prev_tt_ns = l->cur_tt_ns;
+    l->cur_tt_ns = tt_ns;
+    return tt_ns > l->phase_ns ? tt_ns - l->phase_ns : 0;
+}
+
+void pc_link_set_slack(pc_link *l, uint64_t slack_ns)
+{
+    l->slack_ns = slack_ns;
+}
+
+uint64_t pc_link_deadline(const pc_link *l)
+{
+    return l->cur_tt_ns;
+}
+
+uint64_t pc_link_take_until(const pc_link *l, uint64_t tt_ns)
+{
+    return tt_ns > l->guard_ns ? tt_ns - l->guard_ns : tt_ns;
+}
+
+int pc_link_stale(const pc_link *l, uint64_t vblank_ns)
+{
+    return vblank_ns && l->prev_tt_ns && vblank_ns < pc_link_take_until(l, l->prev_tt_ns);
+}
+
+int pc_link_frame(pc_link *l, uint64_t vblank_ns, int locked, int *missed)
+{
+    int moved = 0, miss = 0;
+    l->frames_all++;
+    if ((l->prev_empty || locked) && pc_link_stale(l, vblank_ns))
+        miss = 1;
+    if (missed)
+        *missed = miss;
+    if (l->grace > 0) {
+        l->grace--;
+        return 0;
+    }
+    if (miss) {
+        l->misses++;
+        l->misses_all++;
+        l->calm = 0;
+    }
+    l->frames++;
+    if (l->since_back < (1 << 30))
+        l->since_back++;
+    if (++l->calm >= l->decay_frames) {
+        l->calm = 0;
+        if (l->phase_ns > l->phase0_ns) {
+            l->phase_ns = l->phase_ns - l->phase0_ns >= PC_LINK_STEP_NS
+                        ? l->phase_ns - PC_LINK_STEP_NS : l->phase0_ns;
+            l->lowered++;
+            l->since_back = 0;
+            moved = -1;
+        }
+    }
+    if (l->misses >= PC_LINK_MISSES_RAISE) {
+        if (l->phase_ns + PC_LINK_STEP_NS <= pc_link_phase_max(l)) {
+            l->phase_ns += PC_LINK_STEP_NS;
+            l->raised++;
+            moved = 1;
+            if (l->since_back <= 2 * PC_SLIP_WINDOW && l->decay_frames < PC_DECAY_MAX)
+                l->decay_frames *= 2;
+        }
+        l->calm = 0;
+        l->frames = l->misses = 0;
+    }
+    if (l->frames >= PC_SLIP_WINDOW)
+        l->frames = l->misses = 0;
+    return moved;
 }
 
 /* ── the statistics ──────────────────────────────────────── */

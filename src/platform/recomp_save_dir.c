@@ -12,6 +12,7 @@
  */
 #include "recomp_save_dir.h"
 #include "recomp_env.h"
+#include "recomp_exe_dir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -487,11 +488,26 @@ static int same_tree(const char *a, const char *b)
 
 /* ── the API ───────────────────────────────────────────────────────── */
 
+int recomp_portable_user_dir(const char *root, int kind, char *out, unsigned out_size)
+{
+    int w;
+
+    if (!root || !*root || !out)
+        return 0;
+    w = snprintf(out, out_size, "%s%s", root,
+                 kind == RECOMP_DIR_DATA ? "/Saves" : kind == RECOMP_DIR_CACHE ? "/cache" : "");
+    return w > 0 && (unsigned)w < out_size;
+}
+
 int recomp_user_dir(int kind, const char *name, char *out, unsigned out_size)
 {
     int w;
 #if defined(_WIN32)
-    const char *base = getenv(kind == RECOMP_DIR_DATA ? "APPDATA" : "LOCALAPPDATA");
+    char portable[RS_PATH];
+    const char *base;
+    if (recomp_portable_root(portable, sizeof portable))
+        return recomp_portable_user_dir(portable, kind, out, out_size);
+    base = getenv(kind == RECOMP_DIR_DATA ? "APPDATA" : "LOCALAPPDATA");
     w = snprintf(out, out_size, kind == RECOMP_DIR_CACHE ? "%s/%s/cache" : "%s/%s",
                  base && *base ? base : ".", name);
 #elif defined(__APPLE__)
@@ -503,6 +519,11 @@ int recomp_user_dir(int kind, const char *name, char *out, unsigned out_size)
     const char *xdg = getenv(kind == RECOMP_DIR_CACHE ? "XDG_CACHE_HOME" : "XDG_DATA_HOME");
     const char *home = getenv("HOME");
     size_t i;
+#if defined(__linux__) && !defined(__ANDROID__)
+    char portable[RS_PATH];
+    if (recomp_portable_root(portable, sizeof portable))
+        return recomp_portable_user_dir(portable, kind, out, out_size);
+#endif
     for (i = 0; name[i] && i + 1 < sizeof lower; i++)
         lower[i] = (char)tolower((unsigned char)name[i]);
     lower[i] = '\0';

@@ -13,6 +13,16 @@ extern "C" {
 
 typedef struct MCPXAPUState MCPXAPUState;
 
+/* One line of a hang report's APU state dump (BO-351). `emit` is
+ * xbox_crash_printf in a report; a test passes its own capturer. */
+typedef void (*mcpx_apu_emit_fn)(const char *fmt, ...);
+
+/* A few lines of the APU's own view of itself, for a hang report: the front
+ * end, the interrupt line, frames rendered, trap/delivery counters, and every
+ * voice still in a list. Runs unlocked (a crash note: the process is stuck), so
+ * it only reads. */
+void mcpx_apu_dump_state(MCPXAPUState *d, mcpx_apu_emit_fn emit);
+
 /* Initialize the APU emulation.
  * ram_ptr: pointer to the base of Xbox physical RAM (64MB).
  * Returns the APU state, or NULL on failure. */
@@ -26,6 +36,13 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
+/* The frame thread's step after each frame (and the trapped wait): a pending
+ * notification or trap (set_irq) becomes the interrupt line. d->lock held. */
+void mcpx_apu_frame_irq(MCPXAPUState *d);
+/* Tests only (tests/apu_irq, BO-351): called inside update_irq on the way to
+ * lowering the line, after it has found nothing pending and before it clears
+ * GINTSTS. NULL in the game. */
+extern void (*mcpx_apu_irq_lower_hook)(MCPXAPUState *d);
 
 /* RECOMP_APU_FAULT_BENCH: time n trapped reads of PIO_FREE through the page
  * fault + VEH + decoder path; prints one line, returns us per access (0 if

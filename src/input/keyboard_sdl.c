@@ -43,6 +43,24 @@ int xbox_InputSdlKeyToVk(int key)
     case SDLK_RIGHT:     return XBOX_VK_RIGHT;
     case SDLK_ESCAPE:    return XBOX_VK_ESCAPE;
     case SDLK_SPACE:     return XBOX_VK_SPACE;
+    /* The keys a player may bind (keyboard.h): Windows' own codes. */
+    case SDLK_TAB:       return XBOX_VK_TAB;
+    case SDLK_PAGEUP:    return 0x21;
+    case SDLK_PAGEDOWN:  return 0x22;
+    case SDLK_END:       return 0x23;
+    case SDLK_HOME:      return 0x24;
+    case SDLK_INSERT:    return 0x2D;
+    case SDLK_SEMICOLON: return 0xBA;
+    case SDLK_EQUALS:    return 0xBB;
+    case SDLK_COMMA:     return 0xBC;
+    case SDLK_MINUS:     return 0xBD;
+    case SDLK_PERIOD:    return 0xBE;
+    case SDLK_SLASH:     return 0xBF;
+    case SDLK_BACKQUOTE: return 0xC0;
+    case SDLK_LEFTBRACKET:  return 0xDB;
+    case SDLK_BACKSLASH: return 0xDC;
+    case SDLK_RIGHTBRACKET: return 0xDD;
+    case SDLK_QUOTE:     return 0xDE;
     }
     return 0;
 }

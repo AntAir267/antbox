@@ -100,6 +100,10 @@ int main(void)
     /* The same variant again: the generation stays. */
     nv2a_texrep_set_variant(0);
     CHECK(nv2a_texrep_generation() == gen2);
+    /* The pictures were redrawn under the same variant (nv2a_texrep_refresh): the generation moves on. */
+    nv2a_texrep_refresh();
+    CHECK(nv2a_texrep_generation() != gen2 && nv2a_texrep_generation() != 0);
+    gen2 = nv2a_texrep_generation();
 
     /* A variant with no image, and one past the table: the title's texels. */
     nv2a_texrep_set_variant(2);

@@ -574,6 +574,12 @@ static void test_enhance_init(void)
     CHECK(xbox_enhance_init(".", NULL) == 0);
     CHECK(s_xc_video == XC_VIDEO_AV_WIDESCREEN && s_smc_mode == SMC_VIDEO_MODE_SCART);
     CHECK(o->present_aspect == NV2A_ASPECT_16_9);
+    /* 16:10 (BO-271): the same EEPROM bit, auto shows 16:10. */
+    recomp_env_set(RENV_DISPLAY_WIDESCREEN, "16:10");
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    CHECK(s_xc_video == XC_VIDEO_AV_WIDESCREEN && o->present_aspect == NV2A_ASPECT_16_10);
+    recomp_env_set(RENV_DISPLAY_WIDESCREEN, "1");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_aspect == NV2A_ASPECT_16_9);
     /* An explicit aspect wins over auto. */
     recomp_env_set(RENV_PRESENT_ASPECT, "frame");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_aspect == NV2A_ASPECT_FRAME);

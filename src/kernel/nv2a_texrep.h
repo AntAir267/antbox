@@ -92,6 +92,12 @@ void     nv2a_texrep_set_variant(int v);
 int      nv2a_texrep_variant(void);
 /* Never 0; changes whenever what apply() would do changes. */
 uint32_t nv2a_texrep_generation(void);
+/* The pictures a variant points at were redrawn (a title's prompts that follow
+ * the player's own key bindings): the generation moves on, and every texture
+ * of the registered ones that is already on the GPU is uploaded again. Any
+ * thread. A variant's image must stay as it was until the backends have taken
+ * it: a title keeps a few buffers and writes the one that is not in use. */
+void     nv2a_texrep_refresh(void);
 
 /* The hash a registered texture is known by: its level-0 guest bytes
  * (nv2a_tex_extent of one level), whatever number of levels a backend
@@ -229,13 +235,11 @@ int nv2a_texrep_hdr_probes(void);
 int nv2a_texrep_hdr_probe_index(uint64_t hash);
 uint64_t nv2a_texrep_hdr_probe_hash(int i);   /* 0: none */
 
-/* RECOMP_DEBUG=texrep_dump=<dir> (read by apply): every texture a backend
- * uploads, once per content, as <dir>/<hash>_<w>x<h>_f<color>.tga (level 0,
- * A8R8G8B8 as decoded, before any replacement), with one line per file in
- * <dir>/index.tsv. The hash is nv2a_texrep_hash, the one to register. A
- * debug aid for finding a title's textures: the files are the title's own
- * pictures and stay on the machine that made them. With it on every upload
- * is hashed. */
+/* RECOMP_DEBUG=texrep_dump=<dir>: the dump is nv2a_texpack_dump (nv2a_texpack.h,
+ * BO-312), called by the backends before any replacement: every texture they
+ * decode, once per content, as the PNG file a texture pack uses
+ * (<hash>.png, P8: <hash>-<palette>.png), with <dir>/index.tsv. The hash is
+ * nv2a_texrep_hash, the one to register. */
 
 #ifdef __cplusplus
 }

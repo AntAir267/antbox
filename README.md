@@ -1,11 +1,11 @@
-# antbox
+# AntBox
 
 A shared toolkit for statically recompiling original Xbox games into native programs. The
 game's x86 code becomes C and runs natively, and the Xbox kernel is replaced by native code.
 The graphics and sound chips and USB pads the game's libraries talk to are still simulated
 in software.
 
-**antbox is a fork of the `takedawn` branch of
+**AntBox is a fork of the `takedawn` branch of
 [xenophobentx/xboxrecomp](https://github.com/xenophobentx/xboxrecomp/tree/takedawn), the
 toolkit of [Takedawn](https://github.com/xenophobentx/takedawn).** GitHub doesn't show that
 link because this repository started fresh, so it's stated here; see
@@ -17,7 +17,7 @@ It's what these ports are built on:
 - Double-S.T.E.A.L 2: Second Clash
 - MechAssault 2: Lone Wolf
 
-**antbox contains no game.** There are no game files, executables or generated code from a
+**AntBox contains no game.** There are no game files, executables or generated code from a
 game here. To build a port, you need your own copy of the game.
 
 ## What's different from xboxrecomp
@@ -40,7 +40,7 @@ game here. To build a port, you need your own copy of the game.
 
 ## Building
 
-antbox is a library: the executable lives in your game's own project, which starts from
+AntBox is a library: the executable lives in your game's own project, which starts from
 `templates/new-game`. The pipeline (XBE parsing, disassembly, lifting to C) needs Python
 3.10+ and `capstone`. The build needs CMake, Clang or GCC, SDL2, the Vulkan headers and
 glslang; without the last two, CMake quietly leaves the Vulkan backends out.
@@ -70,7 +70,7 @@ repository, and each change is copied here after it passes the checks of the gam
 
 ## Credits and license
 
-antbox is built on [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp), through
+AntBox is built on [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp), through
 [apexJCL/xboxrecomp](https://github.com/apexJCL/xboxrecomp) and the `takedawn` branch of
 [xenophobentx/xboxrecomp](https://github.com/xenophobentx/xboxrecomp), the toolkit of
 [Takedawn](https://github.com/xenophobentx/takedawn). [CONTRIBUTORS.md](CONTRIBUTORS.md)

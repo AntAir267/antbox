@@ -334,6 +334,26 @@ int enhance_cfg_bool(const char *key, int def)
     return recomp_cfg_bool(s_file[f], key, def);
 }
 
+int enhance_widescreen(int *is_1610)
+{
+    Bind *b;
+    recomp_cfg_type t;
+    const char *v = env_of("display.widescreen", &b);
+    int f;
+
+    *is_1610 = 0;
+    if (v && word_is(v, "16:10")) {
+        *is_1610 = 1;
+        return 1;
+    }
+    if (!v && (f = file_of("display.widescreen", &t)) >= 0 && t == RCFG_STRING &&
+        !strcmp(recomp_cfg_string(s_file[f], "display.widescreen", ""), "16:10")) {
+        *is_1610 = 1;
+        return 1;
+    }
+    return enhance_cfg_bool("display.widescreen", 0);
+}
+
 int enhance_cfg_choice(const char *key, const char *const *choices, int def)
 {
     Bind *b;

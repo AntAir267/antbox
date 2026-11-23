@@ -195,34 +195,123 @@ int xbox_WakeOrdinalBlocks(uint32_t ordinal)
     }
 }
 
-void xbox_WakeSignalled(const void *object, uint32_t guest_ret)
+#if defined(_WIN32)
+/* An event's state without taking it: 1 set, 0 not, -1 unknown (not an
+ * event, or no NtQueryEvent). EVENT_QUERY_STATE is in the access a guest
+ * event's handle was created with. */
+typedef LONG (NTAPI *nt_query_event_fn)(HANDLE, int, PVOID, ULONG, PULONG);
+
+static int win_event_state(HANDLE h)
+{
+    static nt_query_event_fn query;
+    static int resolved;
+    struct { int type; LONG state; } info;
+    ULONG len = 0;
+
+    if (!resolved) {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (ntdll)
+            query = (nt_query_event_fn)(void *)GetProcAddress(ntdll, "NtQueryEvent");
+        resolved = 1;
+    }
+    if (!query || query(h, 0 /* EventBasicInformation */, &info, sizeof info, &len) < 0)
+        return -1;
+    return info.state != 0;
+}
+#endif
+
+/* Has a thread other than `best` taken the signal, so that `best` stays
+ * asleep and waiting for it to run on is pointless?
+ *
+ * POSIX: the compat layer's events record the thread whose wait took them
+ * (w32_event_peek). A Win32 event does not, which is why this hand-off was
+ * left out on Windows and BO-221's ordering was not kept there. What every
+ * guest wait does say, on every host, is when it ends (xbox_WakeWaitEnd
+ * counts `wakes`). So on Windows: the event still set means nobody has
+ * taken it yet; `best` counted a wake means it took it; another guest
+ * thread that was in a wait on the same object when it was signalled and
+ * has counted a wake since, while `best` has not, took it instead (an
+ * auto-reset event wakes one waiter). Otherwise keep waiting, up to the
+ * bound: Windows hands an auto-reset event to a waiter inside SetEvent, so
+ * "not set and nobody has counted yet" is the normal state between the
+ * signal and the woken thread being scheduled. */
+typedef struct { wake_rec *r; uint32_t wakes; } wake_seen;
+
+static int wake_taken_elsewhere(const void *object, wake_rec *best,
+                                uint32_t best_wakes0, const wake_seen *seen,
+                                uint32_t nseen, int *state)
 {
 #if defined(_WIN32)
-    /* A Win32 event does not say which wait took it, so the hand-off could
-     * not tell a waiter that woke from one that another thread beat to it. */
-    (void)object;
-    (void)guest_ret;
-#else
-    wake_rec *self = t_self, *best = NULL;
-    uint32_t i, n, e0;
-    uint64_t t0;
+    uint32_t i;
 
-    /* Host threads (timers, DPCs, audio) never wait here. */
-    if (!self || !object || !on())
+    *state = win_event_state((HANDLE)object);
+    if (*state < 0)
+        return 1;
+    if (*state)
+        return 0;
+    if (__atomic_load_n(&best->wakes, __ATOMIC_ACQUIRE) != best_wakes0)
+        return 0;
+    for (i = 0; i < nseen; i++)
+        if (__atomic_load_n(&seen[i].r->wakes, __ATOMIC_ACQUIRE) != seen[i].wakes)
+            return 1;
+    return 0;
+#else
+    DWORD taker;
+    int set = w32_event_peek((HANDLE)object, &taker);
+
+    (void)best_wakes0; (void)seen; (void)nseen;
+    *state = set;
+    return set < 0 || (!set && taker && taker != best->tid);
+#endif
+}
+
+/* Who waited on the object the calling thread is about to signal, and at
+ * which point of its run (epoch) and which wait (waits). Without it the
+ * waiters are read after the signal, and a woken thread that already ran
+ * and began its next wait on the same object looked like the one still to
+ * run: the signaller then slept the whole bound for a block that had
+ * already happened (4 in 2000 posts on Windows and on a loaded Mac). */
+typedef struct { wake_rec *r; uint32_t epoch, waits, wakes; } wake_snap;
+static RECOMP_TLS const void *t_snap_object;
+static RECOMP_TLS uint32_t t_snap_n;
+static RECOMP_TLS wake_snap t_snap[WAKE_MAX];
+
+void xbox_WakeSignalBegin(const void *object)
+{
+    uint32_t i, n;
+
+    t_snap_object = NULL;
+    t_snap_n = 0;
+    if (!t_self || !object || !on())
         return;
     n = __atomic_load_n(&s_nrec, __ATOMIC_ACQUIRE);
     for (i = 0; i < n; i++) {
         wake_rec *r = &s_rec[i];
+        uint32_t w = __atomic_load_n(&r->waits, __ATOMIC_ACQUIRE);
+        uint32_t e = __atomic_load_n(&r->epoch, __ATOMIC_SEQ_CST);
 
-        if (r == self || __atomic_load_n(&r->waiting_on, __ATOMIC_ACQUIRE) != object)
+        /* In that wait, before and after the epoch was read: its epoch is
+         * the one of that wait. */
+        if (r == t_self || __atomic_load_n(&r->waiting_on, __ATOMIC_ACQUIRE) != object
+                || __atomic_load_n(&r->waits, __ATOMIC_ACQUIRE) != w)
             continue;
-        if (__atomic_load_n(&r->prio, __ATOMIC_RELAXED) <= __atomic_load_n(&self->prio, __ATOMIC_RELAXED))
-            continue;
-        if (!best || r->prio > best->prio)
-            best = r;
+        t_snap[t_snap_n].r = r;
+        t_snap[t_snap_n].epoch = e;
+        t_snap[t_snap_n].waits = w;
+        t_snap[t_snap_n].wakes = __atomic_load_n(&r->wakes, __ATOMIC_ACQUIRE);
+        t_snap_n++;
     }
-    if (!best)
-        return;
+    t_snap_object = object;
+}
+
+/* Wait until `best` makes its next call that can block after epoch e0,
+ * another thread took the signal, or the bound runs out. */
+static void wake_wait_for(const void *object, wake_rec *best, uint32_t e0,
+                          uint32_t best_wakes0, const wake_seen *seen,
+                          uint32_t nseen, uint32_t guest_ret)
+{
+    uint64_t t0;
+
     if (!best->ev) {
         lock();
         if (!best->ev)
@@ -235,10 +324,8 @@ void xbox_WakeSignalled(const void *object, uint32_t guest_ret)
      * ran. Sleep on its event, not a yield: a host scheduler that ranks
      * this thread above it would never let it run. */
     __atomic_add_fetch(&best->watched, 1, __ATOMIC_SEQ_CST);
-    e0 = __atomic_load_n(&best->epoch, __ATOMIC_SEQ_CST);
     t0 = xbox_HostNowNs();
     for (;;) {
-        DWORD taker;
         int set;
 
         if (__atomic_load_n(&best->epoch, __ATOMIC_SEQ_CST) != e0) {
@@ -255,8 +342,7 @@ void xbox_WakeSignalled(const void *object, uint32_t guest_ret)
             break;
         }
         /* Another thread's wait took the event: this one stays asleep. */
-        set = w32_event_peek((HANDLE)object, &taker);
-        if (set < 0 || (!set && taker && taker != best->tid))
+        if (wake_taken_elsewhere(object, best, best_wakes0, seen, nseen, &set))
             break;
         if (xbox_HostNowNs() - t0 >= s_bound_ns) {
             if (__atomic_add_fetch(&s_timeouts, 1, __ATOMIC_RELAXED) <= 8) {
@@ -269,12 +355,144 @@ void xbox_WakeSignalled(const void *object, uint32_t guest_ret)
             }
             break;
         }
+#if !defined(_WIN32)
         if (guest_turn_joined())
             guest_turn_yield();
+#endif
         WaitForSingleObject(best->ev, 1);
     }
     __atomic_sub_fetch(&best->watched, 1, __ATOMIC_SEQ_CST);
-#endif
+}
+
+/* A signal from a thread at DISPATCH_LEVEL or holding the one-CPU gate.
+ *
+ * On the console nothing preempts a thread at DISPATCH_LEVEL: the woken
+ * thread gets the CPU when the signaller lowers IRQL. Waiting for it here,
+ * while raised, was a stall at every such signal (finding 10 of the audit
+ * of 2026-11-03): a woken thread whose next step raises IRQL, or that a
+ * guest_cpus token holds back, cannot get past the gate this thread holds,
+ * so the full bound always ran out. The hand-off is noted instead and run
+ * at the lower that lets the gate go (xbox_WakeIrqlLowered). A few per
+ * raise; one past that is not waited for. */
+#define WAKE_DEFER_MAX 8
+#define WAKE_DEFER_SEEN 8
+typedef struct {
+    const void *object;
+    wake_rec *best;
+    uint32_t e0, best_wakes0, nseen, guest_ret;
+    wake_seen seen[WAKE_DEFER_SEEN];
+} wake_deferred;
+static RECOMP_TLS wake_deferred t_defer[WAKE_DEFER_MAX];
+static RECOMP_TLS uint32_t t_ndefer;
+static uint64_t s_deferred, s_defer_dropped;
+
+static void wake_defer(const void *object, wake_rec *best, uint32_t e0,
+                       uint32_t best_wakes0, const wake_seen *seen,
+                       uint32_t nseen, uint32_t guest_ret)
+{
+    wake_deferred *d;
+    uint64_t k;
+
+    if (t_ndefer >= WAKE_DEFER_MAX) {
+        __atomic_add_fetch(&s_defer_dropped, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    d = &t_defer[t_ndefer++];
+    d->object = object;
+    d->best = best;
+    d->e0 = e0;
+    d->best_wakes0 = best_wakes0;
+    d->guest_ret = guest_ret;
+    /* Only for the Windows "taken by another" test: fewer seen means that
+     * test answers "no" more often, and the bound decides. */
+    d->nseen = nseen < WAKE_DEFER_SEEN ? nseen : WAKE_DEFER_SEEN;
+    memcpy(d->seen, seen, d->nseen * sizeof seen[0]);
+    k = __atomic_add_fetch(&s_deferred, 1, __ATOMIC_RELAXED);
+    if (k == 1) {
+        fprintf(stderr, "  [KERNEL] wake hand-off: signal at DISPATCH_LEVEL from 0x%08X;"
+                        " the woken thread runs first at the lower\n", (unsigned)guest_ret);
+        fflush(stderr);
+    }
+}
+
+void xbox_WakeSignalled(const void *object, uint32_t guest_ret)
+{
+    wake_rec *self = t_self, *best = NULL;
+    uint32_t i, n, e0 = 0, best_wakes0 = 0, nseen = 0;
+    wake_seen seen[WAKE_MAX];
+
+    int snapped = 0;
+
+    /* Host threads (timers, DPCs, audio) never wait here. */
+    if (!self || !object || !on())
+        return;
+    if (t_snap_object == object) {
+        /* The waiters as they were at the signal (xbox_WakeSignalBegin). */
+        snapped = 1;
+        t_snap_object = NULL;
+        for (i = 0; i < t_snap_n; i++) {
+            wake_rec *r = t_snap[i].r;
+
+            seen[nseen].r = r;
+            seen[nseen].wakes = t_snap[i].wakes;
+            nseen++;
+            if (__atomic_load_n(&r->prio, __ATOMIC_RELAXED) <= __atomic_load_n(&self->prio, __ATOMIC_RELAXED))
+                continue;
+            if (!best || r->prio > best->prio) {
+                best = r;
+                e0 = t_snap[i].epoch;
+            }
+        }
+        n = 0;
+    } else {
+        n = __atomic_load_n(&s_nrec, __ATOMIC_ACQUIRE);
+    }
+    for (i = 0; i < n; i++) {
+        wake_rec *r = &s_rec[i];
+
+        if (r == self || __atomic_load_n(&r->waiting_on, __ATOMIC_ACQUIRE) != object)
+            continue;
+        /* Every other waiter on it, with its wake count now (Windows). */
+        seen[nseen].r = r;
+        seen[nseen].wakes = __atomic_load_n(&r->wakes, __ATOMIC_ACQUIRE);
+        nseen++;
+        if (__atomic_load_n(&r->prio, __ATOMIC_RELAXED) <= __atomic_load_n(&self->prio, __ATOMIC_RELAXED))
+            continue;
+        if (!best || r->prio > best->prio)
+            best = r;
+    }
+    if (!best)
+        return;
+    /* `seen` is the others: drop best from it. */
+    for (i = 0; i < nseen; i++)
+        if (seen[i].r == best) {
+            best_wakes0 = seen[i].wakes;
+            seen[i] = seen[--nseen];
+            break;
+        }
+    if (!snapped)
+        e0 = __atomic_load_n(&best->epoch, __ATOMIC_SEQ_CST);
+    if (xbox_IrqlThisThreadBlocksDpcs()) {
+        wake_defer(object, best, e0, best_wakes0, seen, nseen, guest_ret);
+        return;
+    }
+    wake_wait_for(object, best, e0, best_wakes0, seen, nseen, guest_ret);
+}
+
+/* Lowered below DISPATCH_LEVEL, the one-CPU gate let go (kernel_hal.c):
+ * the hand-offs signalled while raised run now. */
+void xbox_WakeIrqlLowered(void)
+{
+    wake_deferred d[WAKE_DEFER_MAX];
+    uint32_t i, n = t_ndefer;
+
+    if (!n)
+        return;
+    memcpy(d, t_defer, n * sizeof d[0]);
+    t_ndefer = 0;
+    for (i = 0; i < n; i++)
+        wake_wait_for(d[i].object, d[i].best, d[i].e0, d[i].best_wakes0,
+                      d[i].seen, d[i].nseen, d[i].guest_ret);
 }
 
 void xbox_WakeCounts(uint64_t *handoffs, uint64_t *timeouts)

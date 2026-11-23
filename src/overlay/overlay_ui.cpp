@@ -22,6 +22,7 @@
 #include "xbox_settings.h"
 #include "nv2a_texscale.h"
 #include "nv2a_texup.h"
+#include "nv2a_filmup.h"
 #include "xbox_shader_build.h"
 #include "xbox_report.h"
 #include "nv2a_pcache.h"
@@ -32,6 +33,8 @@
 #else
 #include <strings.h>
 #endif
+#include "xnet_hle.h"
+#include "xnet_lobby.h"
 
 #include "imgui.h"
 #include <atomic>
@@ -41,6 +44,8 @@
 
 #include "input_backend.h"
 #include "input_map.h"
+#include "keyboard.h"
+#include "keyboard_sdl.h"
 #include "touch_pad.h"
 #include "kernel_pause.h"
 #include "present_cadence.h"    /* what reached the glass, for the graph */
@@ -69,6 +74,7 @@ void  nv2a_host_hdr_pattern(int kind, float x0, float y0, float x1, float y1, fl
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -86,6 +92,194 @@ void  nv2a_host_hdr_pattern(int kind, float x0, float y0, float x1, float y1, fl
 static SDL_Window *s_win;
 static bool s_enabled;          /* RECOMP_OVERLAY is not 0 */
 static bool s_open;
+
+/* Window-system calls the overlay asks for (BO-347). A row is activated while
+ * the frame is built, on the present thread, and SDL's text input and URL
+ * calls belong on the window's thread on every platform: on macOS
+ * SDL_StartTextInput makes SDL's field editor the window's first responder,
+ * and AppKit then runs the input-method switch on the present thread's run
+ * loop, where it aborts the process. So the request is noted here and made
+ * by xbox_OverlayPoll on the main loop's thread. */
+enum { OV_TI_NONE = 0, OV_TI_START, OV_TI_STOP };
+static std::atomic<int> s_ti_want{OV_TI_NONE};   /* the last asked wins */
+static std::atomic<bool> s_url_want{false};      /* s_up_res.url, update_open_page */
+
+/* The online text editor (BO-134): the System page's name and server rows,
+ * edited in place. Keyboard: type, Backspace, Left/Right, Enter keeps, Esc
+ * drops. Pad: Up/Down change the character under the cursor, Left/Right move
+ * it (past the end adds one), X deletes, Y picks a random name (the name) or
+ * puts the default server back (the server), A keeps, B drops. The name:
+ * letters and digits, up to 15, as a gamertag. The server: a host name or address with an optional
+ * ":port", up to 63. */
+static bool s_ne_open;
+static char s_ne_buf[64];
+static int s_ne_cur;
+static int s_ne_server;             /* editing online.server, not online.name */
+static int s_ne_code;               /* editing online.code (BO-335) */
+static const char k_ne_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+static const char k_ne_srv_chars[] = "0123456789.abcdefghijklmnopqrstuvwxyz-:";
+
+static int ne_max(void) { return s_ne_server ? 63 : s_ne_code ? XL_CODE_MAX : 15; }
+static const char *ne_set(void) { return s_ne_server ? k_ne_srv_chars : s_ne_code ? XL_CODE_ALPHABET : k_ne_chars; }
+static int ne_ok(char c)
+{
+    if (s_ne_code)
+        return isalnum((unsigned char)c);
+    if (s_ne_server)
+        return isalnum((unsigned char)c) || c == '.' || c == '-' || c == ':';
+    return isalnum((unsigned char)c);
+}
+
+static void ne_random(void)
+{
+    if (s_ne_code) {
+        xl_code_make(s_ne_buf, (uint32_t)rand() ^ (uint32_t)SDL_GetTicks());
+        s_ne_cur = (int)strlen(s_ne_buf);
+        return;
+    }
+    if (s_ne_server) {
+        snprintf(s_ne_buf, sizeof s_ne_buf, "%s", XNET_HLE_DEFAULT_LOBBY);
+        s_ne_cur = (int)strlen(s_ne_buf);
+        return;
+    }
+    snprintf(s_ne_buf, sizeof s_ne_buf, "Racer%04u", (unsigned)(rand() % 10000));
+    s_ne_cur = (int)strlen(s_ne_buf);
+}
+
+/* kind: 0 the name, 1 the server, 2 the game code */
+static const char *ne_key(void) { return s_ne_server ? "online.server" : s_ne_code ? "online.code" : "online.name"; }
+
+static void ne_open(int kind)
+{
+    const char *v;
+    s_ne_server = kind == 1;
+    s_ne_code = kind == 2;
+    v = xbox_SettingsText(ne_key(), NULL);
+    snprintf(s_ne_buf, sizeof s_ne_buf, "%s", v[0] ? v : (kind == 0 ? "Racer" : kind == 1 ? XNET_HLE_DEFAULT_LOBBY : ""));
+    /* an empty code starts as a new random one: the usual thing to share */
+    if (s_ne_code && !s_ne_buf[0])
+        xl_code_make(s_ne_buf, (uint32_t)rand() ^ (uint32_t)SDL_GetTicks());
+    s_ne_cur = (int)strlen(s_ne_buf);
+    s_ne_open = true;
+    s_ti_want.store(OV_TI_START);          /* by xbox_OverlayPoll (BO-347) */
+}
+
+static void ne_close(bool keep)
+{
+    /* An empty server, or the default typed out, is stored empty: it follows
+     * XNET_HLE_DEFAULT_LOBBY if that moves. An empty code is kept too (public
+     * games); an empty name is not. */
+    if (keep && s_ne_server && !strcmp(s_ne_buf, XNET_HLE_DEFAULT_LOBBY))
+        s_ne_buf[0] = 0;
+    if (keep && s_ne_code) {
+        char c[XL_CODE_MAX + 1];
+        xl_code_clean(s_ne_buf, c, sizeof c);   /* too short: no code */
+        xbox_SettingsSetText("online.code", c);
+        xnet_hle_set_code(c);
+    } else if (keep && (s_ne_buf[0] || s_ne_server))
+        xbox_SettingsSetText(ne_key(), s_ne_buf);
+    s_ne_open = false;
+    s_ti_want.store(OV_TI_STOP);           /* by xbox_OverlayPoll (BO-347) */
+}
+
+static void ne_insert(char c)
+{
+    size_t n = strlen(s_ne_buf);
+    if (!ne_ok(c) || (int)n >= ne_max())
+        return;
+    if (s_ne_server && c >= 'A' && c <= 'Z')
+        c = (char)(c - 'A' + 'a');
+    if (s_ne_code && c >= 'a' && c <= 'z')
+        c = (char)(c - 'a' + 'A');
+    memmove(s_ne_buf + s_ne_cur + 1, s_ne_buf + s_ne_cur, n - (size_t)s_ne_cur + 1);
+    s_ne_buf[s_ne_cur++] = c;
+}
+
+static void ne_delete(void)
+{
+    size_t n = strlen(s_ne_buf);
+    int at = s_ne_cur > 0 && s_ne_cur == (int)n ? s_ne_cur - 1 : s_ne_cur;
+    if (!n || at < 0)
+        return;
+    memmove(s_ne_buf + at, s_ne_buf + at + 1, n - (size_t)at);
+    if (s_ne_cur > (int)strlen(s_ne_buf))
+        s_ne_cur = (int)strlen(s_ne_buf);
+}
+
+static void ne_step(int d)
+{
+    const char *set = ne_set(), *p;
+    int i, n = (int)strlen(set);
+    if (s_ne_cur >= (int)strlen(s_ne_buf)) {
+        if ((int)strlen(s_ne_buf) >= ne_max())
+            return;
+        ne_insert(set[0]);
+        s_ne_cur--;
+        return;
+    }
+    p = strchr(set, s_ne_buf[s_ne_cur]);
+    i = p ? (int)(p - set) : 0;
+    s_ne_buf[s_ne_cur] = set[((i + d) % n + n) % n];
+}
+
+/* The row's text while editing: the character under the cursor in brackets. */
+static const char *ne_label(void)
+{
+    static char out[128];
+    const char *what = s_ne_server ? "Server" : s_ne_code ? "Game code" : "Online name";
+    int n = (int)strlen(s_ne_buf);
+    if (s_ne_cur >= n)
+        snprintf(out, sizeof out, "%s: %s[ ]", what, s_ne_buf);
+    else
+        snprintf(out, sizeof out, "%s: %.*s[%c]%s", what, s_ne_cur, s_ne_buf, s_ne_buf[s_ne_cur],
+                 s_ne_buf + s_ne_cur + 1);
+    return out;
+}
+
+/* An event while the editor is open: every key and button goes to it. */
+static int ne_event(const SDL_Event *ev)
+{
+    if (ev->type == SDL_TEXTINPUT) {
+        const char *t;
+        for (t = ev->text.text; *t; t++)
+            ne_insert(*t);
+        return 1;
+    }
+    if (ev->type == SDL_KEYDOWN) {
+        switch (ev->key.keysym.sym) {
+        case SDLK_RETURN: case SDLK_KP_ENTER: ne_close(true); break;
+        case SDLK_ESCAPE: ne_close(false); break;
+        case SDLK_BACKSPACE: if (s_ne_cur > 0) { s_ne_cur--; ne_delete(); } break;
+        case SDLK_DELETE: ne_delete(); break;
+        case SDLK_LEFT: if (s_ne_cur > 0) s_ne_cur--; break;
+        case SDLK_RIGHT: if (s_ne_cur < (int)strlen(s_ne_buf)) s_ne_cur++; break;
+        case SDLK_UP: ne_step(1); break;
+        case SDLK_DOWN: ne_step(-1); break;
+        default: break;
+        }
+        return 1;
+    }
+    if (ev->type == SDL_CONTROLLERBUTTONDOWN) {
+        switch (ev->cbutton.button) {
+        case SDL_CONTROLLER_BUTTON_A: ne_close(true); break;
+        case SDL_CONTROLLER_BUTTON_B: ne_close(false); break;
+        case SDL_CONTROLLER_BUTTON_X: ne_delete(); break;
+        case SDL_CONTROLLER_BUTTON_Y: ne_random(); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP: ne_step(1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: ne_step(-1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: if (s_ne_cur > 0) s_ne_cur--; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+            if (s_ne_cur < (int)strlen(s_ne_buf)) s_ne_cur++;
+            else ne_step(1), s_ne_cur = (int)strlen(s_ne_buf) - 1;
+            break;
+        default: break;
+        }
+        return 1;
+    }
+    if (ev->type == SDL_KEYUP || ev->type == SDL_CONTROLLERBUTTONUP || ev->type == SDL_CONTROLLERAXISMOTION)
+        return 1;
+    return 0;
+}
 static float s_alpha;           /* 0..1, the fade */
 /* The rows coming in (BO-190), as the title's menus bring theirs: each row
  * slides in from the left and fades up, one after another. Timed from frame
@@ -130,13 +324,26 @@ static int s_steps[D_COUNT];
 static int s_activate, s_back, s_page_delta, s_reset;
 
 /* The page and the row on each. */
-enum { P_DISPLAY, P_GRAPHICS, P_AUDIO, P_INPUT, P_POWER, P_ADVANCED, P_COUNT };
-static const char *const k_page_name[P_COUNT] = {
-    "Display", "Graphics", "Audio", "Input", "Power", "Advanced"
+/* BO-327: Display (the screen, HDR, the frame rate), Graphics (picture
+ * quality, sharper art), Game (what the game draws and does), Audio,
+ * Controls, the host's page (Mods) and System, last: LB from the first page
+ * goes to System. The names are the RECOMP_OVERLAY_TEST dumps' "page" line,
+ * which the scene scripts wait for. */
+enum { P_DISPLAY, P_GRAPHICS, P_GAME, P_AUDIO, P_CONTROLS, P_HOST, P_SYSTEM, P_COUNT };
+static const char *k_page_name[P_COUNT] = {
+    "Display", "Graphics", "Game", "Audio", "Controls", "Mods", "System"
 };
 static int s_page;
 static int s_sel[P_COUNT];
 static bool s_scroll_to_sel;
+
+/* BO-338: each page keeps its expert rows behind a "Show advanced settings"
+ * switch (this session only: not a setting, so no settings.toml key). The
+ * rows are tagged `adv` where page_rows makes them; a page that has none
+ * has no switch. The Controls page also has a sub-page, the
+ * keyboard's keys (s_keys_page). */
+static bool s_adv[P_COUNT];
+static bool s_keys_page;
 
 /* Settings written a moment after the last change. */
 static bool s_save_pending;
@@ -186,11 +393,12 @@ struct Meta {
     unsigned disabled;                /* choice bits that cannot be picked */
 };
 
-static const char *const n_aspect[]    = { "4:3", "16:9", NULL };
+static const char *const n_aspect[]    = { "4:3", "16:9", "16:10", NULL };
 static const char *const n_filter[]    = { "Nearest", "Linear", "Integer", NULL };
 static const char *const n_overscan[]  = { "Show all", "Crop (TV safe area)", "Fill height", NULL };
-static const char *const n_timing[]    = { "Legacy (when ready)", "Auto (even frames)", NULL };
+static const char *const n_timing[]    = { "Legacy (when ready)", "Auto (display link)", "Aimed (0.2)", NULL };
 static const char *const n_frame_pacing[] = { "Automatic", "Low latency", "Smooth", NULL };
+static const char *const n_online[] = { "Off", "Internet", "Local network", NULL };
 static const char *const n_fit[]       = { "Letterbox", "Fill 16:10 (crops the sides)", NULL };
 static const char *const n_aniso[]     = { "Off", "2x", "4x", "8x", "16x", NULL };
 static const char *const n_lod[]       = { "Off", "Auto (from the render scale)", "-0.5", "-1.0", "-1.5", NULL };
@@ -211,17 +419,19 @@ static const char *const n_scheme[]    = { "Xbox layout", "PS2 layout", NULL };
 static const char *const n_first_pad[] = { "Player 1", "Player 2", NULL };
 static const char *const n_ui_scale[]  = { "Off", "2x", "4x", NULL };
 static const char *const n_texup[]     = { "Off", "FSRCNNX", "NNEDI3", NULL };
+static const char *const n_filmup[]    = { "Off", "Cheap", "Best", NULL };
 static const char *const n_texup_sc[]  = { "2x", "4x", NULL };
 static const char *const n_glyphs[]    = { "Auto (the controller in use)", "Xbox (original)", "Xbox (modern: LB RB LT RT)", "PlayStation (DualShock 3, 4)", "PlayStation 5 (DualSense)", "Nintendo", "Steam (Deck, Steam Controller)", "Positional (any pad)", "Keyboard", NULL };
 static_assert(sizeof n_glyphs / sizeof n_glyphs[0] == XBOX_GLYPHS_MODE_COUNT + 1, "one name per glyph mode, in pad_glyphs.h order");
 static const char *const n_units[]     = { "mph (as shipped)", "km/h", NULL };
-static const char *const n_language[]  = { "English", "Japanese", "German", "French", "Spanish", "Italian", "Korean", "Chinese", "Portuguese", NULL };
+static const char *const n_language[]  = { "English", "Japanese", "German", "French", "Spanish", "Italian", "Korean", "Chinese", "Portuguese", "Dutch", "Swedish", NULL };
 static const char *const n_ultrawide[] = { "Off", "21:9", "32:9", "Window", NULL };
 static const char *const n_vehicle_detail[] = { "Original", "Far (2x)", "Farthest (4x)", NULL };
 static const char *const n_scenery_detail[] = { "Original", "Far", NULL };
 static const char *const n_score_board[] = { "Original", "Smooth", NULL };
 static const char *const n_rival_marker[] = { "Original", "Farther", NULL };
 static const char *const n_crashnav_map[] = { "Full width", "4:3", NULL };
+static const char *const n_pictures[] = { "Stretched", "Blurred sides", "Black bars", NULL };
 static const char *const n_power[]     = { "Maximum (~14 W on Deck)", "Balanced (~10 W, recommended)", "Battery saver (~8 W)", "Auto (adapts)", NULL };
 /* Off the Steam Deck the watts are somebody else's: the names alone. */
 static const char *const n_power_plain[] = { "Maximum", "Balanced (recommended)", "Battery saver", "Auto (adapts)", NULL };
@@ -232,10 +442,10 @@ static bool on_steam_deck()
 
 static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_DISPLAY_FULLSCREEN */ { XS_DISPLAY_FULLSCREEN, "Fullscreen", "Borderless fullscreen on the desktop.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_DISPLAY_ASPECT */     { XS_DISPLAY_ASPECT, "Aspect ratio", "16:9 draws the game in widescreen.", 1, FMT_PLAIN, n_aspect, 0 },
+    /* XS_DISPLAY_ASPECT */     { XS_DISPLAY_ASPECT, "Aspect ratio", "16:9 draws the game in widescreen. 16:10 is the same widescreen with a little more above and below, for 16:10 screens such as the Steam Deck's.", 1, FMT_PLAIN, n_aspect, 0 },
     /* XS_DISPLAY_FILTER */     { XS_DISPLAY_FILTER, "Filter", "How the picture is scaled to the window.", 1, FMT_PLAIN, n_filter, 0 },
     /* XS_DISPLAY_OVERSCAN */   { XS_DISPLAY_OVERSCAN, "Overscan", "Crop cuts the TV border all round. Fill height drops the top and bottom border and stretches to the full height (about 7% taller); the sides stay.", 1, FMT_PLAIN, n_overscan, 0 },
-    /* XS_DISPLAY_FIT */        { XS_DISPLAY_FIT, "Present fit", "Fills the window's height on a 16:10 screen.", 1, FMT_PLAIN, n_fit, 0 },
+    /* XS_DISPLAY_FIT */        { XS_DISPLAY_FIT, "Present fit", "A 16:9 picture on this 16:10 screen: Letterbox shows it whole with bars above and below, Fill 16:10 fills the height and crops the sides. Aspect ratio 16:10 shows the whole picture with no bars.", 1, FMT_PLAIN, n_fit, 0 },
 #if defined(__ANDROID__)
     /* XS_GRAPHICS_RENDER_SCALE */ { XS_GRAPHICS_RENDER_SCALE, "Render scale", "Internal resolution as a multiple of the Xbox's 640x480. 1.5x is 960x720.", 1, FMT_PLAIN, n_scale, 0 },
 #else
@@ -259,29 +469,29 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_INPUT_FIRST_PAD */    { XS_INPUT_FIRST_PAD, "First controller", "Player 1: the first controller to press a button is player 1, and the keyboard drives the same player. Player 2: the keyboard is player 1 alone and controllers start at player 2, so a keyboard and a controller can play split screen. Press a button on each controller after a change.", 1, FMT_PLAIN, n_first_pad, 0 },
     /* XS_POWER_MODE */         { XS_POWER_MODE, "Power mode", "Maximum busy-waits throughout (steadiest, hottest). Balanced sleeps, then spins for the last 8 ms of each frame (steady 60). Battery saver only sleeps (coolest, with an occasional small dip). Auto picks the spin as it goes: less while frames are steady, more when they come late.", 1, FMT_PLAIN, n_power, 0 },
     /* XS_ADVANCED_PERF */      { XS_ADVANCED_PERF, "Performance overlay", "FPS and frame-time graph in the corner. Greetings to the DF team!", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GAME_SPEED_UNITS */   { XS_GAME_SPEED_UNITS, "Speed units", "Speed and distance in km/h and metres instead of mph and miles, using the game's own metric display. Applies from the next race. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
-    /* XS_DISPLAY_HUD_FIX */    { XS_DISPLAY_HUD_FIX, "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On keeps the HUD at its 4:3 proportions, pinned to the screen edges. Applies from the next race. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_DISPLAY_ULTRAWIDE */  { XS_DISPLAY_ULTRAWIDE, "Ultrawide", "For displays wider than 16:9, with Aspect set to 16:9. Races fill the whole width, showing more at the sides without stretching. Menus, loading screens and videos stay 16:9 in the middle. Window matches the window's or screen's own shape. Applies from the next race.", 1, FMT_PLAIN, n_ultrawide, 0 },
+    /* XS_GAME_SPEED_UNITS */   { XS_GAME_SPEED_UNITS, "Speed units", "Speed and distance in km/h and metres instead of mph and miles, using the game's own metric display. Text stays English.", 1, FMT_PLAIN, n_units, 0 },
+    /* XS_DISPLAY_HUD_FIX */    { XS_DISPLAY_HUD_FIX, "Widescreen HUD", "In 16:9 the game stretches its HUD with the picture. On keeps the HUD at its 4:3 proportions, pinned to the screen edges. Nothing changes in 4:3.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_DISPLAY_ULTRAWIDE */  { XS_DISPLAY_ULTRAWIDE, "Ultrawide", "For displays wider than 16:9, with Aspect set to 16:9. Races fill the whole width, showing more at the sides without stretching. Menus, loading screens and videos stay 16:9 in the middle. Window matches the window's or screen's own shape.", 1, FMT_PLAIN, n_ultrawide, 0 },
     /* XS_GRAPHICS_BLOOM */     { XS_GRAPHICS_BLOOM, "Bloom", "How strong the game's own bloom is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
     /* XS_GRAPHICS_MOTION_BLUR */ { XS_GRAPHICS_MOTION_BLUR, "Motion blur", "How strong the game's own motion blur is. 100% is the original.", 0.1, FMT_PERCENT, NULL, 0 },
     /* XS_GRAPHICS_CRASH_60FPS */ { XS_GRAPHICS_CRASH_60FPS, "60 fps crash cameras", "The game drops to 30 fps in its crash and takedown cameras. On keeps them at 60. Needs a fast machine: if 60 can't be held, the game itself slows down, not just the picture. Leave it off on a Steam Deck or other handheld.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_SPLIT_60FPS */ { XS_GRAPHICS_SPLIT_60FPS, "60 fps split screen", "Two-player split screen runs at 30 fps in the original. On runs it at 60 and draws the scene twice per frame. Needs a fast machine: if 60 can't be held, the game itself slows down. Leave it off on a Steam Deck or other handheld. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GRAPHICS_SPLIT_60FPS */ { XS_GRAPHICS_SPLIT_60FPS, "60 fps split screen", "Two-player split screen runs at 30 fps in the original. On runs it at 60 and draws the scene twice per frame. Needs a fast machine: if 60 can't be held, the game itself slows down. Leave it off on a Steam Deck or other handheld.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_HIGH_REFRESH */ { XS_GRAPHICS_HIGH_REFRESH, "High refresh rate", "Draws the game at your display's refresh rate instead of 60 fps, for 120, 144 Hz and faster displays. The game itself still runs at its own 60 steps a second; cars and the camera move smoothly between them. Menus, split screen, and crash cameras unless 60 fps crash cameras is on, stay at the game's own rate. Adds up to one 60 Hz step of delay. Needs a fast machine: every frame is drawn at the full render scale.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_SPLIT_MUSIC */  { XS_AUDIO_SPLIT_MUSIC, "Music in split screen", "The original plays no music in split screen. On plays EA GAMES TRAX or your custom music in two-player Race and Road Rage, as in one-player. Applies from the next two-player event.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_SPLIT_MUSIC */  { XS_AUDIO_SPLIT_MUSIC, "Music in split screen", "The original plays no music in split screen. On plays EA GAMES TRAX or your custom music in two-player Race and Road Rage, as in one-player.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_LOD_BIAS */  { XS_GRAPHICS_LOD_BIAS, "Texture sharpness (LOD bias)", "With a render scale above 1x, picks sharper texture levels so the extra pixels show detail. Auto uses -0.5 at 2x and -1.0 at 4x.", 1, FMT_PLAIN, n_lod, 0 },
     /* XS_GRAPHICS_DITHER */    { XS_GRAPHICS_DITHER, "Dither", "Faint noise added when scaling to the window, to hide banding in smooth gradients such as the sky. Metal only for now. Text and HUD at their exact size are unchanged.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_VEHICLE_DETAIL */ { XS_GRAPHICS_VEHICLE_DETAIL, "Vehicle detail distance", "How far away rival cars and traffic keep their detailed models before the game swaps in simpler ones. Far doubles the console's distance, Farthest quadruples it. Costs GPU time with many vehicles on screen. Scenery, the track and where traffic appears stay the same.", 1, FMT_PLAIN, n_vehicle_detail, 0 },
-    /* XS_GRAPHICS_SCENERY_DETAIL */ { XS_GRAPHICS_SCENERY_DETAIL, "Scenery detail", "How far away trees and other roadside objects keep their detailed models before the game swaps in simpler ones. Original is the console's distance; Far moves the swap further out, so trees no longer change shape as you come round a bend. Costs a little GPU time. Changes at once.", 1, FMT_PLAIN, n_scenery_detail, 0 },
+    /* XS_GRAPHICS_SCENERY_DETAIL */ { XS_GRAPHICS_SCENERY_DETAIL, "Scenery detail distance", "How far away trees and other roadside objects keep their detailed models before the game swaps in simpler ones. Original is the console's distance; Far moves the swap further out, so trees no longer change shape as you come round a bend. Costs a little GPU time.", 1, FMT_PLAIN, n_scenery_detail, 0 },
     /* XS_INPUT_GLYPHS */       { XS_INPUT_GLYPHS, "Button prompts", "The button icons in the game's menus and hints. Auto follows the controller you used last. Xbox (original) is the game's own art. Positional works with any pad: a diamond of four dots, with the button to press filled. Keyboard shows key caps. Auto picks it while you play on the keyboard. The game's text and videos still name Xbox buttons.", 1, FMT_PLAIN, n_glyphs, 0 },
     /* XS_AUDIO_LFE_LOWPASS */  { XS_AUDIO_LFE_LOWPASS, "Subwoofer low-pass (LFE)", "120 Hz matches the console's Dolby Digital encoder. Off sends the full-range LFE feed.", 1, FMT_PLAIN, n_lfe_lowpass, 0 },
-    /* XS_DISPLAY_PRESENT_TIMING */ { XS_DISPLAY_PRESENT_TIMING, "Frame presentation", "When a finished frame goes to the display. Legacy: as soon as it is ready. Auto: each frame is aimed at one refresh, so frames stay on screen equally long and appear sooner after they are drawn. On a fixed 60, 120 or 240 Hz display the game's clock follows the display; on variable refresh (VRR, ProMotion) frames go out at even intervals. The performance overlay's on-glass line shows the result.", 1, FMT_PLAIN, n_timing, 0 },
+    /* XS_DISPLAY_PRESENT_TIMING */ { XS_DISPLAY_PRESENT_TIMING, "Frame presentation", "When a finished frame goes to the display. Auto: on macOS 14 and later each frame goes out at a refresh the system names (a display link), and the game's clock follows those refreshes, on fixed, variable-refresh and ProMotion displays alike; on older macOS as Aimed. Aimed: each frame is timed for one refresh (the Auto of 0.2). Legacy: as soon as it is ready. The performance overlay's on-glass line shows the result.", 1, FMT_PLAIN, n_timing, 0 },
     /* XS_ADVANCED_PERF_STEPS */ { XS_ADVANCED_PERF_STEPS, "Graph: simulation steps", "Marks frames where the game ran more than one simulation step on the frame-time graph. It does that when its frame rate drops.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_ADVANCED_DIAG_LOG */  { XS_ADVANCED_DIAG_LOG, "Diagnostic logging", "Off logs only errors and a few start-up facts. On writes the full log (about 830 KB a run at most, the last three runs kept), and bug reports include it. To capture a problem: switch it on, restart so the log has the start, reproduce it, then create the report.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_UI_SCALE */  { XS_GRAPHICS_UI_SCALE, "Menu and HUD upscaling", "Redraws the game's 2D art (menu text, HUD, icons, logos) at 2x or 4x with an edge-following scaler (Super-xBR), for render scales above 1x. The 3D world is untouched. Sharper versions are made in the background and kept on disk, so new art can look unscaled at first. Uses more texture memory.", 1, FMT_PLAIN, n_ui_scale, 0 },
-    /* XS_INTERFACE_MENU_ENTRY */ { XS_INTERFACE_MENU_ENTRY, "Entry in the game's menu", "Adds TAKEDAWN SETTINGS to the game's Settings menu (Driver Details > Settings). It opens this menu, like the hotkey. Shows the next time that menu opens.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_INTERFACE_MENU_ENTRY */ { XS_INTERFACE_MENU_ENTRY, "Entry in the game's menu", "Adds TAKEDAWN SETTINGS to the game's Settings menu (Driver Details > Settings). It opens this menu, like the hotkey. From the next time that menu opens.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_AUDIO_CUSTOM_LEVEL */ { XS_AUDIO_CUSTOM_LEVEL, "Custom music loudness", "Modern songs are mastered louder than the game's music, and the game plays them louder still, so they distort. Match game music brings each song to the level of EA GAMES TRAX with a slow gain that never pumps within a song. Quieter and Louder sit 4 dB below and above that. Off plays songs as the game sends them. Custom music only.", 1, FMT_PLAIN, n_custom_level, 0 },
-    /* XS_DISPLAY_SCORE_BOARD */ { XS_DISPLAY_SCORE_BOARD, "Score board", "The SCORE board at the top of the screen. Original is the console's look: the dark plate behind the score vanishes a moment after its text fades. Smooth fades the plate with the text, and fades the board back in after a crash camera. Changes at once.", 1, FMT_PLAIN, n_score_board, 0 },
-    /* XS_DISPLAY_RIVAL_MARKER */ { XS_DISPLAY_RIVAL_MARKER, "Rival marker switch", "The marker over a rival car is a small arrow far away and its race position (4th) near. Original is the console's: it changes at 35 metres, checked twice a second, so a rival you close on can be nearer when it changes. Farther shows the position from 60 metres and the arrow again past 75, checked every frame, so the change is earlier and does not flip back and forth. Changes at once.", 1, FMT_PLAIN, n_rival_marker, 0 },
+    /* XS_DISPLAY_SCORE_BOARD */ { XS_DISPLAY_SCORE_BOARD, "Score board", "The SCORE board at the top of the screen. Original is the console's look: the dark plate behind the score vanishes a moment after its text fades. Smooth fades the plate with the text, and fades the board back in after a crash camera.", 1, FMT_PLAIN, n_score_board, 0 },
+    /* XS_DISPLAY_RIVAL_MARKER */ { XS_DISPLAY_RIVAL_MARKER, "Rival marker switch", "The marker over a rival car is a small arrow far away and its race position (4th) near. Original is the console's: it changes at 35 metres, checked twice a second, so a rival you close on can be nearer when it changes. Farther shows the position from 60 metres and the arrow again past 75, checked every frame, so the change is earlier and does not flip back and forth.", 1, FMT_PLAIN, n_rival_marker, 0 },
     /* XS_AUDIO_MENU_SOUNDS */  { XS_AUDIO_MENU_SOUNDS, "Menu sounds", "This menu clicks with the game's own menu sounds, read from your copy of the game.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_HDR */       { XS_GRAPHICS_HDR, "HDR", "High dynamic range output on a display that can show it (on macOS: a display with HDR or XDR brightness headroom; on Steam Deck and Linux: game mode with HDR switched on in the display settings; on Windows: Use HDR switched on for the display in Windows' display settings). The game's light keeps its strength: lamps, brake lights, sparks, the boost glow and the sun go brighter than white, while the HUD and menus stay at their own brightness. Off is the original picture.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_HDR_PEAK */  { XS_GRAPHICS_HDR_PEAK, "Peak brightness", "The brightest the display can show. Display uses what the display reports (on a Steam Deck that is right). To set it by eye: raise it until the symbol in the box disappears into the bright background, then stop.", 50.0, FMT_NITS, NULL, 0 },
@@ -291,15 +501,19 @@ static constexpr Meta k_meta[XS_COUNT] = {
     /* XS_GRAPHICS_HDR_HIGHLIGHTS */ { XS_GRAPHICS_HDR_HIGHLIGHTS, "Highlight gain", "Strengthens the light above paper white (lamps, sparks, flames) before it rolls off to the peak. 1.00 is as the game stacks it; more helps a display with little room above paper white.", 0.1, FMT_GAIN, NULL, 0 },
     /* XS_GRAPHICS_HDR_DECODE */ { XS_GRAPHICS_HDR_DECODE, "Gamma", "How the game's colours become light: 2.2 as a TV shows it, or the sRGB curve (lighter near black).", 1, FMT_PLAIN, NULL, 0 },
     /* XS_DISPLAY_FRAME_PACING */ { XS_DISPLAY_FRAME_PACING, "Frame pacing", "Low latency shows each frame at the first refresh it can make. Smooth keeps one finished frame in hand, so a late frame does not show as a repeated one; it adds one refresh (16.7 ms at 60 Hz) to the delay from the pad to the screen. Automatic picks Smooth on the Steam Deck and Low latency elsewhere. On a variable-refresh display (G-Sync, FreeSync) or one well above 60 Hz there is no queue to keep, and Smooth works like Low latency.", 1, FMT_PLAIN, n_frame_pacing, 0 },
-    /* XS_GAME_RACE_CLOCK */    { XS_GAME_RACE_CLOCK, "Potato mode", "Keeps the race at real speed on a slow machine by skipping frames. Without it, a machine under 60 fps runs the race in slow motion until the first crash. Leave it off on a fast PC: at 60 fps it gains nothing, and lap times can come out a few seconds slower. Applies from the next race.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_AUDIO_CUSTOM_AT_START */ { XS_AUDIO_CUSTOM_AT_START, "Custom music at start", "With a music folder chosen, the game starts on the custom soundtrack you last picked in Driver Details > Settings > EA GAMES TRAX (the first one until you pick), so you do not have to pick it every time. Picking EA GAMES TRAX there starts it on EA GAMES TRAX from then on. Off starts on EA GAMES TRAX every time, as the original does. Applies from the next start.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GAME_RACE_CLOCK */    { XS_GAME_RACE_CLOCK, "Potato mode", "Keeps the race at real speed on a slow machine by skipping frames. Without it, a machine under 60 fps runs the race in slow motion until the first crash. Leave it off on a fast PC: at 60 fps it gains nothing, and lap times can come out a few seconds slower.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_AUDIO_CUSTOM_AT_START */ { XS_AUDIO_CUSTOM_AT_START, "Custom music at start", "With a music folder chosen, the game starts on the custom soundtrack you last picked in Driver Details > Settings > EA GAMES TRAX (the first one until you pick), so you do not have to pick it every time. Picking EA GAMES TRAX there starts it on EA GAMES TRAX from then on. Off starts on EA GAMES TRAX every time, as the original does.", 1, FMT_PLAIN, NULL, 0 },
     /* XS_GRAPHICS_TEXUP */     { XS_GRAPHICS_TEXUP, "Texture upscale", "Sharpens the textures of the world (signs, buildings, cars) on the graphics card while you play. FSRCNNX is sharper, NNEDI3 softer. A texture first shows as the game has it and turns sharp a moment later. Sharpened textures are kept on disk, so the next race has them at once. See-through parts (fences, trees) keep the game's own edges. Uses more video memory. Off shows the game's own textures.", 1, FMT_PLAIN, n_texup, 0 },
     /* XS_GRAPHICS_TEXUP_SCALE */ { XS_GRAPHICS_TEXUP_SCALE, "Upscale scale", "How much larger the sharpened textures are. 4x looks finer up close, but it needs four times the video memory of 2x and takes longer to fill in. Textures over 256 pixels a side get 2x.", 1, FMT_PLAIN, n_texup_sc, 0 },
     /* XS_GRAPHICS_TEXUP_ROADS */ { XS_GRAPHICS_TEXUP_ROADS, "Upscale road surfaces", "Off leaves the road surfaces as the game has them: the upscalers can make their fine grain look noisy. On upscales them too.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_DISPLAY_CRASHNAV_MAP */ { XS_DISPLAY_CRASHNAV_MAP, "Crash Nav map", "The map in Crash Nav (Select Location) with Widescreen HUD on in 16:9. Full width spreads the map, its route and its markers across the screen like the frame around it. 4:3 keeps the map the shape of the rest of the menu, with the frame beside it. Changes at once.", 1, FMT_PLAIN, n_crashnav_map, 0 },
+    /* XS_DISPLAY_CRASHNAV_MAP */ { XS_DISPLAY_CRASHNAV_MAP, "Crash Nav map", "The map in Crash Nav (Select Location) with Widescreen HUD on in 16:9. Full width spreads the map, its route and its markers across the screen like the frame around it. 4:3 keeps the map the shape of the rest of the menu, with the frame beside it.", 1, FMT_PLAIN, n_crashnav_map, 0 },
     /* XS_GRAPHICS_TEXUP_PRELOAD */ { XS_GRAPHICS_TEXUP_PRELOAD, "Upscale while loading", "Does most of the sharpening during the loading screen and the countdown, so the first race on a new track has less of it to do; a fast PC can leave it off.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GRAPHICS_SOFTBODY */  { XS_GRAPHICS_SOFTBODY, "Soft-body damage", "Cars crumple, tear and bend where they are hit, with the game's own sparks and debris where metal rips, instead of only losing panels. Drawn only: handling and the race are unchanged. Costs CPU in big pile-ups. Applies after a restart.", 1, FMT_PLAIN, NULL, 0 },
-    /* XS_GAME_LANGUAGE */      { XS_GAME_LANGUAGE, "Language", "The language of the game's text, speech and films, as an Xbox set to that language would show them. Only the languages on your disc are offered. Applies after a restart.", 1, FMT_PLAIN, n_language, 0 },
+    /* XS_DISPLAY_PICTURES */   { XS_DISPLAY_PICTURES, "4:3 pictures", "The game's full-screen pictures (loading screens, the films behind the menus, the Crash Nav map) with Widescreen HUD on in 16:9. They are 4:3: Blurred sides (the default) keeps them 4:3 with a blurred, darker copy beside them, Black bars with dark sides. Stretched spreads them across the screen, as the original does in widescreen.", 1, FMT_PLAIN, n_pictures, 0 },
+    /* XS_GRAPHICS_FILMUP */    { XS_GRAPHICS_FILMUP, "Film upscale", "Sharpens the game's films (the intro, the menu background) on the graphics card while they play: first a light pass over the square blocks of the video compression, then an upscale to twice the size. Best uses FSRCNNX, a small neural network; Cheap uses AMD FSR 1, which costs much less. Off shows the films as the game has them. Races are not affected.", 1, FMT_PLAIN, n_filmup, 0 },
+    /* XS_ONLINE_MODE */ { XS_ONLINE_MODE, "Online play", "Internet: the game's Xbox Live menus play through the lobby server in the Server row below. Local network: this copy runs a lobby for the computers on your network. Off: as a console without a network cable. From the next start.", 1, FMT_PLAIN, n_online, 0 },
+    /* XS_ONLINE_REACTIONS */ { XS_ONLINE_REACTIONS, "Quick reactions", "Shows the quick reactions (GG, LET'S GO! and the like) the other players send with the d-pad in the game lobby and on the results screen. Off hides them; the reactions are still sent.", 1, FMT_PLAIN, NULL, 0 },
+    /* XS_GAME_LANGUAGE */      { XS_GAME_LANGUAGE, "Language", "The language of the game's text, speech and films, as an Xbox set to that language would show them. Only the languages on your disc are offered.", 1, FMT_PLAIN, n_language, 0 },
+    /* XS_GRAPHICS_SOFTBODY */  { XS_GRAPHICS_SOFTBODY, "Soft-body damage", "Cars crumple, tear and bend where they are hit, with the game's own sparks and debris where metal rips, instead of only losing panels. Drawn only: handling and the race are unchanged. Costs CPU in big pile-ups.", 1, FMT_PLAIN, NULL, 0 },
 #if defined(__ANDROID__)
     /* XS_INPUT_VIBRATION */    { XS_INPUT_VIBRATION, "Vibration", "Where rumble goes. Auto uses this device's vibrator while its built-in controls are in use. External controllers don't rumble on Android; This device vibrates anyway.", 1, FMT_PLAIN, n_vibration, 0 },
     /* XS_INPUT_TOUCH */        { XS_INPUT_TOUCH, "Touch controls", "On-screen controls. In a race: steer with the left thumb anywhere on the left half, GAS, BRAKE and BOOST on the right (BOOST keeps accelerating). In menus: a d-pad and A B X Y. Pause and this menu are at the top, left of centre. Auto hides them while a controller is used and shows them again when you touch the screen.", 1, FMT_PLAIN, n_touch, 0 },
@@ -361,23 +575,31 @@ static const Meta &meta(int id)
 #if defined(__ANDROID__)
 extern "C" const char *nvk_core_describe(void);   /* nv2a_vk_core.c */
 #endif
-enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER };
+enum RowKind { R_SETTING, R_ACTION, R_INFO, R_SPEAKERS, R_FOLDER, R_KEY, R_HOST,
+               R_HEADER,                       /* a section's title (BO-327): text only */
+               R_ADV };                        /* "Show advanced settings": the page's switch (BO-338) */
 enum Action { A_NONE,                                               /* 0 is "no question asked" (s_confirm) */
               A_RESET_PAGE, A_RESET_ALL, A_REPORT, A_REPORT_SHOT,
               A_HOST0, A_HOST1, A_HOST2, A_HOST3,                  /* xbox_OverlaySetHostRows */
               A_SHADERS,                                          /* the Graphics page's shader build */
               A_MIXER,                                            /* the Mixer page (overlay_mixer.inc) */
               A_UPDATE_CHECK, A_UPDATE_OPEN,                      /* Check for updates (xbox_update.h) */
+              A_ONLINE_NAME,                                      /* edit the online name (BO-134) */
+              A_ONLINE_SERVER,                                    /* edit the lobby server's address (BO-134) */
+              A_ONLINE_CODE,                                      /* edit the game code (BO-335) */
               A_STEAM_ART,                                        /* xbox_OverlaySetSteamArt */
-              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_XBOX, A_SAVE_RESTORE, A_SAVE_CANCEL,  /* xbox_OverlaySetSaveIO */
+              A_SAVE_EXPORT, A_SAVE_IMPORT, A_SAVE_BROWSE, A_SAVE_XBOX, A_SAVE_RESTORE,           /* xbox_OverlaySetSaveIO */
+              A_PS2_SLOT0, A_PS2_SLOT1, A_PS2_SLOT2, A_PS2_CANCEL, A_SAVE_CANCEL,  /* BO-323: a PS2 save's profiles */
               A_CHEAT0, A_CHEAT1, A_CHEAT2, A_CHEAT3,              /* xbox_OverlaySetCheats */
               A_CHEAT_KEEP, A_CHEAT_DISCARD,
               A_HDR_RESET,                                        /* BO-110: HDR levels to the display's */
+              A_KEYS_RESET,                                       /* BO-267: the keyboard keys to the defaults */
+              A_KEYS_PAGE, A_KEYS_BACK,                           /* BO-338: the keyboard keys' sub-page, and back from it */
               A_RESTART_PIN, A_QUIT };       /* the two rows at the foot of every page: they ask first */
 
 /* The most rows a page has (the Audio page, with the music folder's lines
- * above its settings; the Advanced page with the save and restart rows). */
-#define OVERLAY_ROWS 56
+ * above its settings; the System page with the save and restart rows). */
+#define OVERLAY_ROWS 64
 
 /* ── restart (recomp_restart.h) ────────────────────────────────────── */
 
@@ -429,6 +651,31 @@ void xbox_OverlaySetHostRows(int n, const char *(*fn)(int row, int activate))
     s_host_n = fn ? (n > XBOX_OVERLAY_HOST_ROWS ? XBOX_OVERLAY_HOST_ROWS : n) : 0;
 }
 
+/* ── the host's own page (xbox_OverlaySetHostPage) ─────────────────── */
+
+static const xbox_overlay_hostpage *s_hp;
+static char s_hp_text[XBOX_OVERLAY_HOSTPAGE_ROWS][200];
+
+void xbox_OverlaySetHostPage(const xbox_overlay_hostpage *page)
+{
+    s_hp = page;
+    k_page_name[P_HOST] = page && page->name && *page->name ? page->name : "Mods";
+}
+
+static int hp_count()
+{
+    int n = s_hp && s_hp->count ? s_hp->count() : 0;
+    return n > XBOX_OVERLAY_HOSTPAGE_ROWS ? XBOX_OVERLAY_HOSTPAGE_ROWS : n < 0 ? 0 : n;
+}
+
+static void hp_row(int i, xbox_overlay_hostrow *o)
+{
+    memset(o, 0, sizeof *o);
+    o->enabled = 1;
+    if (s_hp && s_hp->row)
+        s_hp->row(i, o);
+}
+
 /* ── cheats (xbox_OverlaySetCheats) ────────────────────────────────── */
 
 /* A cheat session: from the first cheat switched on, the title's saves go
@@ -459,7 +706,7 @@ void xbox_OverlaySetCheats(const xbox_cheat *list, int n)
 }
 
 /* The save root, once the kernel's paths are set up (the first time the
- * Advanced page is built): a copy an earlier run left is removed then. */
+ * System page is built): a copy an earlier run left is removed then. */
 static bool cheat_ready()
 {
     if (!s_cheat_n)
@@ -743,13 +990,35 @@ static void sio_stage(const char *folder)
     }
 }
 
-/* An original Xbox save (folder) is made into an export-shaped folder, with
- * its profile signed again, and staged like any other import. */
-static void sio_stage_xbox(const char *folder)
+/* A PS2 save with more than one profile: the folder and its profiles, until
+ * one is picked (BO-323). */
+static char s_ps2_folder[1024];
+static xbox_ps2_choice s_ps2_choice;
+static char s_ps2_label[3][128];
+
+/* An original Xbox save (folder), or a Burnout 3 save from the PS2 (a card
+ * image, a save file or folder in it), is made into an export-shaped folder,
+ * its profile signed for the port, and staged like any other import.
+ * `ps2_slot` 0: the PS2 save's only profile (several: they are offered). */
+static void sio_stage_xbox(const char *folder, int ps2_slot = 0)
 {
     char out[1024] = "", info[400] = "", err[1400] = "";
-    if (!xbox_SaveImportPrepare(folder, s_sio_id, s_sio_dir, s_sio_dir, out, sizeof out, info, sizeof info,
-                                err, sizeof err)) {
+    xbox_ps2_choice ch;
+    s_ps2_folder[0] = 0;
+    if (!xbox_SaveImportPrepareSlot(folder, s_sio_id, s_sio_dir, s_sio_dir, ps2_slot, &ch, out, sizeof out,
+                                    info, sizeof info, err, sizeof err)) {
+        if (ps2_slot == 0 && ch.count > 1) {
+            /* Rows to choose from on the page (sio_rows). */
+            snprintf(s_ps2_folder, sizeof s_ps2_folder, "%s", folder);
+            s_ps2_choice = ch;
+            for (int i = 0; i < ch.count && i < 3; i++)
+                snprintf(s_ps2_label[i], sizeof s_ps2_label[i], "Import PS2 profile %d: %.100s", ch.slot[i],
+                         ch.line[i]);
+            snprintf(s_sio_msg, sizeof s_sio_msg, "%s", err);
+            snprintf(s_sio_info, sizeof s_sio_info, "This PS2 save has %d profiles: pick one above.", ch.count);
+            fprintf(stderr, LOGP "ps2 save has %d profiles, waiting for a choice\n", ch.count);
+            return;
+        }
         snprintf(s_sio_msg, sizeof s_sio_msg, "%s", err);
         snprintf(s_sio_info, sizeof s_sio_info, "Not imported (reason in the note below).");
         fprintf(stderr, LOGP "xbox save import refused: %s\n", err);
@@ -760,8 +1029,10 @@ static void sio_stage_xbox(const char *folder)
         char more[2600];
         snprintf(more, sizeof more, "%s  %s", info, s_sio_msg);
         snprintf(s_sio_msg, sizeof s_sio_msg, "%s", more);
-        snprintf(s_sio_info, sizeof s_sio_info, "Xbox save ready. Restart the game to import it.");
-        snprintf(s_restart_save, sizeof s_restart_save, "An Xbox save import is waiting for the next start.");
+        const bool ps2 = !strncmp(info, "PS2 ", 4);
+        snprintf(s_sio_info, sizeof s_sio_info, "%s save ready. Restart the game to import it.", ps2 ? "PS2" : "Xbox");
+        snprintf(s_restart_save, sizeof s_restart_save, "A%s save import is waiting for the next start.",
+                 ps2 ? " PS2" : "n Xbox");
         fprintf(stderr, LOGP "xbox save import staged: %s\n", info);
     }
 }
@@ -770,7 +1041,7 @@ static void xbox_browser_open()
 {
     xsb_options o;
     memset(&o, 0, sizeof o);
-    o.use_label = "Import the Xbox save in this folder";
+    o.use_label = "Import the save in this folder";
     o.top_label = "Home folder";
     o.mark = sio_mark_xbox;
     s_fb_purpose = FB_XBOX;
@@ -844,6 +1115,21 @@ static void sio_action(int action)
         s_fb_scroll = true;
         break;
     }
+    case A_PS2_SLOT0:
+    case A_PS2_SLOT1:
+    case A_PS2_SLOT2: {
+        const int k = action - A_PS2_SLOT0;
+        char folder[1024];
+        snprintf(folder, sizeof folder, "%s", s_ps2_folder);
+        if (folder[0] && k < s_ps2_choice.count)
+            sio_stage_xbox(folder, s_ps2_choice.slot[k]);
+        break;
+    }
+    case A_PS2_CANCEL:
+        s_ps2_folder[0] = 0;
+        snprintf(s_sio_msg, sizeof s_sio_msg, "Nothing imported. Your current save stays.");
+        snprintf(s_sio_info, sizeof s_sio_info, "PS2 import cancelled.");
+        break;
     case A_SAVE_CANCEL:
         recomp_save_import_cancel(s_sio_dir);
         s_restart_save[0] = 0;
@@ -872,7 +1158,7 @@ static void browser_count(const xsb_row &r, char *out, size_t n)
     if (r.kind == XSB_OFF || r.kind == XSB_UP)
         return;
     if (s_fb_purpose == FB_SAVE || s_fb_purpose == FB_XBOX) {
-        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? (s_fb_purpose == FB_XBOX ? "an Xbox save" : "a save of this game")
+        snprintf(out, n, "%s", r.songs < 0 ? "..." : r.songs ? (s_fb_purpose == FB_XBOX ? (r.songs == 2 ? "a PS2 save" : "an Xbox save") : "a save of this game")
                                : r.more ? "not checked" : "");
         return;
     }
@@ -970,6 +1256,12 @@ static void update_open_page()
 {
     if (s_up_state.load(std::memory_order_acquire) != 2 || s_up_res.kind != XU_NEWER || !s_up_res.url[0])
         return;
+    s_url_want.store(true);                /* opened by xbox_OverlayPoll (BO-347) */
+}
+
+/* On the main loop's thread (xbox_OverlayPoll). */
+static void update_open_page_now()
+{
     fprintf(stderr, LOGP "update check: opening %s\n", s_up_res.url);
     if (SDL_OpenURL(s_up_res.url) != 0)
         snprintf(s_up_open_err, sizeof s_up_open_err, "Could not open the page: %.120s", SDL_GetError());
@@ -1066,10 +1358,12 @@ struct Row {
     RowKind kind;
     xs_id id;                         /* R_SETTING */
     int action;                       /* R_ACTION */
-    const char *text;                 /* R_ACTION label, R_INFO line */
+    const char *text;                 /* R_ACTION label, R_INFO line, R_HEADER title */
+    bool sub = false;                 /* indented under the row above it (BO-327) */
+    bool adv = false;                 /* an advanced row: only with "Show advanced settings" on (BO-338) */
 };
 
-/* The Advanced page's three lines on what reaches the glass (below, with
+/* The System page's three lines on what reaches the glass (below, with
  * the frame-time graph). */
 static char s_glass_info[3][160];
 static void glass_info();
@@ -1093,11 +1387,90 @@ static void diag_info()
         snprintf(s_diag_info, sizeof s_diag_info, "Log: %s", shown);
 }
 
+static bool keys_locked();
+
+/* BO-327: the keyboard's key rows only where a keyboard is likely: not on a
+ * Steam Deck and not under gamescope (Game Mode, Big Picture), where they
+ * were 14 rows nobody could use. The keys still work; settings.toml's
+ * input.keys or a desktop session changes them. */
+static bool keys_shown()
+{
+#if defined(__ANDROID__)
+    return false;
+#else
+    /* gamescope as the game's host sees it: its Wayland display, or the
+     * session's desktop name (the port's own check, BO-103). */
+    const char *gs = getenv("GAMESCOPE_WAYLAND_DISPLAY"), *de = getenv("XDG_CURRENT_DESKTOP");
+    return !recomp_host_is_steam_deck() && !(gs && *gs) && !(de && !strcmp(de, "gamescope"));
+#endif
+}
+
+/* The window's size as the last frame drew it (build_pages_inner). */
+static float s_disp_w, s_disp_h;
+
+/* BO-327: Present fit only does something with a 16:9 picture on a 16:10
+ * window: the row shows only then (the window's shape from the last frame;
+ * before the first, from SDL). */
+static bool fit_relevant()
+{
+    float w = s_disp_w, h = s_disp_h;
+    if ((w <= 0.0f || h <= 0.0f) && s_win) {
+        int iw = 0, ih = 0;
+        SDL_GetWindowSize(s_win, &iw, &ih);
+        w = (float)iw, h = (float)ih;
+    }
+    if (w <= 0.0f || h <= 0.0f)
+        return false;
+    return fabsf(w / h - 1.6f) < 0.02f && (int)xbox_SettingValue(XS_DISPLAY_ASPECT) == 1;
+}
+
+static bool patch_on(xs_id id)
+{
+    return recomp_patch_enabled(xbox_SettingGet(id)->key) != 0;
+}
+
+/* BO-338: the advanced rows of a page out of its list while the page's
+ * switch is off (a section title left with nothing under it goes too), and
+ * the switch itself above the page's reset rows, on any page that has
+ * advanced rows. */
+static int adv_filter(int page, Row *r, int n)
+{
+    int hidden = 0;
+    for (int i = 0; i < n; i++)
+        hidden += r[i].adv ? 1 : 0;
+    if (!hidden)
+        return n;
+    if (!s_adv[page]) {
+        int k = 0;
+        for (int i = 0; i < n; i++)
+            if (!r[i].adv)
+                r[k++] = r[i];
+        n = k;
+        k = 0;
+        for (int i = 0; i < n; i++) {
+            if (r[i].kind == R_HEADER
+                && (i + 1 >= n || r[i + 1].kind == R_HEADER
+                    || (r[i + 1].kind == R_ACTION && (r[i + 1].action == A_RESET_PAGE || r[i + 1].action == A_RESET_ALL))))
+                continue;
+            r[k++] = r[i];
+        }
+        n = k;
+    }
+    int at = n;
+    while (at > 0 && r[at - 1].kind == R_ACTION && (r[at - 1].action == A_RESET_PAGE || r[at - 1].action == A_RESET_ALL))
+        at--;
+    for (int i = n; i > at; i--)
+        r[i] = r[i - 1];
+    r[at] = Row{ R_ADV, XS_COUNT, 0, "Show advanced settings" };
+    return n + 1;
+}
+
 static int page_rows(int page, Row *r)
 {
     int n = 0;
-    bool staged = false;              /* a save import waits for the next start (Advanced) */
+    bool staged = false;              /* a save import waits for the next start (System) */
 #define SET(i)  do { if (!xbox_SettingsHidden(i)) r[n++] = Row{ R_SETTING, (i), 0, NULL }; } while (0)
+#define SUB(i)  do { if (!xbox_SettingsHidden(i)) r[n++] = Row{ R_SETTING, (i), 0, NULL, true }; } while (0)    /* indented under the row above */
     /* The title's own settings for a page (xbox_SettingsAddTitle). */
 #define TITLE_ROWS(xp) \
     for (int t_ = XS_TITLE_0; t_ <= XS_TITLE_LAST; t_++) { \
@@ -1108,9 +1481,20 @@ static int page_rows(int page, Row *r)
 #define ACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t) }
 #define INFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t) }
 #define WARN(t) r[n++] = Row{ R_INFO, XS_COUNT, 1, (t) }   /* in the attention yellow */
+#define HEAD(t) r[n++] = Row{ R_HEADER, XS_COUNT, 0, (t) }
 #define SPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t) }
+    /* The same for an advanced row (BO-338): hidden unless the page's switch is on. */
+#define ASET(i)  r[n++] = Row{ R_SETTING, (i), 0, NULL, false, true }
+#define ASUB(i)  r[n++] = Row{ R_SETTING, (i), 0, NULL, true, true }
+#define AACT(a, t) r[n++] = Row{ R_ACTION, XS_COUNT, (a), (t), false, true }
+#define AINFO(t) r[n++] = Row{ R_INFO, XS_COUNT, 0, (t), false, true }
+#define AHEAD(t) r[n++] = Row{ R_HEADER, XS_COUNT, 0, (t), false, true }
+#define ASPK(a, t) r[n++] = Row{ R_SPEAKERS, XS_COUNT, (a), (t), false, true }
     switch (page) {
     case P_DISPLAY:
+        /* The screen, HDR and the frame rate (BO-327: Power is no page of
+         * its own; High refresh rate and the performance overlay joined
+         * Power mode here). */
 #if !defined(__ANDROID__)
         /* Android: the game is the whole screen always (immersive); out of
          * fullscreen SDL brings the system bars back over a smaller window,
@@ -1118,7 +1502,22 @@ static int page_rows(int page, Row *r)
         SET(XS_DISPLAY_FULLSCREEN);
 #endif
         SET(XS_DISPLAY_ASPECT); SET(XS_DISPLAY_FILTER);
-        SET(XS_DISPLAY_OVERSCAN); SET(XS_DISPLAY_FIT);
+        SET(XS_DISPLAY_OVERSCAN);
+        if (fit_relevant())
+            SET(XS_DISPLAY_FIT);
+        /* BO-110: HDR, where the display can show more than SDR white. */
+        if (nv2a_host_hdr_potential() > 1.0f) {
+            SET(XS_GRAPHICS_HDR);
+            if (xbox_SettingValue(XS_GRAPHICS_HDR) != 0.0) {
+                SUB(XS_GRAPHICS_HDR_PEAK); SUB(XS_GRAPHICS_HDR_PAPER); SUB(XS_GRAPHICS_HDR_HUD);
+                /* BO-227: Metal's HDR pass takes these too now. */
+                ASUB(XS_GRAPHICS_HDR_SHADOWS); ASUB(XS_GRAPHICS_HDR_HIGHLIGHTS);
+                r[n++] = Row{ R_ACTION, XS_COUNT, A_HDR_RESET, "Reset HDR to the display's defaults", true };
+            }
+        }
+        HEAD("Frame rate");
+        if (patch_on(XS_GRAPHICS_HIGH_REFRESH))
+            SET(XS_GRAPHICS_HIGH_REFRESH);
 #if defined(__APPLE__)
         if (!s_vulkan)                 /* the Metal presenter's (BO-115) */
             SET(XS_DISPLAY_PRESENT_TIMING);
@@ -1127,29 +1526,14 @@ static int page_rows(int page, Row *r)
         if (s_vulkan)                  /* the Vulkan presenter's queue (BO-110, BO-207) */
             SET(XS_DISPLAY_FRAME_PACING);
 #endif
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_SPEED_UNITS)->key))
-            SET(XS_GAME_SPEED_UNITS);
-        {
-            unsigned langs = xbox_SettingsLanguages();
-            if (langs & (langs - 1))    /* more than one on the title's disc */
-                SET(XS_GAME_LANGUAGE);
-        }
-        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_HUD_FIX)->key))
-            SET(XS_DISPLAY_HUD_FIX);
-        /* The map screen's shape: only with the widescreen HUD on. */
-        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_CRASHNAV_MAP)->key) &&
-            xbox_SettingValue(XS_DISPLAY_HUD_FIX) != 0)
-            SET(XS_DISPLAY_CRASHNAV_MAP);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_ULTRAWIDE)->key))
-            SET(XS_DISPLAY_ULTRAWIDE);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_SCORE_BOARD)->key))
-            SET(XS_DISPLAY_SCORE_BOARD);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_DISPLAY_RIVAL_MARKER)->key))
-            SET(XS_DISPLAY_RIVAL_MARKER);
+        SET(XS_POWER_MODE);
+        SET(XS_ADVANCED_PERF);
         TITLE_ROWS(XS_PAGE_DISPLAY);
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_GRAPHICS:
+        /* Picture quality, then the sharper art, then the game's own
+         * effects and detail distances. */
         SET(XS_GRAPHICS_RENDER_SCALE); SET(XS_GRAPHICS_ANISO);
         SET(XS_GRAPHICS_AA); SET(XS_GRAPHICS_SHARPEN);
         {   /* The Vulkan path's two renderers; the other backends have one. */
@@ -1157,49 +1541,52 @@ static int page_rows(int page, Row *r)
             if (be && (!strcasecmp(be, "vulkan") || !strcasecmp(be, "vk") || !strcasecmp(be, "native")))
                 SET(XS_GRAPHICS_RENDERER);
         }
-        SET(XS_GRAPHICS_LOD_BIAS);
-        if (!nv2a_texscale_held())      /* RECOMP_DEBUG=ui_scale_hold=1 (nv2a_texscale.h) */
-            SET(XS_GRAPHICS_UI_SCALE);
-        if (nv2a_texup_supported()) {   /* BO-245: a backend that can (Metal for now) */
-            SET(XS_GRAPHICS_TEXUP);
-            if (xbox_SettingValue(XS_GRAPHICS_TEXUP) != 0) {
-                /* A Steam Deck is offered 2x only: no scale row there. */
-                if (nv2a_texup_max_scale() > 2)
-                    SET(XS_GRAPHICS_TEXUP_SCALE);
-                SET(XS_GRAPHICS_TEXUP_ROADS);
-                SET(XS_GRAPHICS_TEXUP_PRELOAD);
+        {
+            const bool ui = !nv2a_texscale_held();     /* RECOMP_DEBUG=ui_scale_hold=1 (nv2a_texscale.h) */
+            const bool tx = nv2a_texup_supported();    /* BO-245: a backend that can */
+            const bool fm = nv2a_filmup_supported();   /* BO-136 */
+            if (ui || tx || fm)
+                HEAD("Sharper art");
+            if (ui)
+                SET(XS_GRAPHICS_UI_SCALE);
+            if (tx) {
+                SET(XS_GRAPHICS_TEXUP);
+                if (xbox_SettingValue(XS_GRAPHICS_TEXUP) != 0) {
+                    /* A Steam Deck is offered 2x only: no scale row there. */
+                    if (nv2a_texup_max_scale() > 2)
+                        SUB(XS_GRAPHICS_TEXUP_SCALE);
+                    SUB(XS_GRAPHICS_TEXUP_ROADS);
+                    ASUB(XS_GRAPHICS_TEXUP_PRELOAD);
+                }
             }
+            if (fm)
+                SET(XS_GRAPHICS_FILMUP);
         }
         /* Dither (graphics.dither) has no row: settings.toml or
          * RECOMP_GFX_DITHER only (docs/runtime/overlay.md). */
-        /* BO-110: HDR, where the display can show more than SDR white. */
-        if (nv2a_host_hdr_potential() > 1.0f) {
-            SET(XS_GRAPHICS_HDR);
-            if (xbox_SettingValue(XS_GRAPHICS_HDR) != 0.0) {
-                SET(XS_GRAPHICS_HDR_PEAK); SET(XS_GRAPHICS_HDR_PAPER); SET(XS_GRAPHICS_HDR_HUD);
-                /* BO-227: Metal's HDR pass takes these too now. */
-                SET(XS_GRAPHICS_HDR_SHADOWS); SET(XS_GRAPHICS_HDR_HIGHLIGHTS);
-                ACT(A_HDR_RESET, "Reset HDR to the display's defaults");
-            }
+        {
+            const bool any = patch_on(XS_GRAPHICS_BLOOM) || patch_on(XS_GRAPHICS_MOTION_BLUR)
+                             || patch_on(XS_GRAPHICS_SOFTBODY)
+                             || patch_on(XS_GRAPHICS_VEHICLE_DETAIL) || patch_on(XS_GRAPHICS_SCENERY_DETAIL);
+            HEAD(any ? "Effects and detail" : "Detail");
         }
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_BLOOM)->key))
+        if (patch_on(XS_GRAPHICS_BLOOM))
             SET(XS_GRAPHICS_BLOOM);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_MOTION_BLUR)->key))
+        if (patch_on(XS_GRAPHICS_MOTION_BLUR))
             SET(XS_GRAPHICS_MOTION_BLUR);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_CRASH_60FPS)->key))
-            SET(XS_GRAPHICS_CRASH_60FPS);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SPLIT_60FPS)->key))
-            SET(XS_GRAPHICS_SPLIT_60FPS);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_HIGH_REFRESH)->key))
-            SET(XS_GRAPHICS_HIGH_REFRESH);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SOFTBODY)->key))
+        /* Soft-body damage (PR #88): read at the start (RESTART tag). */
+        if (patch_on(XS_GRAPHICS_SOFTBODY))
             SET(XS_GRAPHICS_SOFTBODY);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GAME_RACE_CLOCK)->key))
-            SET(XS_GAME_RACE_CLOCK);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_VEHICLE_DETAIL)->key))
+        if (patch_on(XS_GRAPHICS_VEHICLE_DETAIL))
             SET(XS_GRAPHICS_VEHICLE_DETAIL);
-        if (recomp_patch_enabled(xbox_SettingGet(XS_GRAPHICS_SCENERY_DETAIL)->key))
+        if (patch_on(XS_GRAPHICS_SCENERY_DETAIL))
             SET(XS_GRAPHICS_SCENERY_DETAIL);
+        ASET(XS_GRAPHICS_LOD_BIAS);
+        if (s_sb) {
+            sb_texts();
+            AINFO(s_sb_info);
+            AACT(A_SHADERS, s_sb_label);
+        }
 #if defined(__ANDROID__)
         {
             /* Which driver draws: chosen before the game starts, in the app's
@@ -1213,22 +1600,68 @@ static int page_rows(int page, Row *r)
         }
 #endif
         TITLE_ROWS(XS_PAGE_GRAPHICS);
+        /* The port's own rows (xbox_OverlaySetHostRows: Android's driver
+         * choice). */
         for (int i = 0; i < s_host_n; i++) {
             const char *t = s_host_fn(i, 0);
             if (t && *t)
                 ACT(A_HOST0 + i, t);
         }
-        if (s_sb) {
-            sb_texts();
-            INFO(s_sb_info);
-            ACT(A_SHADERS, s_sb_label);
+        ACT(A_RESET_PAGE, "Reset this page to the defaults");
+        break;
+    case P_GAME:
+        /* What the game draws and does (BO-327): the title's patches; first
+         * its language, where the disc has more than one (game.language). */
+        {
+            unsigned langs = xbox_SettingsLanguages();
+            if (langs & (langs - 1))    /* more than one on the title's disc */
+                SET(XS_GAME_LANGUAGE);
         }
+        if (patch_on(XS_DISPLAY_HUD_FIX))
+            SET(XS_DISPLAY_HUD_FIX);
+        /* The 4:3 pictures and the map screen's shape: only with the
+         * widescreen HUD on; the map's own row only while the pictures are
+         * stretched (4:3 pictures take the map with them, BO-315). */
+        if (patch_on(XS_DISPLAY_PICTURES) && xbox_SettingValue(XS_DISPLAY_HUD_FIX) != 0)
+            SET(XS_DISPLAY_PICTURES);
+        if (patch_on(XS_DISPLAY_CRASHNAV_MAP) && xbox_SettingValue(XS_DISPLAY_HUD_FIX) != 0 &&
+            (!patch_on(XS_DISPLAY_PICTURES) || xbox_SettingValue(XS_DISPLAY_PICTURES) == 0)) {
+            if (patch_on(XS_DISPLAY_PICTURES))
+                SUB(XS_DISPLAY_CRASHNAV_MAP);
+            else
+                SET(XS_DISPLAY_CRASHNAV_MAP);
+        }
+        if (patch_on(XS_DISPLAY_ULTRAWIDE))
+            SET(XS_DISPLAY_ULTRAWIDE);
+        if (patch_on(XS_DISPLAY_SCORE_BOARD))
+            SET(XS_DISPLAY_SCORE_BOARD);
+        if (patch_on(XS_DISPLAY_RIVAL_MARKER))
+            SET(XS_DISPLAY_RIVAL_MARKER);
+        if (patch_on(XS_GAME_SPEED_UNITS))
+            SET(XS_GAME_SPEED_UNITS);
+        if (patch_on(XS_GRAPHICS_CRASH_60FPS) || patch_on(XS_GRAPHICS_SPLIT_60FPS)
+            || patch_on(XS_AUDIO_SPLIT_MUSIC) || patch_on(XS_GAME_RACE_CLOCK))
+            HEAD("Frame rate and split screen");
+        if (patch_on(XS_GRAPHICS_CRASH_60FPS))
+            SET(XS_GRAPHICS_CRASH_60FPS);
+        if (patch_on(XS_GRAPHICS_SPLIT_60FPS))
+            SET(XS_GRAPHICS_SPLIT_60FPS);
+        if (patch_on(XS_AUDIO_SPLIT_MUSIC))
+            SET(XS_AUDIO_SPLIT_MUSIC);
+        if (patch_on(XS_GAME_RACE_CLOCK))
+            SET(XS_GAME_RACE_CLOCK);
+        if (!n)
+            INFO("This game has no settings of its own here.");
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
     case P_AUDIO:
-        /* The player's own music first: it is what this page is opened for
-         * most (BO-108). Its status line and notes follow it. */
+        /* Volume and mute first (BO-327; BO-108 had the music folder on
+         * top), then the player's own music, then the speakers' tools. */
+        SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
+        if (menusnd_named())
+            ASET(XS_AUDIO_MENU_SOUNDS);
         if (s_mf) {
+            HEAD("Custom music");
             r[n++] = Row{ R_FOLDER, XS_COUNT, 0, "Custom music folder" };
             s_mf_status[0] = 0;
             if (s_mf->status)
@@ -1237,82 +1670,94 @@ static int page_rows(int page, Row *r)
                 INFO(s_mf_status);
             /* More lines of the port's (what a scan left out, by name), as
              * far as the page has room. */
-            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < OVERLAY_ROWS - 12; k++) {
+            for (int k = 0; k < MUSIC_NOTES && s_mf->note && n < OVERLAY_ROWS - 14; k++) {
                 s_mf_note[k][0] = 0;
                 if (!s_mf->note(k, s_mf_note[k], sizeof s_mf_note[k]) || !s_mf_note[k][0])
                     break;
                 INFO(s_mf_note[k]);
             }
-        }
-        if (s_mf)
             SET(XS_AUDIO_CUSTOM_AT_START);
-        if (s_mf)
             SET(XS_AUDIO_CUSTOM_LEVEL);
-        SET(XS_AUDIO_VOLUME); SET(XS_AUDIO_MUTE); SET(XS_AUDIO_MUTE_BG); SET(XS_AUDIO_SPEAKERS);
-        if (menusnd_named())
-            SET(XS_AUDIO_MENU_SOUNDS);
+        }
+        HEAD("Speakers and mixer");
         /* The dry effect sends' level: only where no model of the title's
          * effects image runs (apu_gp.h); with one they are not dry. */
         if (!apu_gp_wired())
-            SET(XS_AUDIO_FX_LEVEL);
+            ASET(XS_AUDIO_FX_LEVEL);
         /* audio.lfe_lowpass has no row: the stock 120 Hz is the console's,
          * and the Mixer page has its own LFE low-pass for tuning. */
         if (apu_bus_count() > 0)
-            ACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
-        if (recomp_patch_enabled(xbox_SettingGet(XS_AUDIO_SPLIT_MUSIC)->key))
-            SET(XS_AUDIO_SPLIT_MUSIC);
+            AACT(A_MIXER, "Mixer: buses, sends, LFE, limiter, meters");
         TITLE_ROWS(XS_PAGE_AUDIO);
         SPK(0, "Speaker test, game mix");
-        SPK(1, "Speaker test, direct");
+        ASPK(1, "Speaker test, direct");
         if (mcpx_apu_title_channels() != 6)
             INFO("The output is stereo: each speaker is folded to left/right.");
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
-    case P_INPUT:
-        SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE); SET(XS_INPUT_RUMBLE);
-        SET(XS_INPUT_FACE_LAYOUT);
+    case P_CONTROLS:
+        /* The keyboard's keys, on a sub-page of their own (BO-338): a way
+         * back first, then the keys and their reset. */
+        if (s_keys_page && keys_shown()) {
+            ACT(A_KEYS_BACK, "Back to Controls");
+            /* BO-267: the keyboard's keys, one row per button of the pad. */
+            HEAD("Keyboard keys: two for each button of the pad");
+            for (int a = 0; a < XBOX_KEYACT_COUNT; a++)
+                r[n++] = Row{ R_KEY, XS_COUNT, a, NULL };
+            if (!keys_locked())
+                ACT(A_KEYS_RESET, "Reset keyboard keys to the defaults");
+            break;
+        }
+        /* What players change first: the layout and the prompts (BO-327),
+         * then the feel, then touch (Android) or the keyboard. */
         if (xbox_InputControlSchemeOffered())
             SET(XS_INPUT_CONTROL_SCHEME);
+        SET(XS_INPUT_FACE_LAYOUT);
 #if !defined(__ANDROID__)
+        /* PR #7: the first controller's player (keyboard split screen). */
         SET(XS_INPUT_FIRST_PAD);
 #endif
         SET(XS_INPUT_GLYPHS);
+        SET(XS_INPUT_RUMBLE);
 #if defined(__ANDROID__)
         SET(XS_INPUT_VIBRATION);
+#endif
+        SET(XS_INPUT_DEADZONE); SET(XS_INPUT_TRIGGER_DEADZONE);
+#if defined(__ANDROID__)
         SET(XS_INPUT_TOUCH);
         if ((int)xbox_SettingValue(XS_INPUT_TOUCH) != XBOX_TOUCH_OFF) {
-            SET(XS_INPUT_TOUCH_OPACITY); SET(XS_INPUT_TOUCH_SCALE); SET(XS_INPUT_TOUCH_AUTO_GAS);
+            SUB(XS_INPUT_TOUCH_OPACITY); SUB(XS_INPUT_TOUCH_SCALE); SUB(XS_INPUT_TOUCH_AUTO_GAS);
         }
 #endif
         TITLE_ROWS(XS_PAGE_INPUT);
+        if (keys_shown())
+            ACT(A_KEYS_PAGE, "Keyboard keys...");
         ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
-    case P_POWER:
-#if !defined(__linux__)
-        {
-            /* The note names the default this build has: the title's own
-             * choice (xbox_SettingsGameDefault), Balanced where it takes the
-             * Deck's pacing (Windows), the busy-wait where it sets none
-             * (macOS). */
-            const xs_setting *pm = xbox_SettingGet(XS_POWER_MODE);
-            if (xbox_PowerStockHidden(xbox_SettingsHost())) {
-                INFO("Tuned on the Steam Deck (Linux). Balanced is the default here too.");
-            } else if (pm && (int)pm->def == 1) {
-                INFO("Tuned on the Steam Deck (Linux). Balanced is the default here too.");
-                INFO("Maximum is the game's own busy-wait.");
-            } else if (pm && (int)pm->def == 2) {
-                INFO("Tuned on the Steam Deck (Linux). Battery saver is the default here.");
-                INFO("Maximum is the game's own busy-wait.");
+    case P_HOST: {
+        const int hn = hp_count();
+        if (!s_hp)
+            INFO("This build has no page of its own here.");
+        for (int i = 0; i < hn; i++) {
+            xbox_overlay_hostrow hr;
+            hp_row(i, &hr);
+            if (hr.kind == XBOX_HOSTROW_INFO || hr.kind == XBOX_HOSTROW_WARN) {
+                snprintf(s_hp_text[i], sizeof s_hp_text[i], "%s", hr.label);
+                r[n++] = Row{ R_INFO, XS_COUNT, hr.kind == XBOX_HOSTROW_WARN ? 1 : 0, s_hp_text[i], false, hr.adv != 0 };
+            } else if (hr.kind == XBOX_HOSTROW_HEADER) {
+                snprintf(s_hp_text[i], sizeof s_hp_text[i], "%s", hr.label);
+                r[n++] = Row{ R_HEADER, XS_COUNT, 0, s_hp_text[i], false, hr.adv != 0 };
             } else {
-                INFO("Tuned on the Steam Deck (Linux). The default here is Maximum,");
-                INFO("the game's own busy-wait; the other two sleep between frames.");
+                r[n++] = Row{ R_HOST, XS_COUNT, i, NULL, false, hr.adv != 0 };
             }
         }
-#endif
-        SET(XS_POWER_MODE);
-        ACT(A_RESET_PAGE, "Reset this page to the defaults");
+        /* The host's own reset (its choices back to its defaults), asked
+         * once more as every reset. */
+        if (s_hp && s_hp->reset)
+            ACT(A_RESET_PAGE, "Reset this page to the defaults");
         break;
-    default:
+    }
+    default:   /* P_SYSTEM */
         if (s_about[0])
             INFO(s_about);
         if (s_up_checkable) {
@@ -1335,7 +1780,113 @@ static int page_rows(int page, Row *r)
             if (st == 2)
                 INFO(s_sa_line);
         }
-        SET(XS_ADVANCED_PERF);
+        SET(XS_INTERFACE_MENU_ENTRY);
+        /* Online play (BO-134): the mode, and with it the name and the
+         * server (settings.toml's online.name and online.server, edited in
+         * place); on the internet the server's counts (BO-336) and the
+         * game code (online.code, BO-335). A System section (BO-327): it
+         * is the copy's network setup, read at the start like the updates
+         * and saves around it, not something the game draws or does. */
+        HEAD("Online play");
+        SET(XS_ONLINE_MODE);
+        if (xbox_SettingValue(XS_ONLINE_MODE) != 0.0) {
+            SET(XS_ONLINE_REACTIONS);
+            static char srow[128], nmrow[80];
+            const char *srv = xbox_SettingsText("online.server", NULL);
+            const char *nm = xbox_SettingsText("online.name", NULL);
+            if (s_ne_open && !s_ne_server && !s_ne_code)
+                snprintf(nmrow, sizeof nmrow, "%s", ne_label());
+            else
+                snprintf(nmrow, sizeof nmrow, "Online name: %s", nm[0] ? nm : "Racer");
+            r[n++] = Row{ R_ACTION, XS_COUNT, A_ONLINE_NAME, nmrow, true };
+            if (xbox_SettingValue(XS_ONLINE_MODE) == 1.0) {
+                if (s_ne_open && s_ne_server)
+                    snprintf(srow, sizeof srow, "%s", ne_label());
+                else
+                    snprintf(srow, sizeof srow, "Server: %s%s", srv[0] ? srv : XNET_HLE_DEFAULT_LOBBY,
+                             srv[0] ? "" : " (the default)");
+                r[n++] = Row{ R_ACTION, XS_COUNT, A_ONLINE_SERVER, srow, true };
+                /* BO-336: what the server said when this copy signed in */
+                {
+                    static char strow[96];
+                    int on = -1, wt = -1;
+                    if (xnet_hle_lobby_status(&on, &wt) && on >= 0) {
+                        if (wt >= 0)
+                            snprintf(strow, sizeof strow, "Server: %d online, %d game%s waiting", on, wt, wt == 1 ? "" : "s");
+                        else
+                            snprintf(strow, sizeof strow, "Server: %d online", on);
+                        r[n++] = Row{ R_INFO, XS_COUNT, 0, strow, true };
+                    }
+                }
+                /* BO-335: the game code */
+                {
+                    static char crow[64];
+                    const char *code = xbox_SettingsText("online.code", NULL);
+                    if (s_ne_open && s_ne_code)
+                        snprintf(crow, sizeof crow, "%s", ne_label());
+                    else
+                        snprintf(crow, sizeof crow, "Game code: %s", code[0] ? code : "(none: public games)");
+                    r[n++] = Row{ R_ACTION, XS_COUNT, A_ONLINE_CODE, crow, true };
+                }
+            }
+        }
+        HEAD("Bug reports");
+        /* The print gate (BO-125), next to the report it feeds. */
+        SET(XS_ADVANCED_DIAG_LOG);
+        diag_info();
+        AINFO(s_diag_info);
+        if (xbox_BugReportHasMaker()) {
+            INFO(s_rep_info);
+            ACT(A_REPORT, "Create bug report");
+            ACT(A_REPORT_SHOT, "Create bug report with a screenshot");
+        }
+        /* Save data: a copy out of the profile, and one back in. */
+        {
+            static char sg[400];
+            const bool sg_on = xbox_SaveGuardProblem(sg, sizeof sg) != 0;
+            if (s_sio_on || sg_on)
+                HEAD("Save data");
+            if (s_sio_on) {
+                static char imp[160];
+                char found[1024];
+                staged = sio_staged(found, sizeof found);
+                ACT(A_SAVE_EXPORT, "Export save to home folder");
+                if (staged) {
+                    ACT(A_SAVE_CANCEL, "Cancel the import");
+                } else if (s_ps2_folder[0]) {
+                    /* A PS2 save with several profiles: which one (BO-323). */
+                    for (int i = 0; i < s_ps2_choice.count && i < 3; i++)
+                        ACT(A_PS2_SLOT0 + i, s_ps2_label[i]);
+                    ACT(A_PS2_CANCEL, "Do not import a PS2 profile");
+                } else {
+                    if (recomp_save_export_newest(s_sio_dest, s_sio_id, found, sizeof found))
+                        snprintf(imp, sizeof imp, "Import save from home folder (newest: %.60s)", path_leaf(found));
+                    else
+                        snprintf(imp, sizeof imp, "Import save from home folder (none found there)");
+                    ACT(A_SAVE_IMPORT, imp);
+                    ACT(A_SAVE_BROWSE, "Import save from another folder...");
+                    ACT(A_SAVE_XBOX, "Import Xbox or PS2 save...");
+                    /* Counted now and then, not at every frame. */
+                    static int kept = -1;
+                    static uint32_t kept_at;
+                    static char rest[96];
+                    if (kept < 0 || (int32_t)(now_ms() - kept_at) > 2000) {
+                        kept = recomp_save_history_count(s_sio_dir, s_sio_id);
+                        kept_at = now_ms();
+                    }
+                    if (kept > 0) {
+                        snprintf(rest, sizeof rest, "Restore an earlier save (%d kept)...", kept);
+                        ACT(A_SAVE_RESTORE, rest);
+                    }
+                }
+                if (s_sio_info[0])
+                    INFO(s_sio_info);
+            }
+            /* A save the save guard could not put in place (kernel_saveguard.h). */
+            if (sg_on)
+                WARN(sg);
+        }
+        AHEAD("Developer");
         {
             /* What Auto holds now (BO-175): one line, only while it is on. */
             static char au[160];
@@ -1348,7 +1899,7 @@ static int page_rows(int page, Row *r)
                     snprintf(au, sizeof au, "Auto now: spinning through each wait (busy-wait). Last change: %s.", why);
                 else
                     snprintf(au, sizeof au, "Auto now: spinning the last %.0f ms of each frame. Last change: %s.", lead, why);
-                INFO(au);
+                AINFO(au);
             }
         }
 #if defined(__APPLE__)
@@ -1356,13 +1907,13 @@ static int page_rows(int page, Row *r)
          * record when frames reach the glass, and their pages are as they
          * were. */
         if (!s_vulkan) {
-            SET(XS_ADVANCED_PERF_STEPS);
+            ASET(XS_ADVANCED_PERF_STEPS);
             /* What reaches the glass, in words (the graph has one line of it). */
             glass_info();
-            INFO(s_glass_info[0]);
-            INFO(s_glass_info[1]);
+            AINFO(s_glass_info[0]);
+            AINFO(s_glass_info[1]);
             if (s_glass_info[2][0])    /* empty while there are no on-glass times */
-                INFO(s_glass_info[2]);
+                AINFO(s_glass_info[2]);
         }
 #endif
         /* The console key (kernel_console_keys.h): read at the start. */
@@ -1373,55 +1924,14 @@ static int page_rows(int page, Row *r)
                                           " the port's own earlier saves show as Unusable while it is."
                                         : "Console key: not set. For saves from an original Xbox or xemu, set console.eeprom"
                                           " (path of your eeprom.bin) or console.hdd_key in settings.toml.");
-            INFO(ck);
+            AINFO(ck);
         }
         TITLE_ROWS(XS_PAGE_ADVANCED);
-        SET(XS_INTERFACE_MENU_ENTRY);
-        /* The print gate (BO-125), next to the report it feeds. */
-        SET(XS_ADVANCED_DIAG_LOG);
-        diag_info();
-        INFO(s_diag_info);
-        if (xbox_BugReportHasMaker()) {
-            INFO(s_rep_info);
-            ACT(A_REPORT, "Create bug report");
-            ACT(A_REPORT_SHOT, "Create bug report with a screenshot");
-        }
-        /* Save data: a copy out of the profile, and one back in. */
-        if (s_sio_on) {
-            static char imp[160];
-            char found[1024];
-            staged = sio_staged(found, sizeof found);
-            ACT(A_SAVE_EXPORT, "Export save to home folder");
-            if (staged) {
-                ACT(A_SAVE_CANCEL, "Cancel the import");
-            } else {
-                if (recomp_save_export_newest(s_sio_dest, s_sio_id, found, sizeof found))
-                    snprintf(imp, sizeof imp, "Import save from home folder (newest: %.60s)", path_leaf(found));
-                else
-                    snprintf(imp, sizeof imp, "Import save from home folder (none found there)");
-                ACT(A_SAVE_IMPORT, imp);
-                ACT(A_SAVE_BROWSE, "Import save from another folder...");
-                ACT(A_SAVE_XBOX, "Import Xbox save...");
-                /* Counted now and then, not at every frame. */
-                static int kept = -1;
-                static uint32_t kept_at;
-                static char rest[96];
-                if (kept < 0 || (int32_t)(now_ms() - kept_at) > 2000) {
-                    kept = recomp_save_history_count(s_sio_dir, s_sio_id);
-                    kept_at = now_ms();
-                }
-                if (kept > 0) {
-                    snprintf(rest, sizeof rest, "Restore an earlier save (%d kept)...", kept);
-                    ACT(A_SAVE_RESTORE, rest);
-                }
-            }
-            if (s_sio_info[0])
-                INFO(s_sio_info);
-        }
         /* Cheats (xbox_OverlaySetCheats): a tester's rows, shown only with
          * RECOMP_DEBUG=cheats. cheat_ready() still runs, so a copy an earlier
          * session left behind is removed either way. */
         if (cheat_ready() && recomp_env(RENV_CHEATS)) {
+            const int c0 = n;
             INFO(s_cs == CS_NONE ? "Cheats (this session only; your save is not changed):"
                                  : "While a cheat is on, the game saves to a copy, not to your save.");
             for (int i = 0; i < s_cheat_n; i++) {
@@ -1438,16 +1948,16 @@ static int page_rows(int page, Row *r)
                 WARN("Progress is not being saved until you restart.");
             if (s_cs_info[0])
                 INFO(s_cs_info);
+            /* Advanced (BO-338), except while a session is on: its questions stay in view. */
+            if (s_cs == CS_NONE)
+                for (int i = c0; i < n; i++)
+                    r[i].adv = true;
         }
-        /* A save the save guard could not put in place (kernel_saveguard.h). */
-        {
-            static char sg[400];
-            if (xbox_SaveGuardProblem(sg, sizeof sg))
-                WARN(sg);
-        }
+        ACT(A_RESET_PAGE, "Reset this page to the defaults");
         ACT(A_RESET_ALL, "Reset all settings to the defaults");
         break;
     }
+    n = adv_filter(page, r, n);
     /* The foot of every page, kept in view below the page's own rows (the
      * last rows; see pin_count): Quit game always, and Restart only while a
      * restart is pending (the one place for it: there is no Restart row in
@@ -1461,19 +1971,58 @@ static int page_rows(int page, Row *r)
     ACT(A_QUIT, s_cs == CS_DISCARDED ? "Quit game (progress is not being saved until a restart)"
                 : s_cs != CS_NONE ? "Quit game (progress made with cheats is not saved)" : "Quit game");
 #undef SET
+#undef SUB
 #undef ACT
 #undef INFO
 #undef WARN
+#undef HEAD
 #undef SPK
 #undef TITLE_ROWS
+#undef ASET
+#undef ASUB
+#undef AACT
+#undef AINFO
+#undef AHEAD
+#undef ASPK
     return n;
 }
 
 static void value_text(xs_id id, char *out, size_t n);
 
+/* BO-338: when a change to a setting is used, as a tag after its label (and
+ * no longer a sentence at the end of its help). RESTART: read when the game
+ * starts (the table's XS_RESTART flag, which also counts for the Restart
+ * row). NEXT RACE: read when a race starts. NEXT START: read at the start,
+ * but nothing waits for a restart. `hot`: a change is waiting for it. */
+static const char *tag_word(xs_id id, bool *hot)
+{
+    const xs_setting *s = xbox_SettingGet(id);
+    *hot = false;
+    if (s->flags & XS_RESTART) {
+        *hot = s->value != s->launch;
+        return "RESTART";
+    }
+    switch (id) {
+    case XS_GAME_SPEED_UNITS: case XS_DISPLAY_HUD_FIX: case XS_DISPLAY_ULTRAWIDE:
+    case XS_GRAPHICS_SPLIT_60FPS: case XS_AUDIO_SPLIT_MUSIC: case XS_GAME_RACE_CLOCK:
+        return "NEXT RACE";
+    case XS_AUDIO_CUSTOM_AT_START:
+        *hot = s->value != s->launch;
+        return "NEXT START";
+    default:
+        return NULL;
+    }
+}
+
+static const char *host_tag_word(const xbox_overlay_hostrow &hr)
+{
+    return hr.tag == XBOX_HOSTTAG_NEXT_RACE ? "NEXT RACE" : hr.tag == XBOX_HOSTTAG_NEXT_START ? "NEXT START" : NULL;
+}
+
 static void test_state(const char *path)
 {
-    static const char *const kinds[] = { "setting", "action", "info", "speakers", "folder" };
+    static const char *const kinds[] = { "setting", "action", "info", "speakers", "folder", "key", "host", "header",
+                                         "advanced" };
     static const char *const bkinds[] = { "use", "off", "up", "place", "dir" };
     Row r[OVERLAY_ROWS];
     int n = page_rows(s_page, r);
@@ -1482,6 +2031,8 @@ static void test_state(const char *path)
         return;
     fprintf(f, "open %d\npage %s\npaused %d\n", s_open ? 1 : 0, k_page_name[s_page],
             xbox_HostPaused());
+    if (s_keys_page && s_page == P_CONTROLS && keys_shown())
+        fprintf(f, "subpage Keyboard keys\n");
     if (xsb_is_open()) {
         /* The folder browser, over the page: where it is and its rows. */
         char where[1024], c[48];
@@ -1497,16 +2048,33 @@ static void test_state(const char *path)
         return;
     }
     for (int i = 0; i < n; i++) {
-        char v[96] = "";
+        char v[96] = "", tags[48] = "";
         const char *label = r[i].text;
         if (r[i].kind == R_SETTING) {
+            bool hot;
+            const char *tw_ = tag_word(r[i].id, &hot);
             label = meta(r[i].id).label;
             value_text(r[i].id, v, sizeof v);
+            if (tw_)
+                snprintf(tags, sizeof tags, " [%s%s]", tw_, hot ? "*" : "");
+        } else if (r[i].kind == R_ADV) {
+            snprintf(v, sizeof v, "%s", s_adv[s_page] ? "On" : "Off");
         } else if (r[i].kind == R_FOLDER) {
             music_value(v, sizeof v);
+        } else if (r[i].kind == R_KEY) {
+            label = xbox_InputKeyActionName(r[i].action);
+            xbox_InputKeyActionKeys(r[i].action, v, sizeof v);
+        } else if (r[i].kind == R_HOST) {
+            static xbox_overlay_hostrow hr;
+            hp_row(r[i].action, &hr);
+            label = hr.label;
+            snprintf(v, sizeof v, "%s", hr.value);
+            if (host_tag_word(hr))
+                snprintf(tags, sizeof tags, " [%s%s]", host_tag_word(hr), hr.tag_hot ? "*" : "");
         }
-        fprintf(f, "%c %s: %s%s%s\n", s_open && i == s_sel[s_page] ? '>' : ' ', kinds[r[i].kind],
-                label ? label : "", v[0] ? " = " : "", v);
+        /* A sub-row's label after "- " (BO-327), as it is drawn indented. */
+        fprintf(f, "%c %s: %s%s%s%s%s%s\n", s_open && i == s_sel[s_page] ? '>' : ' ', kinds[r[i].kind],
+                r[i].sub ? "- " : "", label ? label : "", v[0] ? " = " : "", v, tags, r[i].adv ? " [advanced]" : "");
     }
     fclose(f);
 }
@@ -1518,11 +2086,18 @@ int xbox_OverlayTestRowIndex(const char *prefix)
     Row r[OVERLAY_ROWS];
     int n = page_rows(s_page, r);
     for (int i = 0; i < n; i++) {
-        const char *t = r[i].kind == R_SETTING ? meta(r[i].id).label : r[i].text;
+        const char *t = r[i].kind == R_SETTING ? meta(r[i].id).label
+                      : r[i].kind == R_KEY ? xbox_InputKeyActionName(r[i].action) : r[i].text;
         if (t && !strncmp(t, prefix, strlen(prefix)))
             return i;
     }
     return -1;
+}
+
+/* Tests: the open page's "Show advanced settings" on or off. */
+void xbox_OverlayTestShowAdvanced(int on)
+{
+    s_adv[s_page] = on != 0;
 }
 
 int xbox_OverlayTestHasRow(const char *prefix)
@@ -1550,7 +2125,7 @@ static bool page_has(int page, xs_id id)
     return false;
 }
 
-static bool selectable(const Row &r) { return r.kind != R_INFO; }
+static bool selectable(const Row &r) { return r.kind != R_INFO && r.kind != R_HEADER; }
 
 /* ── the speaker test ──────────────────────────────────────────────── */
 
@@ -1748,6 +2323,7 @@ static void mx_poll();
 static void mx_ab_toggle();
 static bool s_mx_open;                 /* the Mixer page shows (overlay_mixer.inc) */
 
+
 /* Restart game and Quit game ask once more: the first A (or click) arms the
  * row, the same row again does it; B, another row or another page cancels. */
 
@@ -1792,7 +2368,7 @@ static const char *confirm_text(int action)
     char *b = ring[n++ & 3];
     const char *what = action >= A_CHEAT0 && action <= A_CHEAT3 ? "switch it on"
                      : action == A_QUIT ? "quit"
-                     : action == A_RESET_PAGE || action == A_RESET_ALL ? "reset" : "restart";
+                     : action == A_RESET_PAGE || action == A_RESET_ALL || action == A_KEYS_RESET ? "reset" : "restart";
 
     snprintf(b, sizeof ring[0], "Press %s again to %s, %s to cancel", act_name(0), what, act_name(1));
     return b;
@@ -1800,7 +2376,112 @@ static const char *confirm_text(int action)
 
 static void quit_now();
 
+/* ── keyboard keys (BO-267, keyboard.h) ─────────────────────────────── */
+
+#define KEYS_KEY "input.keys"
+/* The action whose key is being waited for (-1: none) and the slot it goes
+ * in; the slot each row has selected (a row has two keys); what the last
+ * refusal said. */
+static int s_key_cap = -1, s_key_cap_slot;
+static int s_key_slot[XBOX_KEYACT_COUNT];
+static char s_key_msg[160];
+
+static bool keys_locked()
+{
+    int locked = 0;
+    xbox_SettingsText(KEYS_KEY, &locked);
+    return locked != 0;
+}
+
+/* The bindings into settings.toml (only what differs from the defaults). */
+static void keys_save()
+{
+    char b[512];
+    xbox_InputKeyBindingsFormat(b, sizeof b);
+    xbox_SettingsSetText(KEYS_KEY, b);
+    changed();
+}
+
+static void keys_cancel()
+{
+    s_key_cap = -1;
+}
+
+/* A key went down while a row waits for one. Esc leaves it as it was, Delete
+ * empties the key, any key the table has is taken unless another action has
+ * it: that one is refused and the row keeps waiting. */
+static void key_capture(SDL_Keycode k)
+{
+    int vk, other = -1, r;
+    const int a = s_key_cap, slot = s_key_cap_slot;
+
+    if (k == SDLK_ESCAPE) {
+        keys_cancel();
+        s_key_msg[0] = 0;
+        return;
+    }
+    if (k == SDLK_DELETE) {
+        xbox_InputKeyBind(a, slot, 0, NULL);
+        keys_save();
+        keys_cancel();
+        s_key_msg[0] = 0;
+        return;
+    }
+    vk = xbox_InputSdlKeyToVk(k);
+    if (!vk || !xbox_InputKeyBindable(vk)) {
+        snprintf(s_key_msg, sizeof s_key_msg, "That key can't be used. Press another one.");
+        return;
+    }
+    r = xbox_InputKeyBind(a, slot, vk, &other);
+    if (r == -2) {
+        snprintf(s_key_msg, sizeof s_key_msg, "%s is already %s. Press another key, or Esc.",
+                 xbox_InputKeyName(vk), xbox_InputKeyActionName(other));
+        return;
+    }
+    if (r == 0) {
+        keys_save();
+        s_key_msg[0] = 0;
+        keys_cancel();
+    }
+}
+
+static void key_row_activate(const Row &r)
+{
+    if (keys_locked())
+        return;
+    if (s_key_cap == r.action) {          /* the same row again: leave it */
+        keys_cancel();
+        return;
+    }
+    s_key_msg[0] = 0;
+    s_key_cap = r.action;
+    s_key_cap_slot = s_key_slot[r.action];
+}
+
 static void activate_row(const Row &r);
+/* BO-338: after "Show advanced settings" or the keys' sub-page changed the
+ * list under the cursor, the cursor goes where the player is looking, from
+ * the next frame's list: on the switch; on the first key (into the keys'
+ * sub-page); on the way into it (back out). */
+static bool s_adv_reselect;
+static int s_sub_reselect;            /* A_KEYS_PAGE: just entered it; A_KEYS_BACK: just left it */
+static void reselect_run(const Row *rows, int n)
+{
+    if (!s_adv_reselect && !s_sub_reselect)
+        return;
+    for (int i = 0; i < n; i++) {
+        const bool hit = s_adv_reselect ? rows[i].kind == R_ADV
+                       : s_sub_reselect == A_KEYS_PAGE ? rows[i].kind == R_KEY
+                       : rows[i].kind == R_ACTION && rows[i].action == A_KEYS_PAGE;
+        if (hit) {
+            s_sel[s_page] = i;
+            s_scroll_to_sel = true;
+            break;
+        }
+    }
+    s_adv_reselect = false;
+    s_sub_reselect = 0;
+}
 /* The title's confirm sound, after what the row did (it replaces a value
  * change's); the speaker test is heard alone, a locked setting is silent. */
 static void activate(const Row &r)
@@ -1814,6 +2495,17 @@ static void activate_row(const Row &r)
 {
     if (s_confirm && !(r.kind == R_ACTION && r.action == s_confirm))
         s_confirm = 0;
+    if (r.kind == R_KEY) {
+        key_row_activate(r);
+        return;
+    }
+    if (r.kind == R_HOST) {
+        xbox_overlay_hostrow hr;
+        hp_row(r.action, &hr);
+        if (hr.enabled && s_hp && s_hp->activate)
+            s_hp->activate(r.action);
+        return;
+    }
     if (r.kind == R_ACTION && (r.action == A_RESTART_PIN || r.action == A_QUIT)) {
         if (s_confirm != r.action) {
             s_confirm = r.action;
@@ -1850,6 +2542,17 @@ static void activate_row(const Row &r)
         mx_open();
         return;
     }
+    if (r.kind == R_ADV) {
+        s_adv[s_page] = !s_adv[s_page];
+        s_adv_reselect = true;           /* the cursor stays on the switch (next frame's list) */
+        return;
+    }
+    if (r.kind == R_ACTION && (r.action == A_KEYS_PAGE || r.action == A_KEYS_BACK)) {
+        keys_cancel();
+        s_keys_page = r.action == A_KEYS_PAGE;
+        s_sub_reselect = r.action == A_KEYS_PAGE ? A_KEYS_PAGE : A_KEYS_BACK;
+        return;
+    }
     if (r.kind == R_SPEAKERS) {
         spk_play(r.action);
         return;
@@ -1863,6 +2566,10 @@ static void activate_row(const Row &r)
     }
     if (r.kind == R_ACTION && r.action == A_UPDATE_CHECK) {
         update_check_start();
+        return;
+    }
+    if (r.kind == R_ACTION && (r.action == A_ONLINE_NAME || r.action == A_ONLINE_SERVER || r.action == A_ONLINE_CODE)) {
+        ne_open(r.action == A_ONLINE_SERVER ? 1 : r.action == A_ONLINE_CODE ? 2 : 0);
         return;
     }
     if (r.kind == R_ACTION && r.action == A_UPDATE_OPEN) {
@@ -1916,7 +2623,7 @@ static void activate_row(const Row &r)
     }
     if (r.kind == R_ACTION) {
         /* Resetting asks once more: the cursor keeps its index when the rows
-         * change under it (an import staged from the Advanced page shortens
+         * change under it (an import staged from the System page shortens
          * the save rows), so one Enter can land here unseen, and a reset
          * rewrites settings.toml to the defaults. */
         if (s_confirm != r.action) {
@@ -1924,9 +2631,25 @@ static void activate_row(const Row &r)
             return;
         }
         s_confirm = 0;
+        if (r.action == A_KEYS_RESET) {
+            xbox_InputKeyBindingsReset();
+            keys_save();
+            keys_cancel();
+            return;
+        }
         if (r.action == A_RESET_ALL) {
             xbox_SettingsResetAll();
+            if (!keys_locked()) {
+                xbox_InputKeyBindingsReset();
+                keys_save();
+            }
+        } else if (s_page == P_HOST) {
+            if (s_hp && s_hp->reset)
+                s_hp->reset();
+            return;
         } else {
+            /* The keyboard's keys have their own reset, on their sub-page
+             * (BO-338); this one does the settings the page shows now. */
             for (int i = 0; i < XS_COUNT; i++)
                 if (page_has(s_page, (xs_id)i))
                     xbox_SettingReset((xs_id)i);
@@ -1959,17 +2682,26 @@ static void clear_nav()
 
 /* The title is paused while the overlay is open, except on the Mixer page:
  * a mix is set by ear, so there the game keeps running and sounding (its
- * input still held: the car coasts). Called wherever either changes. */
+ * input still held: the car coasts). Nor while an online session is up
+ * (signed in, a lobby, a race, its results): the other copies and the
+ * lobby would stop hearing from this one, so the game runs on the same way
+ * and the header says so. Called wherever any of them changes (and every
+ * frame). */
 static uint32_t s_pause_at;            /* the pause waits until then (set_open) */
+static bool s_online_runs;             /* open, and not paused for an online session */
 static void pause_sync()
 {
     static int applied = -1;
-    int want = s_open && !s_mx_open && (int32_t)(now_ms() - s_pause_at) >= 0;
+    const bool online = s_open && xnet_hle_session_up();
+    int want = s_open && !s_mx_open && !online && (int32_t)(now_ms() - s_pause_at) >= 0;
+    s_online_runs = online;
     if (want != applied) {
         applied = want;
         xbox_HostPause(want);
         if (s_open)
-            fprintf(stderr, LOGP "%s\n", want ? "the title is paused" : "Mixer page: the title runs while it is open");
+            fprintf(stderr, LOGP "%s\n", want ? "the title is paused"
+                    : online ? "online session: the title runs while it is open, its input held"
+                    : "Mixer page: the title runs while it is open");
     }
 }
 
@@ -1983,11 +2715,13 @@ static void set_open(bool on, bool from_title = false)
     if (on == s_open)
         return;
     s_open = on;
+    keys_cancel();
     clear_nav();
     s_pause_at = on && from_title ? now_ms() + 700 : 0;
     if (on) {
         s_rows_t0 = now_ms();
         s_rows_step_ms = ROWS_STEP_OPEN_MS;
+        s_keys_page = false;
     }
     if (!from_title)
         menusnd_play(on ? XBOX_OVERLAY_SND_OPEN : XBOX_OVERLAY_SND_CLOSE);
@@ -1995,7 +2729,8 @@ static void set_open(bool on, bool from_title = false)
         s_scroll_to_sel = true;
         xbox_InputSetBlocked(1);
         pause_sync();
-        fprintf(stderr, LOGP "open: the title is paused, its input is held\n");
+        fprintf(stderr, LOGP "open: %s, its input is held\n",
+                s_online_runs ? "online, the title runs" : "the title is paused");
     } else {
         /* A build beside a running title would cost it frames: it stops
          * with the overlay, and goes on from there the next time. */
@@ -2129,6 +2864,8 @@ int xbox_OverlayEvent(const SDL_Event *ev)
     if (!s_enabled)
         return 0;
     std::lock_guard<std::mutex> g(s_ov_mu);
+    if (s_open && s_ne_open && ne_event(ev))
+        return 1;
 
     switch (ev->type) {
     case SDL_WINDOWEVENT:
@@ -2169,6 +2906,11 @@ int xbox_OverlayEvent(const SDL_Event *ev)
         if (!s_open)
             break;
         s_last_input_pad = false;
+        if (s_key_cap >= 0) {                /* a keyboard key is being picked (BO-267) */
+            if (!(ev->key.keysym.mod & KMOD_GUI))
+                key_capture(k);
+            return 1;
+        }
         switch (k) {
         case SDLK_UP:    dir_set(s_key, D_UP, true); break;
         case SDLK_DOWN:  dir_set(s_key, D_DOWN, true); break;
@@ -2332,6 +3074,8 @@ static void test_poll()
         {"enter", SDLK_RETURN, 0}, {"esc", SDLK_ESCAPE, 0}, {"f1", SDLK_F1, 0},
         {"pgup", SDLK_PAGEUP, 0}, {"pgdn", SDLK_PAGEDOWN, 0}, {"del", SDLK_DELETE, 0},
         {"q", SDLK_q, 0}, {"e", SDLK_e, 0}, {"tab", SDLK_TAB, 0}, {"shift+tab", SDLK_TAB, KMOD_LSHIFT},
+        {"w", SDLK_w, 0}, {"z", SDLK_z, 0}, {"i", SDLK_i, 0}, {"shift", SDLK_LSHIFT, 0}, {"space", SDLK_SPACE, 0},
+        {"comma", SDLK_COMMA, 0}, {"f5", SDLK_F5, 0},
     };
     static const struct { const char *name; int b; } pads[] = {
         {"a", SDL_CONTROLLER_BUTTON_A}, {"b", SDL_CONTROLLER_BUTTON_B},
@@ -2396,6 +3140,15 @@ void xbox_OverlayPoll(void)
     std::lock_guard<std::mutex> g(s_ov_mu);
     test_poll();
 
+    /* What the present thread's frame asked of the window system (BO-347). */
+    switch (s_ti_want.exchange(OV_TI_NONE)) {
+    case OV_TI_START: SDL_StartTextInput(); break;
+    case OV_TI_STOP:  SDL_StopTextInput();  break;
+    default: break;
+    }
+    if (s_url_want.exchange(false))
+        update_open_page_now();
+
     if (s_open_request.exchange(0) && !s_open)
         set_open(true, true);
     /* The on-screen controls' menu button. */
@@ -2440,8 +3193,15 @@ void xbox_OverlayPoll(void)
     pause_sync();
     if (s_back > 0) {
         s_back = 0;
-        if (s_open && s_confirm) {
+        if (s_open && s_key_cap >= 0) {
+            keys_cancel();                /* B leaves a key being picked */
+            menusnd_play(XBOX_OVERLAY_SND_BACK);
+        } else if (s_open && s_confirm) {
             s_confirm = 0;                /* B takes back a Restart / Quit question */
+            menusnd_play(XBOX_OVERLAY_SND_BACK);
+        } else if (s_open && s_keys_page && s_page == P_CONTROLS) {
+            s_keys_page = false;          /* B leaves the keyboard keys' sub-page for Controls */
+            s_sub_reselect = A_KEYS_BACK;
             menusnd_play(XBOX_OVERLAY_SND_BACK);
         } else if (s_open && s_mx_open) {
             mx_back();
@@ -2563,7 +3323,7 @@ static bool scripted_on()
 
 /* A save the save guard could not put in place (kernel_saveguard.h): a
  * new failure is shown over the game for a while, overlay open or not; the
- * Advanced page keeps the line while it stands. */
+ * System page keeps the line while it stands. */
 static char s_sg_text[400];
 static bool sg_banner_on()
 {
@@ -2574,6 +3334,21 @@ static bool sg_banner_on()
     if (seq && seq != seen) {
         seen = seq;
         until = now + 15000u;
+    }
+    return seq && (int32_t)(until - now) > 0;
+}
+
+/* A message about online play (xnet_hle_message): over the game for 12 s. */
+static char s_net_text[256];
+static bool net_banner_on()
+{
+    static int seen;
+    static uint32_t until;
+    const int seq = xnet_hle_message_get(s_net_text, sizeof s_net_text);
+    const uint32_t now = now_ms();
+    if (seq && seq != seen) {
+        seen = seq;
+        until = now + 12000u;
     }
     return seq && (int32_t)(until - now) > 0;
 }
@@ -2593,7 +3368,7 @@ static bool touch_on()
 int xbox_OverlayWants(void)
 {
     return s_enabled && (s_open || s_alpha > 0.0f || xbox_SettingValue(XS_ADVANCED_PERF) != 0.0
-                         || notice_on() || scripted_on() || sg_banner_on() || touch_on());
+                         || notice_on() || scripted_on() || sg_banner_on() || net_banner_on() || touch_on());
 }
 
 void xbox_OverlayFramePresented(void)
@@ -2958,7 +3733,7 @@ static int cmp_float(const void *a, const void *b)
 }
 
 /* What reached the glass (present_cadence.h): looked at once per drawn
- * frame at most, shared by the graph and the Advanced page's lines. */
+ * frame at most, shared by the graph and the System page's lines. */
 static pc_report s_glass;
 static pc_status s_glass_st;
 static pc_sample s_glass_smp[PC_RING];
@@ -3719,7 +4494,20 @@ static bool key_hints(ImDrawList *dl, float x, float cy, float size, ImU32 c, co
 
 /* A small tag after a label: RESTART in attention yellow where the value
  * has changed since the game started (a restart applies it), in the
- * disabled grey where the setting is only read at start. Returns its width. */
+ * disabled grey where the setting is only read at start; NEXT RACE and
+ * NEXT START (BO-338) the same way. Returns its width. */
+static float row_tag(ImDrawList *dl, float x, float cy, float label, const char *word, bool changed)
+{
+    Face f(s_f_body, SHEAR);
+    const float sz = label * 0.6f;
+    txt(dl, sz, ImVec2(x, top_for(cy, sz)), changed ? col(T->attn) : col(T->text_dim), word);
+    return tw(sz, word);
+}
+
+/* A small tag after a label: RESTART in attention yellow where the value
+ * has changed since the game started (a restart applies it), in the
+ * disabled grey where the setting is only read at start. Returns its width.
+ * The skins' rows use it; takedawn's own rows have tag_word now. */
 static float restart_tag(ImDrawList *dl, float x, float cy, float label, bool changed)
 {
     Face f(s_f_body, SHEAR);
@@ -3790,6 +4578,35 @@ static const char *skin_value(const char *v)
 
 static void page_pick(int page);
 
+/* A page with nothing to set or do, only its "nothing here" note and the rows at the
+ * foot of every page (reset, Quit game, Restart now) (DS2's Game and Mods):
+ * its tab isn't shown, and turning the page passes over it. */
+static bool page_empty(int p)
+{
+    static Row r[OVERLAY_ROWS];
+    int n, i;
+    if (p == P_SYSTEM || p == P_DISPLAY)
+        return false;
+    n = page_rows(p, r);
+    for (i = 0; i < n; i++)
+        if (r[i].kind != R_INFO && r[i].kind != R_HEADER
+                && !(r[i].kind == R_ACTION && (r[i].action == A_RESET_PAGE
+                                               || r[i].action == A_QUIT || r[i].action == A_RESTART_PIN)))
+            return false;
+    return true;
+}
+
+static int page_step(int from, int dir)
+{
+    int p = from;
+    for (int k = 0; k < P_COUNT; k++) {
+        p = (p + dir + P_COUNT) % P_COUNT;
+        if (!page_empty(p))
+            return p;
+    }
+    return from;
+}
+
 /* The header of a skin: its picture, the title's name for the page (its
  * picture, or the word in the title colour), and the pages as a row of
  * names between the arrows, the open one in the hint colour. A click on a
@@ -3808,9 +4625,10 @@ static void draw_header_skin(ImDrawList *dl)
     }
     Face body(s_f_body, SHEAR);
     const float sz = LY.tab, cy = k->tabs_y * LY.H / 480.0f, gap = sz * 1.2f, ah = sz * 0.75f;
-    float total = gap * (P_COUNT - 1);
+    float total = -gap;
     for (int i = 0; i < P_COUNT; i++)
-        total += tw(sz, caps(k_page_name[i]));
+        if (!page_empty(i))
+            total += gap + tw(sz, caps(k_page_name[i]));
     float x = floorf((LY.W - total) * 0.5f);
     for (int d = 0; d < 2; d++) {
         const float ax = d ? x + total + gap * 0.9f : x - gap * 0.9f;
@@ -3819,10 +4637,12 @@ static void draw_header_skin(ImDrawList *dl)
         ImGui::PushID(d + 100);
         ImGui::InvisibleButton("##pg", ImVec2(ah * 2.0f, sz * 1.2f));
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-            page_pick((s_page + (d ? 1 : -1) + P_COUNT) % P_COUNT);
+            page_pick(page_step(s_page, d ? 1 : -1));
         ImGui::PopID();
     }
     for (int i = 0; i < P_COUNT; i++) {
+        if (page_empty(i))
+            continue;
         const char *t = caps(k_page_name[i]);
         const float w = tw(sz, t);
         ImGui::SetCursorScreenPos(ImVec2(x - gap * 0.5f, cy - sz * 0.6f));
@@ -3843,7 +4663,10 @@ static void draw_header_skin(ImDrawList *dl)
  * overlay's own layout, in the skin's colours. */
 static bool draw_row_skin(const Row &r, bool sel, float rh, float fs, ImDrawList *dl, float cy, int *click_dir)
 {
-    if (r.kind == R_FOLDER || r.kind == R_SPEAKERS
+    /* Only settings, actions and notes take the skin's look; the rest (takedawn's
+     * headers and key rows, folders, speakers) are drawn as usual. */
+    if ((r.kind != R_SETTING && r.kind != R_ACTION && r.kind != R_INFO)
+        || (r.kind == R_SETTING && !xbox_SettingGet(r.id))
         || (r.kind == R_ACTION && r.action >= A_CHEAT0 && r.action <= A_CHEAT3 && strrchr(r.text, ':')))
         return false;
     const float mid = floorf(LY.W * 0.5f), sy = LY.H / 480.0f, cg = fs * 0.75f;
@@ -3951,6 +4774,8 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     ImVec2 p = ImGui::GetCursorScreenPos();
     if (r.kind == R_INFO)
         rh *= 0.7f;
+    else if (r.kind == R_HEADER)
+        rh *= 0.8f;
     ImGui::PushID(idx);
     /* A row acts on release, and only for a tap: a finger that went on to
      * scroll the list (or to drag a slider) clicks nothing. */
@@ -3966,7 +4791,9 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     Face body(s_f_body);
     const float ty = top_for(cy, fs);
     const float ar = fs * 0.3f;                  /* the arrows' half height */
-    const float lx = LY.x_label, label_w = LY.x_val0 - lx - ar * 4.0f;
+    /* A sub-row (BO-327) is indented under its parent, with a short dash
+     * where the cursor would be when it is not on it. */
+    const float lx = LY.x_label + (r.sub ? fs * 1.1f : 0.0f), label_w = LY.x_val0 - lx - ar * 4.0f;
     const float vr = LY.x_val1;                   /* where a value box ends; the arrows are outside it */
     const float bh = fmaxf(rh * 0.74f, fs * 1.2f), bpad = bh * 0.4f, ah = fs * 0.75f;
     const float by0 = cy - bh * 0.5f, by1 = cy + bh * 0.5f, bmid = (LY.x_val0 + vr) * 0.5f;
@@ -3980,6 +4807,20 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
                 LY.x_val1 - lx);
         return;
     }
+    if (r.kind == R_HEADER) {
+        /* A section's title: the label face in capitals, smaller, in the
+         * title's red, with a rule to the end of the value column. */
+        Face it(s_f_body, SHEAR);
+        const float hs = fs * 0.78f, hy = top_for(cy + rh * 0.12f, hs);
+        const float w = txt_fit(dl, hs, ImVec2(lx, hy), col(T->title), caps(r.text), LY.x_val1 - lx);
+        const float ry = cy + rh * 0.12f;
+        if (lx + w + hs < LY.x_val1)
+            dl->AddLine(ImVec2(lx + w + hs * 0.6f, ry), ImVec2(LY.x_val1, ry), col(T->rule_hi), fmaxf(1.0f, hs * 0.06f));
+        return;
+    }
+    if (r.sub && !sel)
+        dl->AddLine(ImVec2(LY.x_label - fs * 0.15f, cy), ImVec2(LY.x_label + fs * 0.55f, cy), col(T->text_dim),
+                    fmaxf(1.0f, fs * 0.08f));
     if (sel && r.kind == R_SETTING && r.id == XS_GRAPHICS_HDR_PEAK) {
         /* BO-110: the calibration patch, right of the value: a symbol at the
          * peak set here on a background as bright as the display goes. */
@@ -4031,6 +4872,24 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
             dl->AddRectFilled(p, ImVec2(p.x + width, p.y + rh), col(T->sel_fill, T->sel_fill_a), fs * 0.2f);
             arrow_tri(dl, lx - fs * 0.9f, cy, ar, 1, col(T->arrow));
         }
+    }
+    if (r.kind == R_ADV) {
+        /* The page's switch for its expert rows: a label and an On / Off box
+         * as a setting's (BO-338). */
+        const bool on = s_adv[s_page];
+        {
+            Face it(s_f_body, SHEAR);
+            txt_fit(dl, fs, ImVec2(lx, ty), sel ? col(T->text_hi) : col(T->text), caps(r.text), label_w);
+        }
+        value_box(dl, LY.x_val0, by0, vr, by1, sel);
+        switch_icon(dl, LY.x_val0 + bpad * 0.6f, cy, bh * 0.78f, on, false);
+        txt_fit(dl, fs, ImVec2(bmid, ty), sel ? col(T->text_hi) : col(T->text), on ? "On" : "Off",
+                vr - LY.x_val0 - 2.0f * bpad, false, true);
+        if (sel) {
+            arrow_spr(dl, arl, cy, ah, -1, col({255, 255, 255}), T->arrow);
+            arrow_spr(dl, arr, cy, ah, 1, col({255, 255, 255}), T->arrow);
+        }
+        return;
     }
     if (r.kind == R_ACTION) {
         const bool pin = r.action == A_RESTART_PIN;
@@ -4088,6 +4947,68 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
             padlock_spr(dl, LY.x_val0 - ah * 0.9f, cy, bh * 0.9f);
         return;
     }
+    if (r.kind == R_HOST) {
+        /* The host's own row: a label (shrunk to fit), and in the value column a box with the
+         * host's word; a toggle also has its switch. */
+        xbox_overlay_hostrow hr;
+        hp_row(r.action, &hr);
+        const ImU32 lc = !hr.enabled ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text);
+        /* An action with no word of its own is drawn as the toolkit's action
+         * rows are: the label across the value column, no box (BO-327: the
+         * upscale rows on the Mods page say their state in the label). */
+        const bool bare = hr.kind == XBOX_HOSTROW_ACTION && !hr.value[0];
+        const char *htag = host_tag_word(hr);
+        const float htag_w = htag ? tw(fs * 0.6f, htag) + fs * 0.6f : 0.0f;
+        {
+            Face it(s_f_body, SHEAR);
+            const float w = txt_fit(dl, fs, ImVec2(lx, ty),
+                    hr.kind == XBOX_HOSTROW_ACTION && hr.enabled && !sel ? col(T->action) : lc,
+                    caps(hr.label), bare ? LY.x_val1 - lx : label_w - htag_w);
+            if (htag)
+                row_tag(dl, lx + w + fs * 0.5f, cy, fs, htag, hr.tag_hot != 0);
+        }
+        if (bare)
+            return;
+        value_box(dl, LY.x_val0, by0, vr, by1, sel && hr.enabled);
+        if (hr.kind == XBOX_HOSTROW_TOGGLE && hr.enabled) {
+            switch_icon(dl, LY.x_val0 + bpad * 0.6f, cy, bh * 0.78f, hr.on != 0, false);
+            txt_fit(dl, fs, ImVec2(bmid + bh * 0.3f, ty), hr.on ? col(T->attn) : lc, hr.value,
+                    vr - LY.x_val0 - 2.0f * bpad - bh * 0.6f, false, true);
+        } else {
+            txt_fit(dl, fs, ImVec2(bmid, ty), lc, hr.value, vr - LY.x_val0 - 2.0f * bpad, false, true);
+        }
+        return;
+    }
+    if (r.kind == R_KEY) {
+        /* A button of the pad and its two keys: two boxes in the value
+         * column, the picked one outlined while the row is selected; the one
+         * being waited for says so. A click on a box picks it. */
+        const bool locked = keys_locked();
+        const bool waiting = s_key_cap == r.action;
+        const float gap = fs * 0.3f, bw = (vr - LY.x_val0 - gap) * 0.5f;
+        {
+            Face it(s_f_body, SHEAR);
+            txt_fit(dl, fs, ImVec2(lx, ty), locked ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text),
+                    caps(xbox_InputKeyActionName(r.action)), label_w);
+        }
+        for (int k = 0; k < XBOX_KEY_SLOTS; k++) {
+            const float bx = LY.x_val0 + k * (bw + gap);
+            const bool on = waiting && s_key_cap_slot == k;
+            char kn[24];
+            const int vk = xbox_InputKeyBinding(r.action, k);
+            snprintf(kn, sizeof kn, "%s", on ? "Press a key..." : vk ? xbox_InputKeyName(vk) : "-");
+            value_box(dl, bx, by0, bx + bw, by1, sel && s_key_slot[r.action] == k);
+            txt_fit(dl, fs, ImVec2(bx + bw * 0.5f, ty), on ? col(T->attn) : locked ? col(T->text_dim)
+                    : sel ? col(T->text_hi) : col(T->text), kn, bw - 2.0f * bpad, false, true);
+            if (*clicked && mp.x >= bx && mp.x < bx + bw + gap) {
+                s_key_slot[r.action] = k;
+                *click_dir = 0;
+            }
+        }
+        if (locked)
+            padlock_spr(dl, LY.x_val0 - ah * 0.9f, cy, bh * 0.9f);
+        return;
+    }
     if (r.kind == R_SPEAKERS) {
         /* Six buttons in the value column; the one playing lit, the picked
          * one outlined while the row is selected. A click plays its button. */
@@ -4125,13 +5046,15 @@ static void draw_row(const Row &r, int idx, bool sel, float width, float rh, flo
     {
         /* The label, and after it the tag for a setting read at start. */
         float tag_w = 0.0f;
-        if (s->flags & XS_RESTART)
-            tag_w = tw(fs * 0.6f, "RESTART") + fs * 0.6f;
+        bool hot = false;
+        const char *tag = tag_word(r.id, &hot);
+        if (tag)
+            tag_w = tw(fs * 0.6f, tag) + fs * 0.6f;
         Face it(s_f_body, SHEAR);
         const float w = txt_fit(dl, fs, ImVec2(lx, ty), dim ? col(T->text_dim) : sel ? col(T->text_hi) : col(T->text),
                                 caps(m.label), label_w - tag_w);
-        if (s->flags & XS_RESTART)
-            restart_tag(dl, lx + w + fs * 0.5f, cy, fs, s->value != s->launch);
+        if (tag)
+            row_tag(dl, lx + w + fs * 0.5f, cy, fs, tag, hot);
     }
 
     value_box(dl, LY.x_val0, by0, vr, by1, sel);
@@ -4504,14 +5427,22 @@ static void draw_header(ImDrawList *dl)
             ImGui::PushID(k + 100);
             ImGui::InvisibleButton("##pg", ImVec2(x1 - x0, sz * 1.2f));
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                s_page = (s_page + (k ? 1 : -1) + P_COUNT) % P_COUNT;
+                s_page = page_step(s_page, k ? 1 : -1);
                 menusnd_play(XBOX_OVERLAY_SND_PAGE);
                 rows_in_page();
                 s_scroll_to_sel = true;
                 s_mx_open = false;
+                s_keys_page = false;
                 s_confirm = 0;
             }
             ImGui::PopID();
+        }
+        /* Online the game is not paused (pause_sync): one line under the
+         * page's name says so, over the rule. */
+        if (s_online_runs) {
+            const float hs = LY.hint, w = 0.40f * LY.cw;
+            txt_fit(dl, hs, ImVec2(right + ar, top_for(0.163f * LY.H, hs)), col(T->attn),
+                    "Online: the game keeps running", w, true);
         }
     }
     dl->AddLine(ImVec2(0, LY.y_rule), ImVec2(LY.W, LY.y_rule), col(T->rule_hi), fmaxf(1.0f, 0.0025f * LY.H));
@@ -4523,6 +5454,8 @@ static void draw_header(ImDrawList *dl)
         const float gap = LY.tab * 0.9f, cy = y0 + th * 0.5f;
         float x = LY.cx + 0.094f * LY.cw;
         for (int i = 0; i < P_COUNT; i++) {
+            if (page_empty(i))
+                continue;
             const char *t = caps(k_page_name[i]);
             const float w = tw(LY.tab, t);
             ImGui::SetCursorScreenPos(ImVec2(x - gap * 0.5f, y0));
@@ -4536,6 +5469,7 @@ static void draw_header(ImDrawList *dl)
                 s_page = i;
                 s_scroll_to_sel = true;
                 s_mx_open = false;
+                s_keys_page = false;
                 s_confirm = 0;
             }
             ImGui::PopID();
@@ -4617,7 +5551,7 @@ static void build_browser(float fs, ImDrawList *dl)
     {
         ImVec2 p = ImGui::GetCursorScreenPos();
         const char *t = where[0] ? where
-                      : s_fb_purpose == FB_XBOX ? "Import Xbox save: pick the save's folder"
+                      : s_fb_purpose == FB_XBOX ? "Import Xbox or PS2 save: pick the save's folder"
                       : s_fb_purpose == FB_SAVE ? "Import save: pick an exported save's folder"
                       : "Custom music folder: choose where to look";
         char cut[1100];
@@ -4634,7 +5568,7 @@ static void build_browser(float fs, ImDrawList *dl)
     }
 
     const char *note = s_fb_purpose == FB_XBOX
-        ? "Pick the save folder from your Xbox (UDATA/4541005b/<save>) or a folder that holds it. It is signed again for this port and imported at the next start. For a .zip, use --import-save."
+        ? "Pick the save folder from your Xbox (UDATA/4541005b/<save>), or the folder that holds a PS2 memory card (.ps2) or a .psu/.max/.cbs/.xps/.psv save. It is made into a Takedawn save and imported at the next start. For a .zip, use --import-save."
         : s_fb_purpose == FB_SAVE
         ? "An exported save is a dated folder with UDATA inside. It is imported at the next start."
         : "Every folder with music in it becomes a soundtrack in the game's own music menu.";
@@ -4762,15 +5696,82 @@ static bool row_hint(const Row &r, char *hint, size_t n)
                              (double)st.resident_bytes / 1048576.0, st.queued,
                              (unsigned long long)st.from_disk, (unsigned long long)st.computed);
             }
+            if (r.id == XS_GRAPHICS_FILMUP && xbox_SettingValue(XS_GRAPHICS_FILMUP) != 0) {
+                /* BO-136: what the last films cost here (the Deck's default
+                 * is chosen from this number). */
+                struct nv2a_filmup_stats st;
+                size_t at = strlen(hint);
+                nv2a_filmup_stats(&st);
+                if (at < n && st.gpu_ms > 0)
+                    snprintf(hint + at, n - at, " Last film (%s): %.2f ms of graphics card a film"
+                             " frame (max %.2f); frame time %.2f ms (max %.2f).",
+                             nv2a_filmup_mode_name(st.mode), st.gpu_ms, st.gpu_max_ms,
+                             st.frame_ms, st.frame_max_ms);
+                else if (at < n)
+                    snprintf(hint + at, n - at, " No film sharpened yet.");
+            }
             /* The table's flag: this one is read when the game starts. */
             if (s->flags & XS_RESTART) {
                 size_t at = strlen(hint);
                 snprintf(hint + at, n - at, "%sNeeds a restart.", at ? " " : "");
             }
         }
+    } else if (r.kind == R_HOST) {
+        xbox_overlay_hostrow hr;
+        hp_row(r.action, &hr);
+        snprintf(hint, n, "%s", hr.hint);
+        locked_out = !hr.enabled;
+    } else if (r.kind == R_KEY) {
+        if (keys_locked()) {
+            locked_out = true;
+            snprintf(hint, n, "Set by the environment (%s); unset it to change the keys here.",
+                     recomp_env_name(RENV_KEYBOARD_KEYS));
+        } else {
+            snprintf(hint, n, "%s%s%s %s, then press the new key. Left and Right pick the first or the second key,"
+                     " Delete empties it, Esc cancels. A key does one thing: one that is taken is refused.",
+                     s_key_msg, s_key_msg[0] ? "  " : "", act_name(0), "chooses");
+        }
+    } else if (r.kind == R_ADV) {
+        if (s_adv[s_page])
+            snprintf(hint, n, "The advanced rows of this page are shown. Off hides them again.");
+        else
+            snprintf(hint, n, "Rows on this page that most players never need: rarely changed, mostly for"
+                     " troubleshooting. On shows them.");
+    } else if (r.kind == R_ACTION && r.action == A_KEYS_PAGE) {
+        snprintf(hint, n, "The keys of the keyboard for each button of the pad, two each. %s opens the list.",
+                 act_name(0, true));
+    } else if (r.kind == R_ACTION && r.action == A_KEYS_BACK) {
+        snprintf(hint, n, "Back to the Controls settings. %s does the same.", act_name(1, true));
+    } else if (r.kind == R_ACTION && r.action == A_KEYS_RESET) {
+        snprintf(hint, n, "%s%sEvery keyboard key goes back to the game's own: W S A D and the arrows to drive, Space,"
+                 " Backspace, Shift and Ctrl for A B X Y, Q and E, Enter, Esc.",
+                 s_confirm == A_KEYS_RESET ? confirm_text(A_KEYS_RESET) : "",
+                 s_confirm == A_KEYS_RESET ? ".  " : "");
     } else if (r.kind == R_ACTION && r.action == A_UPDATE_CHECK) {
         snprintf(hint, n, "Asks GitHub whether a newer release of %s is out, with one anonymous"
                  " request sent when you press this row.", s_up_repo);
+    } else if (r.kind == R_ACTION && r.action == A_ONLINE_SERVER) {
+        if (s_ne_open)
+            snprintf(hint, n, "Type the address, or: Up/Down change the character, Left/Right move, X deletes, Y puts"
+                     " the default server back. A or Enter keeps it, B or Esc drops the change.");
+        else
+            snprintf(hint, n, "The lobby server to sign in to: a name or an address, with :port if it is not 21810."
+                     " The default is the community server the project runs. A edits it. From the next start.");
+    } else if (r.kind == R_ACTION && r.action == A_ONLINE_CODE) {
+        if (s_ne_open)
+            snprintf(hint, n, "Type a code, or: Up/Down change the character, Left/Right move, X deletes, Y makes a new"
+                     " one. A or Enter keeps it, B or Esc drops the change. 3 to 15 letters or digits; empty is public.");
+        else
+            snprintf(hint, n, "Play with friends: everyone types the same code here, then picks Xbox Live > Quick Match."
+                     " Games you create with a code are private; only players with the same code see and join them."
+                     " Empty: public games. A edits it.");
+    } else if (r.kind == R_ACTION && r.action == A_ONLINE_NAME) {
+        if (s_ne_open)
+            snprintf(hint, n, "Type a name, or: Up/Down change the letter, Left/Right move, X deletes, Y picks a random"
+                     " name. A or Enter keeps it, B or Esc drops the change. Letters and digits, up to 15.");
+        else
+            snprintf(hint, n, "The name other players see online. A edits it. Your computer's account name is never"
+                     " used. From the next start.");
     } else if (r.kind == R_ACTION && r.action == A_UPDATE_OPEN) {
         snprintf(hint, n, "Opens %s in your web browser.", s_up_res.url);
     } else if (r.kind == R_ACTION && r.action == A_STEAM_ART) {
@@ -4786,7 +5787,11 @@ static bool row_hint(const Row &r, char *hint, size_t n)
             : r.action == A_SAVE_BROWSE
             ? "Pick an exported save's dated folder, on a drive or card too. The usual place is"
             : r.action == A_SAVE_XBOX
-            ? "Pick a Burnout 3 save copied from an original Xbox or from xemu (the folder with Profile 1 in it, or one that holds it). Your save goes to"
+            ? "Pick a Burnout 3 save copied from an original Xbox or from xemu (the folder with Profile 1 in it, or one that holds it), or the folder with a PS2 save in it: a PCSX2 memory card (.ps2), a .psu, .max, .cbs, .xps or .psv file, or a BASLUS-21050 style folder. A PS2 profile keeps your current game settings. Your save goes to"
+            : r.action >= A_PS2_SLOT0 && r.action <= A_PS2_SLOT2
+            ? "Imports this profile of the PS2 save as your Takedawn profile. Your save goes to"
+            : r.action == A_PS2_CANCEL
+            ? "Leaves the PS2 save alone. Nothing is imported, and your save stays as it is in"
             : r.action == A_SAVE_RESTORE
             ? "Your save as it was before each game save, newest first: the latest 20, then one a"
               " day for a week and one a week for a month. Kept in"
@@ -4799,10 +5804,13 @@ static bool row_hint(const Row &r, char *hint, size_t n)
               " The running game is not affected.";
         char hist[1024];
         recomp_save_history_dir(s_sio_dir, hist, sizeof hist);
-        if (r.action == A_SAVE_XBOX)
+        if (r.action == A_PS2_CANCEL)
+            snprintf(hist, sizeof hist, "%s", s_sio_dir);
+        else if (r.action >= A_SAVE_XBOX && r.action < A_PS2_CANCEL && r.action != A_SAVE_RESTORE)
             snprintf(hist, sizeof hist, "%s/save-before-import", s_sio_dir);
         snprintf(hint, n, "%s%s%s %s. %s", s_sio_msg, s_sio_msg[0] ? "  |  " : "", what,
-                 r.action == A_SAVE_RESTORE || r.action == A_SAVE_XBOX ? hist : s_sio_dest, then);
+                 r.action == A_SAVE_RESTORE || (r.action >= A_SAVE_XBOX && r.action <= A_PS2_CANCEL) ? hist : s_sio_dest,
+                 r.action == A_PS2_CANCEL ? "" : then);
     } else if (r.kind == R_ACTION && r.action == A_RESTART_PIN) {
         char why[400];
         restart_reason(why, sizeof why);
@@ -4879,6 +5887,7 @@ static void build_pages_inner()
 
     const bool skinned = skin_frame();
     layout_compute(disp);
+    s_disp_w = disp.x, s_disp_h = disp.y;   /* for the rows (fit_relevant) */
     if (skinned) {
         /* A skin's page hides the game, as the title's own screens do. */
         bg->AddRectFilled(ImVec2(0, 0), disp, col(T->panel));
@@ -4942,6 +5951,7 @@ static void build_pages_inner()
     Row rows[OVERLAY_ROWS];
     int n = page_rows(s_page, rows);
     int &sel = s_sel[s_page];
+    reselect_run(rows, n);
     if (sel < 0 || sel >= n || !selectable(rows[sel])) {
         sel = 0;
         while (sel < n && !selectable(rows[sel]))
@@ -4971,6 +5981,14 @@ static void build_pages_inner()
     if (rows[sel].kind == R_SETTING) {
         while (s_steps[D_LEFT]-- > 0) adjust(rows[sel].id, -1);
         while (s_steps[D_RIGHT]-- > 0) adjust(rows[sel].id, 1);
+    } else if (rows[sel].kind == R_ADV) {
+        /* A switch: either arrow flips it, once however many steps came. */
+        if (s_steps[D_LEFT] > 0 || s_steps[D_RIGHT] > 0)
+            activate_row(rows[sel]);
+    } else if (rows[sel].kind == R_KEY) {
+        int &k = s_key_slot[rows[sel].action];
+        while (s_steps[D_LEFT]-- > 0) k = 0;
+        while (s_steps[D_RIGHT]-- > 0) k = XBOX_KEY_SLOTS - 1;
     } else if (rows[sel].kind == R_SPEAKERS) {
         int &k = s_spk_sel[rows[sel].action];
         while (s_steps[D_LEFT]-- > 0) k = (k + 5) % 6;
@@ -4983,6 +6001,12 @@ static void build_pages_inner()
         if (rows[sel].kind == R_SETTING) {
             xbox_SettingReset(rows[sel].id);
             changed();
+        } else if (rows[sel].kind == R_KEY && !keys_locked()) {
+            xbox_InputKeyBind(rows[sel].action, s_key_slot[rows[sel].action], 0, NULL);
+            keys_save();
+        } else if (rows[sel].kind == R_ADV && s_adv[s_page]) {
+            s_adv[s_page] = false;        /* Default: the advanced rows hidden again */
+            s_adv_reselect = true;
         }
     s_reset = 0;
     /* The footer: the selected row's hint (wrapped), a restart note, the keys. */
@@ -5098,7 +6122,8 @@ static void build_pages_inner()
                 sel = i;                  /* a tap beside a slider's bar, or a locked row */
                 menusnd_play(XBOX_OVERLAY_SND_MOVE);
             }
-        } else if (clicked && (rows[i].kind == R_ACTION || rows[i].kind == R_FOLDER)) {
+        } else if (clicked && (rows[i].kind == R_ACTION || rows[i].kind == R_FOLDER || rows[i].kind == R_ADV
+                               || rows[i].kind == R_KEY || rows[i].kind == R_HOST)) {
             sel = i;
             activate(rows[i]);
         } else if (clicked && rows[i].kind == R_SPEAKERS) {
@@ -5160,11 +6185,12 @@ static void build_pages_inner()
         s_rows_t0 = 0;
     /* A page change shows from the next frame. */
     if (s_page_delta) {
-        s_page = (s_page + (s_page_delta > 0 ? 1 : -1) + P_COUNT) % P_COUNT;
+        s_page = page_step(s_page, s_page_delta > 0 ? 1 : -1);
         s_page_delta = 0;
         menusnd_play(XBOX_OVERLAY_SND_PAGE);
         rows_in_page();
         s_confirm = 0;
+        s_keys_page = false;
         s_scroll_to_sel = true;
     }
 }
@@ -5292,9 +6318,9 @@ bool overlay_begin_frame()
     s_alpha += (s_open ? 1.0f : -1.0f) * dt / 0.14f;
     s_alpha = s_alpha < 0 ? 0 : s_alpha > 1 ? 1 : s_alpha;
     bool perf = xbox_SettingValue(XS_ADVANCED_PERF) != 0.0;
-    bool note = notice_on(), scripted = scripted_on(), sg = sg_banner_on();
+    bool note = notice_on(), scripted = scripted_on(), sg = sg_banner_on(), net = net_banner_on();
     bool touch = touch_on() && !s_open && s_alpha <= 0.0f;
-    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted && !sg && !touch)
+    if (!s_open && s_alpha <= 0.0f && !perf && !note && !scripted && !sg && !net && !touch)
         return false;
 
     ImGuiIO &io = ImGui::GetIO();
@@ -5396,6 +6422,17 @@ bool overlay_begin_frame()
         dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + ts.x + fs, p.y + ts.y + fs * 0.5f),
                           solid(T->notice_bg, 235 / 255.0f), fs * 0.5f);
         dl->AddText(ImGui::GetFont(), fs, p, solid(T->notice_text), s_sg_text, NULL, wrap);
+    }
+    if (net) {
+        /* Low centre, over the game: an online-play message. */
+        ImDrawList *dl = ImGui::GetForegroundDrawList();
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        const float wrap = disp.x * 0.8f;
+        const ImVec2 ts = ImGui::CalcTextSize(s_net_text, NULL, false, wrap);
+        const ImVec2 p((disp.x - ts.x) * 0.5f, disp.y * 0.80f);
+        dl->AddRectFilled(ImVec2(p.x - fs, p.y - fs * 0.5f), ImVec2(p.x + ts.x + fs, p.y + ts.y + fs * 0.5f),
+                          solid(T->notice_bg, 235 / 255.0f), fs * 0.5f);
+        dl->AddText(ImGui::GetFont(), fs, p, solid(T->notice_text), s_net_text, NULL, wrap);
     }
     if (touch)
         draw_touch(ImGui::GetBackgroundDrawList(), io.DisplaySize);

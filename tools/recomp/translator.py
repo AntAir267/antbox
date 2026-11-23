@@ -11,6 +11,7 @@ For each function:
 Produces compilable C code using recomp_types.h macros.
 """
 
+import re
 import bisect
 import json
 import glob
@@ -244,13 +245,205 @@ def _fixup_icall_esp_save(lines):
         if i in insert_before:
             # Determine indentation from the current line
             indent = line[:len(line) - len(line.lstrip())]
-            result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
+            result.append(f"{indent}{{ uint32_t _icall_esp = esp;")
         result.append(line)
         if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
     return result
+
+
+# Guest registers as function locals (the default; --no-reg-locals is the old form).
+#
+# The registers are thread-local globals (g_eax ... g_esp) because a call
+# passes them: arguments on the stack esp points at, the result in eax, and
+# ebx/esi/edi kept for the caller. But a global has to be in memory at every
+# guest store -- MEM32 is a pointer the compiler cannot prove misses g_esp --
+# so each one is reloaded after every store and written back before the
+# next, and esp, in nearly every address, is the worst of them. A local whose
+# address is never taken lives in a host register instead.
+#
+# So each function copies the globals in at entry and the two meet only where
+# something else can look: around every call (RECOMP_ABI_CALL and the
+# indirect-call macros do it in recomp_types.h; bare calls are wrapped here),
+# before every return, after a native longjmp lands, and in the few runtime
+# macros that read them (spin waits, tracing). Interrupts never need them:
+# every device routine runs on a worker stack with the registers saved and
+# restored around it (kernel_hal.c irq_run_line, apu_core.c, ohci.c).
+REG_LOCALS_DECL = ("    uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx, ebx = g_ebx,"
+                   " esi = g_esi, edi = g_edi, esp = g_esp;")
+
+# No-argument forms in generated statements that are not guest calls: the x87
+# stack accessors, value macros and the runtime's own sync macros.
+_REG_SYNC_NOT_CALLS = frozenset({
+    "fp_top", "fp_pop", "fp_st1", "XMM_ZERO", "xbox_ReadTimeStampCounter",
+    "RECOMP_ICALL_GUARD_HIT", "RECOMP_ICALL_GUARD_MISS",
+    "RECOMP_ACQUIRE_FENCE", "RECOMP_REGS_OUT", "RECOMP_REGS_IN",
+})
+_REG_SYNC_RE = re.compile(r"\b(?:([A-Za-z_]\w*)\(\);(\s*return;)?|return;)")
+
+
+_REGS = ("eax", "ecx", "edx", "ebx", "esi", "edi", "esp")
+_REG_NAME = r"(eax|ecx|edx|ebx|esi|edi|esp)"
+# Every way generated C changes a register (recomp_types.h has no other macro
+# that assigns to an argument, and nothing takes a register's address).
+_REG_WRITE_RES = (
+    re.compile(r"\b" + _REG_NAME + r"\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)"),
+    re.compile(r"\b(?:SET_LO8|SET_HI8|SET_LO16|PUSH32|POP32)\(" + _REG_NAME + r"\b"),
+    re.compile(r"\bPOP32\(esp,\s*" + _REG_NAME + r"\b"),
+    re.compile(r"(?:\+\+|--)\s*" + _REG_NAME + r"\b"),
+    re.compile(r"\b" + _REG_NAME + r"\s*(?:\+\+|--)"),
+)
+_REG_USE_RE = re.compile(r"\b" + _REG_NAME + r"\b")
+_COMMENT_RE = re.compile(r"/\*.*?\*/")
+# The indirect-call macros adjust esp and zero eax on their failure paths.
+_ICALL_RE = re.compile(r"\bRECOMP_(?:ICALL|ITAIL)")
+
+
+def _reg_writes(code):
+    out = set()
+    for rx in _REG_WRITE_RES:
+        out.update(rx.findall(code))
+    if _ICALL_RE.search(code):
+        out.update(("eax", "esp"))
+    return out
+
+
+def _localize_registers(lines, verify=False):
+    """Give the function its register locals and add the write-back and reload
+    around what needs them: every guest call, every return, a native longjmp
+    landing.
+
+    Narrowed two ways (2026-11-23), because writing all seven back and reading
+    all seven again at every call made the binary 10-29% bigger for little
+    or no speed (ANTBOX.md):
+    - Per function: only registers the function mentions are locals and are
+      reloaded; only those it ever writes are written back. A register it
+      never writes still equals its global at every sync point, since
+      nothing else changes a global without a reload after it.
+    - Per call: a write-back stores only the registers written since the last
+      sync. Straight after a call (an unconditional one: a direct call's line,
+      or an indirect call, whose every path calls or fails into eax/esp), the
+      locals equal the globals; a label some jump reaches, or a setjmp
+      landing, counts every register the function writes as changed.
+    With verify (--reg-verify), each register a write-back skips is checked
+    against its global at run time (RECOMP_REGS_SKIPPED), which is how the
+    analysis above is tested on a real game.
+
+    Anything called with no arguments that is not a known accessor counts as
+    a guest call, so a helper this list has not met is synchronised rather
+    than missed; one used as a value cannot be wrapped and stops the
+    translation instead."""
+    # The function's code, without comments or preprocessor lines.
+    code_lines = []
+    in_define = False
+    for line in lines:
+        stripped = line.lstrip()
+        if in_define or stripped.startswith("#") or line == REG_LOCALS_DECL:
+            in_define = in_define or stripped.startswith("#")
+            in_define = in_define and line.rstrip().endswith("\\")
+            code_lines.append("")
+            continue
+        code_lines.append(_COMMENT_RE.sub("", line))
+    body = "\n".join(code_lines)
+    written = _reg_writes(body)
+    used = set(_REG_USE_RE.findall(body)) | written
+    if _ICALL_RE.search(body) or "RECOMP_ABI_CALL(" in body:
+        used.update(("eax", "esp"))
+    labels = set(re.findall(r"^(loc_[0-9A-Fa-f]+):", body, re.M))
+    jumped = {lbl for lbl in labels if len(re.findall(r"\b" + lbl + r"\b", body)) > 1}
+
+    W = [r for r in _REGS if r in written]
+    U = [r for r in _REGS if r in used]
+
+    def out_text(dirty):
+        regs = [r for r in W if r in dirty]
+        parts = [f"g_{r} = {r};" for r in regs]
+        if verify:
+            parts += [f"RECOMP_REGS_SKIPPED({r});" for r in U if r not in regs]
+        return " ".join(parts)
+
+    def wrap(dirty, call, then_return):
+        o = out_text(dirty)
+        o = (o + " ") if o else ""
+        if then_return:
+            return f"{{ {o}{call}return; }}"
+        return f"{{ {o}{call}RECOMP_REGS_IN(); }}"
+
+    head = []
+    if U:
+        head.append("    uint32_t " + ", ".join(f"{r} = g_{r}" for r in U) + ";")
+    head += [
+        "    #undef RECOMP_REGS_OUT",
+        "    #define RECOMP_REGS_OUT() ((void)(" + (", ".join(f"g_{r} = {r}" for r in W) or "0") + "))",
+        "    #undef RECOMP_REGS_IN",
+        "    #define RECOMP_REGS_IN() ((void)(" + (", ".join(f"{r} = g_{r}" for r in U) or "0") + "))",
+    ]
+
+    out = []
+    dirty = set()
+    in_define = False
+    for line, code in zip(lines, code_lines):
+        stripped = line.lstrip()
+        if line == REG_LOCALS_DECL:
+            out.extend(head)
+            continue
+        if in_define or stripped.startswith("#"):
+            in_define = line.rstrip().endswith("\\")
+            out.append(line)
+            continue
+        m = re.match(r"\s*(loc_[0-9A-Fa-f]+):", line)
+        if m and m.group(1) in jumped:
+            dirty = set(written)
+        w = _reg_writes(code)
+        cur = dirty | w
+
+        def sync(mm):
+            name, then_return = mm.group(1), mm.group(2)
+            if name is None:
+                return wrap(cur, "", True)
+            if name in _REG_SYNC_NOT_CALLS:
+                if then_return:
+                    return f"{name}(); " + wrap(cur, "", True)
+                return mm.group(0)
+            before = line[:mm.start()].rstrip()
+            if before and before[-1] not in ";{})":
+                raise ValueError(f"reg-locals: {name}() used as a value: {line.strip()}")
+            return wrap(cur, f"{name}(); ", bool(then_return))
+
+        new = _REG_SYNC_RE.sub(sync, line)
+        s2 = new.strip()
+        direct = s2.startswith("PUSH32(esp, 0x") and "RECOMP_ABI_CALL(" in s2
+        if direct:
+            # The direct call's line: its own write-back and reload, so the
+            # write-back can be the narrow one.
+            mm = re.search(r"RECOMP_ABI_CALL\((0x[0-9A-Fa-f]+u), ([A-Za-z_]\w*)\);", new)
+            if mm:
+                new = (new[:mm.start()]
+                       + wrap(cur, f"RECOMP_ABI_CALL_RAW({mm.group(1)}, {mm.group(2)}); ", False)
+                       + new[mm.end():])
+        # A native longjmp lands back in the setjmp call with this frame's
+        # locals stale; recomp_guest_longjmp left the registers in the globals.
+        landing = "if (_sjv) { " in new
+        new = new.replace("if (_sjv) { ", "if (_sjv) { RECOMP_REGS_IN(); ")
+        out.append(new)
+        if direct:
+            dirty = set()
+        elif s2.startswith("{ uint32_t _icall_target") or s2.startswith("{ uint32_t _icall_esp"):
+            dirty = {"eax", "esp"} | (dirty if s2.startswith("{ uint32_t _icall_esp") else set())
+        elif landing:
+            dirty = set(written)
+        else:
+            dirty = cur
+    # Control that runs off the bottom returns too.
+    o = out_text(dirty if not jumped else set(written))
+    out.append(f"    {o}" if o else "    (void)0;")
+    out += ["    #undef RECOMP_REGS_OUT",
+            "    #define RECOMP_REGS_OUT() RECOMP_REGS_OUT_ALL()",
+            "    #undef RECOMP_REGS_IN",
+            "    #define RECOMP_REGS_IN() RECOMP_REGS_IN_ALL()"]
+    return out
 
 
 # The x87 stack accessors the lifter's output is written against. Module-level
@@ -423,6 +616,14 @@ class FunctionTranslator:
         # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
         # does not run and the output is unchanged).
         self.spin_waits = None
+        # Register locals: the guest registers live in each function's own C
+        # locals and meet the globals only where something else could look
+        # (_localize_registers). On from the command line unless
+        # --no-reg-locals; off here, where they are the globals as before.
+        self.reg_locals = False
+        # --reg-verify: each register a narrowed write-back skips is checked
+        # against its global at run time (RECOMP_REGS_SKIPPED).
+        self.reg_verify = False
         # Every `_flags` fallback emitted, with why (flag_fallbacks.py).
         self.flag_fallbacks = FlagFallbacks()
         self.mmio_lowered = 0   # constant device-register accesses lowered (mmio_lower.py)
@@ -1263,6 +1464,10 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            elif m.startswith("fcmov") and len(m) > 5:
+                # fcmovb/nb/be/nbe read CF too (upstream f4e42be, 2026-11-06);
+                # without this an add's carry was never kept for them.
+                cc = m[5:]
             elif m in ("pushfd", "lahf"):
                 # Both copy CF out of the tracked setter, through _cf when
                 # that setter keeps its carry there.
@@ -1914,56 +2119,106 @@ class FunctionTranslator:
         # become a block leader, so it gets no label and its `goto` is dropped
         # as dead code. Re-decode at every newly discovered leader and refresh
         # the computed-edge census until both describe the same instruction set.
-        if recovered is None:
-            resync = set()
-            while True:
-                missing = switch_leaders - {
-                    insn.address for insn in instructions}
-                new_missing = missing - resync
-                if not new_missing:
-                    break
-                resync.update(new_missing)
-                instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end, resync=resync)
-                if not instructions:
-                    return [], []
-                (imm_refs, computed_jump_edges, debug_slide_int3s,
-                 debug_slide_bypasses,
-                 switch_leaders) = self._control_flow_census(
-                     instructions, start, end, coalesced)
+        resync = set()
+        while True:
+            if recovered is None:
+                while True:
+                    missing = switch_leaders - {
+                        insn.address for insn in instructions}
+                    new_missing = missing - resync
+                    if not new_missing:
+                        break
+                    resync.update(new_missing)
+                    instructions = self.disasm.disassemble_function(
+                        raw_bytes, start, end, resync=resync)
+                    if not instructions:
+                        return [], []
+                    (imm_refs, computed_jump_edges, debug_slide_int3s,
+                     debug_slide_bypasses,
+                     switch_leaders) = self._control_flow_census(
+                         instructions, start, end, coalesced)
 
-        self.lifter.imm_code_refs = imm_refs
+            self.lifter.imm_code_refs = imm_refs
 
-        # Build basic blocks
-        blocks = self.disasm.build_basic_blocks(
-            instructions, start, end,
-            extra_leaders=switch_leaders if switch_leaders else None,
-            stop_mnemonics=("ud2", "hlt", "iret", "iretd")
-            if coalesced else ("iret", "iretd"))
-        block_starts = {block.start for block in blocks}
-        for block in blocks:
-            last = block.last_insn
-            if last is None:
-                continue
-            for target in computed_jump_edges.get(last.address, ()):
-                if target in block_starts and target not in block.successors:
-                    block.successors.append(target)
-        if coalesced:
+            # Build basic blocks
+            blocks = self.disasm.build_basic_blocks(
+                instructions, start, end,
+                extra_leaders=switch_leaders if switch_leaders else None,
+                stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+                if coalesced else ("iret", "iretd"))
+            block_starts = {block.start for block in blocks}
             for block in blocks:
-                bypass = (debug_slide_bypasses.get(block.last_insn.address)
-                          if block.last_insn is not None else None)
-                if bypass is not None:
-                    slide = block.last_insn.end_address
-                    block.successors = [
-                        bypass if successor == slide else successor
-                        for successor in block.successors
-                    ]
-                    if bypass not in block.successors:
-                        block.successors.append(bypass)
-                if (block.last_insn is not None
-                        and block.last_insn.mnemonic == "int3"
-                        and block.last_insn.address not in debug_slide_int3s):
-                    block.successors = []
+                last = block.last_insn
+                if last is None:
+                    continue
+                for target in computed_jump_edges.get(last.address, ()):
+                    if target in block_starts and target not in block.successors:
+                        block.successors.append(target)
+            if coalesced:
+                for block in blocks:
+                    bypass = (debug_slide_bypasses.get(block.last_insn.address)
+                              if block.last_insn is not None else None)
+                    if bypass is not None:
+                        slide = block.last_insn.end_address
+                        block.successors = [
+                            bypass if successor == slide else successor
+                            for successor in block.successors
+                        ]
+                        if bypass not in block.successors:
+                            block.successors.append(bypass)
+                    if (block.last_insn is not None
+                            and block.last_insn.mnemonic == "int3"
+                            and block.last_insn.address not in debug_slide_int3s):
+                        block.successors = []
+
+            # Linear decoding also sees inline tables and padding after
+            # returns. Only executable CFG edges (including the computed-edge
+            # census) can make those blocks part of this function. Immediate
+            # code addresses stay too: an intra-function register jmp may
+            # reach them by a goto the CFG could not prove (_lift_jmp).
+            by_start = {block.start: block for block in blocks}
+            reachable = set()
+            pending = [start, *imm_refs]
+            while pending:
+                address = pending.pop()
+                if address in reachable or address not in by_start:
+                    continue
+                reachable.add(address)
+                pending.extend(by_start[address].successors)
+            if recovered is not None:
+                break
+            # A direct jump to code just past an inline table lands on bytes
+            # the table's decode swallowed, the same way a switch target does.
+            # Only reachable edges count, so branches decoded from the table
+            # data itself cannot force a resync. Nor can a jump into the
+            # middle of an instruction that is itself reachable (overlapping
+            # code, or a loop back into its own compare): re-decoding there
+            # would throw away the reachable decode, the function's first
+            # instruction with it, and leave nothing reachable at all.
+            covered = {
+                insn.address + k for address in reachable
+                for insn in by_start[address].instructions
+                for k in range(1, max(1, insn.size))
+            }
+            new_missing = {
+                target for address in reachable
+                for target in by_start[address].successors
+                if target not in by_start and start <= target < end
+                and target not in covered
+            } - resync
+            if not new_missing:
+                break
+            resync.update(new_missing)
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, start, end, resync=resync)
+            if not instructions:
+                return [], []
+            (imm_refs, computed_jump_edges, debug_slide_int3s,
+             debug_slide_bypasses,
+             switch_leaders) = self._control_flow_census(
+                 instructions, start, end, coalesced)
+        blocks = [block for block in blocks if block.start in reachable]
+        instructions = [insn for block in blocks for insn in block.instructions]
         return instructions, blocks
 
     def translate_function(self, func_addr, func_info):
@@ -2105,6 +2360,8 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        if self.reg_locals:
+            lines.append(REG_LOCALS_DECL)
 
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding
@@ -2201,8 +2458,11 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         # sahf snapshots the AH image it loads, for the same reason.
+        # cmpxchg8b and the locked read-modify-writes publish theirs the
+        # same way (the LOCK prefix is Instruction.locked, so "lock add" is
+        # "add" here and matches _RESULT_SNAPSHOT_SETTERS on its own).
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec", "sahf")
+                                 "cmpxchg8b", "inc", "dec", "sahf")
                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
@@ -2395,6 +2655,8 @@ class FunctionTranslator:
                 bb.start == start, incoming)
             if self.spin_waits is not None:
                 stmts = self.spin_waits.consider(start, bb, stmts)
+            if self.lifter.mem_order is not None:
+                stmts = self.lifter.mem_order.fence_spin_exits(start, bb, stmts)
             # Constant-address device registers by call, not fault (BO-72;
             # mmio_lower.py). After spin-wait lowering, which matches the
             # statements as lifted.
@@ -2426,7 +2688,7 @@ class FunctionTranslator:
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
         # The pattern is: optional PUSH32 args, then
         # PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...).
-        # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
+        # We insert "uint32_t _icall_esp = esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
         # Validate: comment out goto targets that reference missing labels
@@ -2466,6 +2728,9 @@ class FunctionTranslator:
             break
         if _last_label_idx is not None and not _has_stmt_after:
             lines.insert(_last_label_idx + 1, "    (void)0;")
+
+        if self.reg_locals:
+            lines = _localize_registers(lines, verify=self.reg_verify)
 
         # Undefine FPU macros
         if has_fpu:
@@ -2519,9 +2784,11 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None, spin_waits=None, patches=None):
+                 icall_sites_json_path=None, spin_waits=None, patches=None,
+                 mem_order=None, reg_locals=False):
         """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
-        patches: a patches.PatchConfig (--patches), or None."""
+        patches: a patches.PatchConfig (--patches), or None.
+        mem_order: a mem_order.MemOrderConfig (--mem-order), or None."""
         self.xbe_path = xbe_path
         # Starts of the seeds a run saw (--seeds, `"observed": true`): the
         # flag-fallback report names its sites in these functions.
@@ -2591,6 +2858,10 @@ class BatchTranslator:
         if patches is not None:
             from .patches import PatchReport
             self.translator.lifter.patches = PatchReport(patches)
+        if mem_order is not None:
+            from .mem_order import MemOrderReport
+            self.translator.lifter.mem_order = MemOrderReport(mem_order)
+        self.translator.reg_locals = bool(reg_locals)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):
@@ -2709,6 +2980,8 @@ class BatchTranslator:
         c_chunks.append(" */")
         c_chunks.append("")
         c_chunks.append('#define RECOMP_GENERATED_CODE')
+        if getattr(self.translator, "reg_locals", False):
+            c_chunks.append('#define RECOMP_REG_LOCALS')
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
@@ -3015,6 +3288,8 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+            ] + (["#define RECOMP_REG_LOCALS"]
+                 if getattr(self.translator, "reg_locals", False) else []) + [
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",

@@ -1,8 +1,8 @@
 > **This is the README of [xboxrecomp](https://github.com/sp00nznet/xboxrecomp), the project
-> antbox is forked from, kept for its technical detail and its credits.** It speaks for
-> that project, not for antbox: "we", the version, the changelog, the list of ports, the
+> AntBox is forked from, kept for its technical detail and its credits.** It speaks for
+> that project, not for AntBox: "we", the version, the changelog, the list of ports, the
 > platform notes and the Discord are theirs. The only changes are the clone command, which
-> now points here, and relative links. For antbox itself, see the
+> now points here, and relative links. For AntBox itself, see the
 > [main README](../README.md).
 
 # xboxrecomp

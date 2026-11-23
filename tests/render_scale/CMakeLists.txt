@@ -8,6 +8,7 @@ project(render_scale_test C)
 set(CMAKE_C_STANDARD 11)
 add_executable(render_scale_test test_main.c
     ../../src/kernel/nv2a_backend_common.c
+    ../../src/platform/host_time.c
     ../../src/platform/recomp_env.c)
 target_include_directories(render_scale_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel

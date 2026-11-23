@@ -99,17 +99,24 @@ extern "C" {
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
     X(VBLANK_SYNC,       CONFIG, "RECOMP_VBLANK_SYNC",       NULL, "=display: the emulated vblank follows the display's refresh (reported by the present path) when within 5% of 60 Hz; default: its own 60.000 Hz timer") \
-    X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default 2)") \
-    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; the default except on macOS) or auto (each frame aimed at one refresh; the vblank locked to a fixed-rate display, timed presents under variable refresh; the default on macOS, BO-239); lock, timed force one (Metal)") \
+    X(PRESENT_DRAWABLES, CONFIG, "RECOMP_PRESENT_DRAWABLES", NULL, "Metal: CAMetalLayer maximumDrawableCount, 2 or 3 (default: 3, but 2 for legacy timing in a window on a 60 Hz fixed-rate display, BO-236)") \
+    X(PRESENT_TIMING,    CONFIG, "RECOMP_PRESENT_TIMING",    NULL, "display.present_timing: legacy (present when ready; the default except on macOS), auto (macOS: on macOS 14 and later frames are presented from a CAMetalDisplayLink, each at the refresh the system names, the vblank and the High refresh grid follow its refreshes (BO-236); before macOS 14 as aimed; the default on macOS) or aimed (each frame aimed at one refresh with presentDrawable:atTime:, the vblank locked to a fixed-rate display, timed presents under variable refresh: auto of 0.2.x, BO-239); link, lock, timed force one (Metal)") \
+    X(PRESENT_TIMING_REV, CONFIG, "RECOMP_PRESENT_TIMING_REV", NULL, "display.present_timing_rev: 2 once display.present_timing was taken over from 0.2.x (a stored legacy moved to auto once on macOS 14 and later, BO-236); written by the settings file, not for users") \
     X(FRAME_PACING,      CONFIG, "RECOMP_FRAME_PACING",      NULL, "display.frame_pacing: auto (smooth under gamescope, low_latency elsewhere; default), low_latency (each frame at the first refresh it can make) or smooth (one finished frame kept queued: +1 refresh of latency, a late frame no longer shows as a repeated one). Linux and Windows Vulkan with FIFO and present_wait (or present_wait2); on Windows the keeper stands down under variable refresh and away from 60 Hz; elsewhere no effect yet (BO-110, BO-207)") \
     X(PRESENT_MODE,      CONFIG, "RECOMP_PRESENT_MODE",      NULL, "display.present_mode, Vulkan with vsync: auto or fifo (FIFO; default) or mailbox (MAILBOX where offered; never picked by itself, BO-110)") \
     X(PRESENT_PHASE,     CONFIG, "RECOMP_PRESENT_PHASE",     NULL, "present timing, a locked display: ms the emulated vblank sits before a display refresh (default 5)") \
     X(PRESENT_LEAD,      CONFIG, "RECOMP_PRESENT_LEAD",      NULL, "present timing, a variable-refresh display: ms from the emulated vblank to the frame's present time (default 12)") \
     X(PRESENT_HANDOVER,  CONFIG, "RECOMP_PRESENT_HANDOVER",  NULL, "present timing, a locked display: ms after the refresh before a frame's own at which the frame is handed to the system, 0.5-16, at most half a refresh used (default 3, BO-239)") \
+    X(PRESENT_LINK_LATENCY, CONFIG, "RECOMP_PRESENT_LINK_LATENCY", NULL, "present timing, the display link (macOS 14+, BO-236): CAMetalDisplayLink preferredFrameLatency, 1 or 2 (default 1)") \
+    X(PRESENT_LINK_PHASE, CONFIG, "RECOMP_PRESENT_LINK_PHASE", NULL, "present timing, the display link: ms the emulated vblank (and the High refresh grid) sits before a refresh's commit deadline, 1-12 (default 4; moved earlier by itself when frames miss)") \
+    X(PRESENT_LINK_SLACK, CONFIG, "RECOMP_PRESENT_LINK_SLACK", NULL, "present timing, the display link: ms after the link's own commit deadline that the presenter takes as the deadline (the vblank and the take-until move with it), 0-30, never closer than 2 ms to the refresh named (default 8 with the link at 60 or less, 0 faster)") \
+    X(PRESENT_LINK_GUARD, CONFIG, "RECOMP_PRESENT_LINK_GUARD", NULL, "present timing, the display link: ms before a refresh's commit deadline after which a new frame waits for the next refresh, 0-8 (default 1.5)") \
     X(PRESENT_DEPTH,     CONFIG, "RECOMP_PRESENT_DEPTH",     NULL, "present timing, a locked display: refreshes from the vblank's refresh to the frame's, 0-3 (default 1; raised by itself when frames slip)") \
+    X(PRESENT_ATTIME,    CONFIG, "RECOMP_PRESENT_ATTIME",    NULL, "present timing, a locked display: 0 hands each frame to the system at once (presentDrawable: without a time; the target is still accounted and traced), a test of whether the time itself delays frames (BO-239); default 1") \
     X(PRESENT_LATENCY,   CONFIG, "RECOMP_PRESENT_LATENCY",   NULL, "D3D11 RECOMP_PRESENT_VSYNC=fifo: SetMaximumFrameLatency, 1-3 (default 1)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(KEYBOARD_ARROWS,   CONFIG, "RECOMP_KEYBOARD_ARROWS",   NULL, "both (default): the arrow keys are the d-pad and also the triggers and the stick; dpad: only the d-pad, for a title whose driving reads the d-pad (W/A/S/D still drive)") \
+    X(KEYBOARD_KEYS,     CONFIG, "RECOMP_KEYBOARD_KEYS",     NULL, "key bindings that differ from the defaults: action=KEY,KEY;...") \
     X(INPUT_RUMBLE,      CONFIG, "RECOMP_INPUT_RUMBLE",      NULL, "forward the title's rumble (USB output report) to the host pad; default 1, 0: off") \
     X(INPUT_CONTROL_SCHEME, CONFIG, "RECOMP_INPUT_CONTROL_SCHEME", NULL, "the driving controls, for a title that offers a second layout: xbox (default, the title's own), ps2 (the PlayStation 2 version's layout while driving; menus are not changed)") \
     X(INPUT_FIRST_PAD,   CONFIG, "RECOMP_INPUT_FIRST_PAD",   NULL, "the first controller's player: player1 (default; the keyboard adds to it) or player2 (the keyboard is player 1 alone, controllers from player 2: keyboard split screen)") \
@@ -144,6 +151,7 @@ extern "C" {
     X(GAME_LANGUAGE,     CONFIG, "RECOMP_GAME_LANGUAGE",     NULL, "the dashboard language the kernel reports (XC_LANGUAGE): english (default, as before), japanese, german, french, spanish, italian, korean, chinese, portuguese; a title shows text, speech and films in it only where its disc has them") \
     X(GAME_RACE_CLOCK,   CONFIG, "RECOMP_GAME_RACE_CLOCK",   NULL, "1: a race keeps real time from its start on a host that cannot hold 60 (the title's own catch-up stepping, which it otherwise starts at the first crash camera), for a title whose build has that behind a patch (--patches, recomp_patch.h); default 0, as shipped") \
     X(DISPLAY_CRASHNAV_MAP, CONFIG, "RECOMP_DISPLAY_CRASHNAV_MAP", NULL, "with RECOMP_GFX_HUD_FIX=1 in 16:9, a title's map screen (Burnout 3: Crash Nav, Select Location), for a title whose build has that behind a switch (recomp_patch.h): stretched (default: the map, its route and markers across the picture), native (4:3, with the menu)") \
+    X(DISPLAY_PICTURES,  CONFIG, "RECOMP_DISPLAY_PICTURES",  NULL, "with RECOMP_GFX_HUD_FIX=1 in 16:9, a title's 4:3 full-screen pictures (Burnout 3: loading screens, menu films, the Crash Nav map and its zoom), for a title whose build has that behind a switch (recomp_patch.h): blur (default: 4:3, a blurred and darkened copy at the sides; unset reads as blur), stretch (as shipped: across the picture), black (4:3, dark sides)") \
     X(GFX_RIVAL_MARKER,  CONFIG, "RECOMP_GFX_RIVAL_MARKER",  NULL, "where the marker over a rival changes its look with distance, for a title whose build has that behind a patch (--patches, recomp_patch.h): original (default, as shipped), farther") \
     X(GFX_SCORE_BOARD,   CONFIG, "RECOMP_GFX_SCORE_BOARD",   NULL, "the title's score board in a race's HUD, for a title whose build has a hook for them: original (default, as shipped), smooth (the board fades as one)") \
     X(OVERLAY,           CONFIG, "RECOMP_OVERLAY",           NULL, "the in-game settings overlay (Back+Start, F1, Cmd+,); default on, 0: off") \
@@ -171,7 +179,13 @@ extern "C" {
     X(GFX_TEXUP,         CONFIG, "RECOMP_GFX_TEXTURE_UPSCALE", NULL, "the world's textures upscaled on the GPU while playing (BO-245, nv2a_texup.h): off (default), fsrcnnx, nnedi3 (Metal)") \
     X(GFX_TEXUP_SCALE,   CONFIG, "RECOMP_GFX_TEXTURE_UPSCALE_SCALE", NULL, "graphics.texture_upscale's factor: 2x (default) or 4x (4x: textures up to 256 a side; larger ones get 2x)") \
     X(GFX_TEXUP_ROADS,   CONFIG, "RECOMP_GFX_TEXUP_ROADS",   NULL, "1: graphics.texture_upscale upscales the road surfaces too (default 0: the title's road skip list leaves them as they are)") \
+    X(GFX_FILMUP,        CONFIG, "RECOMP_GFX_FILM_UPSCALE", NULL, "the films upscaled on the GPU while they play (BO-136, nv2a_filmup.h): off, cheap (deblock + FSR 1), best (deblock + FSRCNNX x2); default best (cheap on Android and ARM Linux)") \
     X(GFX_TEXUP_PRELOAD, CONFIG, "RECOMP_GFX_TEXTURE_UPSCALE_PRELOAD", NULL, "graphics.texture_upscale_preload: 1 (default) the upscaler works through the title's loading screen and countdown with a larger budget (BO-272); 0 spreads the jobs through the race as before") \
+    X(ONLINE,            CONFIG, "RECOMP_ONLINE",            NULL, "online.mode: off (default; the title's network libraries run as shipped, no cable), internet (Xbox Live menus through the lobby server online.server) or lan (a lobby inside this copy for the local network) (xnet_hle.h, BO-134)") \
+    X(ONLINE_SERVER,     CONFIG, "RECOMP_ONLINE_SERVER",     NULL, "online.server: the lobby server, a name or an IPv4 address, optionally :port; default the project's public server") \
+    X(ONLINE_NAME,       CONFIG, "RECOMP_ONLINE_NAME",       NULL, "online.name: the player's name online (the Xbox Live gamertag the title shows); default a random RacerNNNN stored once (never the computer's account name)") \
+    X(ONLINE_CODE,       CONFIG, "RECOMP_ONLINE_CODE",       NULL, "online.code: a game code shared with friends (3 to 15 letters or digits); games created with it are private, and Quick Match and Join Game find only the game with the same code; empty = public games (BO-335)") \
+    X(ONLINE_REACTIONS,  CONFIG, "RECOMP_ONLINE_REACTIONS",  NULL, "online.reactions: show the quick reactions (GG, LET'S GO! and the like) other players send in the game's own menus; off hides them (BO-352)") \
     X(GFX_DITHER,        CONFIG, "RECOMP_GFX_DITHER",        NULL, "1: noise dither of +-0.5 LSB (interleaved gradient noise) in the Metal presenter's scale to the window, against banding of smooth gradients (default 0, off)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
@@ -261,6 +275,9 @@ extern "C" {
     X(STUB_LOG,          TRACE, "stub",            "RECOMP_STUB_LOG",          "name each unresolved stub reached") \
     /* ── debug: RECOMP_DEBUG=key[=value],... ─────────────────────────── */ \
     X(PB_VSH,            DEBUG, "pb_vsh",          "RECOMP_PB_VSH",            "=0: no vertex-program interpreter") \
+    X(HEAP_SPLIT,        DEBUG, "heap_split",      "RECOMP_HEAP_SPLIT",        "=1: split a reused heap block with 64 KB or more to spare (off: Wreckless DSOUND)") \
+    X(PHYS_RAM_ALIAS,    DEBUG, "phys_ram_alias",  "RECOMP_PHYS_RAM_ALIAS",    "=0: MmGetPhysicalAddress gives heap pages their own numbers, as the window's") \
+    X(APU_SSL_ADVANCE,   DEBUG, "apu_ssl_advance", "RECOMP_APU_SSL_ADVANCE",   "=1: a stream voice passes through an empty segment list (DirectSound 5849's expectation; off by default)") \
     X(PB_RC,             DEBUG, "pb_rc",           "RECOMP_PB_RC",             "=0: no register combiners (MODULATE)") \
     X(PB_FAST,           DEBUG, "pb_fast",         "RECOMP_PB_FAST",           "=0: CPU raster without fast paths") \
     X(PB_FAST_AB,        DEBUG, "pb_fast_ab",      "RECOMP_PB_FAST_AB",        "compare fast and slow raster per batch") \
@@ -268,6 +285,7 @@ extern "C" {
     X(PB_MIPS,           DEBUG, "pb_mips",         "RECOMP_PB_MIPS",           "=0: CPU raster samples mip level 0 only") \
     X(PB_CLIP,           DEBUG, "pb_clip",         "RECOMP_PB_CLIP",           "=0: no near-plane clipping") \
     X(ALPHA_KILL,        DEBUG, "alpha_kill",      "RECOMP_ALPHA_KILL",        "=0: GPU backends ignore TEXTURE_CONTROL0 ALPHA_KILL (BO-226)") \
+    X(WIDE_LINES,        DEBUG, "wide_lines",      NULL,                       "=0: lines at a render scale above 1 are drawn one host pixel wide, as before BO-385, not one guest pixel (Metal, Vulkan)") \
     X(PB_CULL_FLIP,      DEBUG, "pb_cull_flip",    "RECOMP_PB_CULL_FLIP",      "CPU raster culls the other winding") \
     X(PB_VSH_AB,         DEBUG, "pb_vsh_ab",       "RECOMP_PB_VSH_AB",         "compare vertex-program paths per batch") \
     X(PB_VSH_AB_DUMP,    DEBUG, "pb_vsh_ab_dump",  "RECOMP_PB_VSH_AB_DUMP",    "=prefix: pb_vsh_ab differing batches") \
@@ -275,6 +293,14 @@ extern "C" {
     X(ZPASS_FIXED,       DEBUG, "zpass_fixed",     "RECOMP_ZPASS_FIXED",       "=n: every occlusion report reads n") \
     X(PB_NULL_DRAW_US,   DEBUG, "null_draw_us",    "RECOMP_PB_NULL_DRAW_US",   "=us: null backend cost per draw") \
     X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
+    X(VTX_RECORD,        DEBUG, "vtx_record",      NULL,                       "=path: the GPU backends' vertex gathers (each draw's inputs and the guest bytes it reads) from vtx_record_at on, vtx_record_n of them, for tests/nv2a_vtx_gather (BO-282)") \
+    X(VTX_RECORD_AT,     DEBUG, "vtx_record_at",   NULL,                       "=s: vtx_record starts s seconds after the first draw (default 60)") \
+    X(VTX_RECORD_N,      DEBUG, "vtx_record_n",    NULL,                       "=n: vtx_record writes n draws (default 3000)") \
+    X(PB_BLOCK,          DEBUG, "pb_block",        NULL,                       "=0: the walker hands the executor ARRAY_ELEMENT16 and INLINE_ARRAY runs a word at a time, as before BO-282 (A/B)") \
+    X(PB_IMM,            DEBUG, "pb_imm",          NULL,                       "=0: immediate-mode vertex methods (SET_VERTEX3F/4F, SET_VERTEX_DATA*) go a word at a time through the executor's whole method dispatch, as before BO-282.12 (A/B)") \
+    X(PB_RECORD,         DEBUG, "pb_record",       NULL,                       "=path: the pushbuffer walks (start, end and the words each read) from pb_record_at on, pb_record_n of them, for tests/nv2a_pb_walk (BO-282)") \
+    X(PB_RECORD_AT,      DEBUG, "pb_record_at",    NULL,                       "=s: pb_record starts at the first walk s seconds after the first one that begins between methods (default 60)") \
+    X(PB_RECORD_N,       DEBUG, "pb_record_n",     NULL,                       "=n: pb_record writes n walks (default 40)") \
     X(AUDIO_STALL,       DEBUG, "audio_stall",     NULL,                       "=at[:for]: the audio device stops taking samples at second `at`, for `for` seconds or for good (test hook; SDL sink)") \
     X(AUDIO_OPEN_HANG,   DEBUG, "audio_open_hang", NULL,                       "the audio device's reopen never returns (test hook; SDL sink)") \
     X(VK_PRESENT_FAIL,   DEBUG, "vk_present_fail", NULL,                       "=at:n[:what]: from second `at`, n acquires in a row fail with what: outdated (default), surface, timeout (test hook; Vulkan window)") \
@@ -289,7 +315,7 @@ extern "C" {
     X(APU_MIXDOWN_ALL,   DEBUG, "apu_mixdown_all", "RECOMP_APU_MIXDOWN_ALL",   "=0: mix only two bins") \
     X(POKE,              DEBUG, "poke",            "RECOMP_POKE",              "=va:value,...: write guest words") \
     X(WORKERS,           DEBUG, "workers",         "RECOMP_WORKERS",           "=inline: run worker threads inline") \
-    X(GUEST_CPUS,        DEBUG, "guest_cpus",      "RECOMP_GUEST_CPUS",        "=all: the title's threads on every host core; =<n>: that core; =token: one at a time by a token, for hosts without thread affinity (macOS) (default: one core, as on the console)") \
+    X(GUEST_CPUS,        DEBUG, "guest_cpus",      "RECOMP_GUEST_CPUS",        "=all: the title's threads on every host core; =<n>: that core; =token: one at a time by a token (macOS, Linux, Android; on Windows one pinned core) (default: one core, as on the console; docs/runtime/guest-cpus.md)") \
     X(HOST_PRIORITY,     DEBUG, "host_priority",   NULL,                       "Windows: the process's priority class while the title's threads are pinned to one core: above (default), high, normal, or keep (as started); never lowered") \
     X(CS_MODE,           DEBUG, "cs_mode",         "RECOMP_CS_MODE",           "=single: one lock for every guest lock") \
     X(ASYNC_IO,          DEBUG, "async_io",        "RECOMP_ASYNC_IO",          "asynchronous file I/O") \
@@ -308,6 +334,8 @@ extern "C" {
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(WINDOW_DISPLAY,    DEBUG, "window_display",  NULL,                       "=n: open the window centred on display n (0 = main)") \
+    X(DETSEED,           DEBUG, "detseed",         NULL,                       "=1: test: the guest's clocks start from fixed values at process start (TSC, performance counter, system time, KeTickCount, interrupt time), so two runs boot on the same numbers (kernel_hal.c)") \
+    X(TIMING_CYCLE,      DEBUG, "timing_cycle",    NULL,                       "=n: macOS, every n seconds display.present_timing steps through aimed, auto, legacy, auto (a test of the live switches into and out of the display link, BO-236)") \
     X(WINDOW_FLOAT,      DEBUG, "window_float",    NULL,                       "1: the window stays above other windows (macOS; a measured run needs it visible: an occluded window reports no on-glass times)") \
     X(GLASS_MEASURE,     DEBUG, "glass_measure",   NULL,                       "=0: the Metal presenter installs no on-glass handler with display.present_timing = legacy (A/B of the measurement's own cost); the graph's on-glass line then says not available") \
     X(LAT_SIG,           DEBUG, "lat_sig",         NULL,                       "=1 with RECOMP_TRACE=latency: the Vulkan presenter reads each new frame back for its 16x12 signature (G rows), so tools/perf/latency.py finds the frame that answers a press (BO-110; a full-frame copy per flip, off by default)") \
@@ -323,6 +351,7 @@ extern "C" {
     X(VK_VALIDATION,     DEBUG, "vk_validation",   NULL,                       "Vulkan: enable VK_LAYER_KHRONOS_validation when installed") \
     X(VK_NO_MIPS,        DEBUG, "vk_no_mips",      NULL,                       "Vulkan uploads level 0 only") \
     X(VK_POINT,          DEBUG, "vk_point",        NULL,                       "Vulkan point sampling") \
+    X(ZCLAMP,            DEBUG, "zclamp",          NULL,                       "=0: Vulkan and Metal clip depth at the near and far planes as before BO-332, instead of clamping it and culling outside the title's SET_CLIP_MIN/MAX (xemu)") \
     X(VK_NO_RTT,         DEBUG, "vk_no_rtt",       NULL,                       "Vulkan decodes render targets from memory (implies vk_writeback=always)") \
     X(VK_WRITEBACK,      DEBUG, "vk_writeback",    NULL,                       "=lazy|always: Vulkan writes guest memory when a dump reads it (default) or at every flip") \
     X(VK_DEVICE_LOST,    DEBUG, "vk_device_lost",  NULL,                       "=<flip>: Vulkan backend treats its first submit after that flip as VK_ERROR_DEVICE_LOST (a test of what the player is told when the driver gives up)") \
@@ -344,8 +373,8 @@ extern "C" {
     X(USB_NDP,           DEBUG, "usb_ndp",         "RECOMP_USB_NDP",           "=n: root-hub ports, 1..4") \
     X(PAD_PRESS,         DEBUG, "pad_press",       "RECOMP_PAD_PRESS",         "=mask: pulse these buttons (USB pad)") \
     X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
-    X(TEXREP_DUMP,       DEBUG, "texrep_dump",     NULL,                       "=dir: every texture a GPU backend (Metal, Vulkan) uploads, once per content, as <hash>_<w>x<h>_f<format>.tga with an index.tsv (the hash is the one nv2a_texrep registers)") \
-    X(TEXREP_DUMP_MIPS,  DEBUG, "texrep_dump_mips", NULL,                      "with texrep_dump: a mipmapped texture's own levels 1.. as well, as <hash>_<w>x<h>_f<format>_m<level>.tga") \
+    X(TEXREP_DUMP,       DEBUG, "texrep_dump",     NULL,                       "=dir: every texture a GPU backend (Metal, Vulkan) uploads, once per content, as the PNG file a texture pack uses, <hash>.png or (P8) <hash>-<palette>.png, with an index.tsv (hash, palette hash, w, h, format, levels; the hash is the one nv2a_texrep registers)") \
+    X(TEXREP_DUMP_MIPS,  DEBUG, "texrep_dump_mips", NULL,                      "with texrep_dump: a mipmapped texture's own levels 1.. as well, as <key>_m<level>.png (not part of a pack)") \
     X(ALPHA_MIPS,        DEBUG, "alpha_mips",      NULL,                       "BO-171, alpha-tested (cut-out) textures: =0 the title's own mip levels and the host LOD bias as before; =mips only the levels made again with their alpha coverage kept; =bias only no negative host bias on alpha-tested draws; default both (Metal, Vulkan)") \
     X(ALPHA_MIPS_AB,     DEBUG, "alpha_mips_ab",   NULL,                       "=n: alpha_mips on for n flips, then off for n, and so on, the textures made again at each change: both pictures in one run (comparisons)") \
     X(ZBIAS,             DEBUG, "zbias",           NULL,                       "BO-176: =0 the depth offsets a title registers for its decal textures (nv2a_texrep_register_zbias) are not applied (Metal, Vulkan)") \
@@ -368,12 +397,15 @@ extern "C" {
     X(HDR_WATCH,         DEBUG, "hdr_watch",       NULL,                       "=<hash>: with hdr and hdr_dump, also dump each flip (up to 60, 20 flips apart, each with the flip after it) where a view's 3D draws that texture (texrep_dump hash) with an additive blend, or with the alpha test on (BO-203: the sun disc; Metal, Vulkan: the .rgbaf only; Vulkan: =<hash>@<flip> from that flip on)") \
     X(HDR_DUMP,          DEBUG, "hdr_dump",        NULL,                       "=prefix: with hdr, the presented frame of every fb_dump_at flip as <prefix>flip_NNNNN.rgbaf (32-bit float RGBA, an 16-byte header: magic HDR1, w, h, hdr on)") \
     X(ALPHA_MIPS_LOG,    DEBUG, "alpha_mips_log",  NULL,                       "one line per texture an alpha-tested draw binds: texrep_dump's hash, the test, the alpha coverage of level 0 and of the levels below before and after alpha_mips (Metal, Vulkan)") \
-    X(CHEATS,            DEBUG, "cheats",          NULL,                       "shows the Advanced page's cheat rows (xbox_OverlaySetCheats), a tester's tool: while one is on the title's saves go to a copy of the save") \
+    X(RT_REDUCE,         DEBUG, "rt_reduce",       NULL,                       "BO-178: =0 a draw that reads a scaled render target into a smaller one (bloom, blur) samples it at the host size, as before; default: at the title's size, an area-averaged copy (Metal, Vulkan)") \
+    X(RT_REDUCE_AB,      DEBUG, "rt_reduce_ab",    NULL,                       "=n: rt_reduce on for n flips, then off for n, and so on: both pictures in one run (comparisons)") \
+    X(CHEATS,            DEBUG, "cheats",          NULL,                       "shows the System page's cheat rows (xbox_OverlaySetCheats), a tester's tool: while one is on the title's saves go to a copy of the save") \
     X(UI_SCALE_ALGO,     DEBUG, "ui_scale_algo",   NULL,                       "=bicubic: graphics.ui_scale scales with a Catmull-Rom bicubic instead of Super-xBR (for comparison)") \
     X(UI_SCALE_HOLD,     DEBUG, "ui_scale_hold",   NULL,                       "graphics.ui_scale held off whatever the setting and the environment say: =1 on any platform (a way to rule the upscaling out when a GPU fault is chased); not held by default anywhere") \
     X(UI_SCALE_CACHE_MB, DEBUG, "ui_scale_cache_mb", NULL,                     "=n: size bound of graphics.ui_scale's disk cache of scaled textures, in MB (default 256); 0: no disk cache") \
     X(UI_SCALE_LOG,      DEBUG, "ui_scale_log",    NULL,                       "one line per texture and kind of draw that binds it (use 1: a 2D draw, 2: another, 3: both), with texrep_dump's hash and the factor it is uploaded at: what graphics.ui_scale's rule catches (Metal, Vulkan)") \
     X(TEXUP_LOG,         DEBUG, "texup_log",       NULL,                       "graphics.texture_upscale: one line per job (found on disk, computed, swapped, dropped) and the governor's pauses (nv2a_texup.h)") \
+    X(FILMUP_AB,         DEBUG, "filmup_ab",       NULL,                       "=n: graphics.film_upscale cycles off, cheap, best every n flips (BO-136: before/after shots of one film moment)") \
     X(TEXUP_CTL,         DEBUG, "texup_ctl",       NULL,                       "=file: every 30 flips the file's first line is graphics.texture_upscale (0 off, 1 fsrcnnx, 2 nnedi3, optional second number the scale): a test's live switch") \
     X(TEXUP_SHADERS,     DEBUG, "texup_shaders",   NULL,                       "=dir: graphics.texture_upscale's shader files from this folder (luma, fsrcnnx_00..12, nnedi3, recombine .metal/.comp and VERSION)") \
     X(TEXUP_MAX,         DEBUG, "texup_max",       NULL,                       "=n: the largest texture side graphics.texture_upscale takes (default 1024; handhelds 512)") \
@@ -384,16 +416,27 @@ extern "C" {
     X(TEXUP_CAP_MS,      DEBUG, "texup_cap_ms",    NULL,                       "=racing[,idle[,prestart[,loading]]]: the governor's GPU ms of compute a frame (default 0.5 while drawing 3D, 4 otherwise; before the GO 4 and on the loading screen 6, within the frame's GPU room: BO-272)") \
     X(TEXUP_SLOTS,       DEBUG, "texup_slots",     NULL,                       "=n: graphics.texture_upscale's job slots, 1..8 (default 8; a stress test of the slot paths)") \
     X(TEXUP_FREE_FLIPS,  DEBUG, "texup_free_flips", NULL,                      "=n: flips after which graphics.texture_upscale gives back a finished or unread slot (default 600; a stress test)") \
+    X(REHASH_PICTURE,    DEBUG, "rehash_picture",  NULL,                       "=1: rehash the bound textures at every picture again, as before BO-282.6 (high refresh rehashes once a step: a diagnosis switch)") \
+    X(REHASH_STEPS,      DEBUG, "rehash_steps",    NULL,                       "=1: count and log texture hash changes the Vulkan backend sees in a 0-step high-refresh picture (BO-282.6 counter run)") \
     X(TEXUP_STRESS,      DEBUG, "texup_stress",    NULL,                       "=n: every n flips the running upscale job's texture is taken as changed by the title (uploaded again at its next bind; Vulkan; a stress test)") \
     X(TEXUP_FP32,        DEBUG, "texup_fp32",      NULL,                       "1: the upscalers' intermediate images are 32-bit float instead of 16 (Metal; a precision check)") \
     X(TEXUP_DUMP,        DEBUG, "texup_dump",      NULL,                       "=dir: the first 3 FSRCNNX jobs' luma in and last model image out as <hash>_<w>x<h>_w<wrap>_luma.f32 / _model.f32 (RGBA float), for tests/nv2a_texup/check_fsrcnnx.py (Vulkan)") \
     X(TEXUP_SKIP,        DEBUG, "texup_skip",      NULL,                       "=file: the road skip list (texrep hashes, one a line) instead of the title's") \
+    X(TEXPACK,           DEBUG, "texpack",         NULL,                       "=dir[;dir...]: texture pack folders (PNG files named by texrep_dump's keys) put in front of the title's mod packs (BO-312, nv2a_texpack.h)") \
+    X(TEXPACK_LOG,       DEBUG, "texpack_log",     NULL,                       "texture packs: one line per job (decoded, from the disk cache) and swap (nv2a_texpack.h)") \
+    X(TEXPACK_CAP_MB,    DEBUG, "texpack_cap_mb",  NULL,                       "=n: memory cap of the pack textures in use on the graphics card, MB (default 1024; handhelds 256); over it the least recently used one goes back to the title's") \
+    X(TEXPACK_SWAP_MB,   DEBUG, "texpack_swap_mb", NULL,                       "=n: pack texture bytes a flip may upload, MB (default 24; one larger result goes alone)") \
+    X(TEXPACK_CPU_MB,    DEBUG, "texpack_cpu_mb",  NULL,                       "=n: bytes of queued and finished pack results held in memory, MB (default 512; handhelds 128)") \
+    X(TEXPACK_CACHE_MB,  DEBUG, "texpack_cache_mb", NULL,                      "=n: size bound of the pack textures' disk cache of compressed results, MB (default 4096); 0: no disk cache") \
+    X(TEXPACK_COMPRESS,  DEBUG, "texpack_compress", NULL,                      "=0: pack textures stay raw BGRA8 (default: big ones are compressed to BC1/BC3 where the backend can sample them)") \
     X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips; =@file: the list in that file, read again when it grows") \
     X(FB_DUMP_FLIPS,     DEBUG, "fb_dump_flips",   "RECOMP_FB_DUMP_FLIPS",     "=n: fb_dump every nth flip") \
+    X(FB_DUMP_HOST,      DEBUG, "fb_dump_host",    NULL,                       "=1: with fb_dump_at, a frame drawn at a render scale above 1 also at its host size, <fb_dump prefix>host_flip_NNNNN.bmp (Metal, Vulkan)") \
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
     X(AUTOPILOT,         DEBUG, "autopilot",       NULL,                       "=1: the title's own AI drives player 1's car while it races (a game's test driver; Burnout 3: src/game/autopilot.c)") \
+    X(ONLINEBOT,         DEBUG, "onlinebot",       NULL,                       "=host|guest|probe: an online test navigator plays the title's menus by the screen it is on (Burnout 3: src/game/onlinebot.c)") \
     X(BUG_REPORT,        DEBUG, "bug_report",      NULL,                       "=seconds[:shot]: write a bug report archive that long after the start (xbox_report.h), :shot with the last frame; =@file: whenever that file appears; no window needed") \
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
@@ -424,6 +467,7 @@ extern "C" {
     X(FRAMETIME_HOST,    TRACE, "frametime_host",  NULL,                       "=file: with frametime, the host stacks of guest-main's host-code samples in every frame where they reach frametime_host_ms (Mach, Linux)") \
     X(FRAMETIME_HOST_MS, TRACE, "frametime_host_ms", NULL,                     "=ms: the m_host a frame needs for frametime_host to write its stacks (4)") \
     X(LATENCY_TRACE,     TRACE, "latency",         NULL,                       "=file: input-to-photon CSV: pad report changes, guest ISR, swap, vblank release, executor done, GPU done + frame signature, drawable acquire/present/on-glass (tools/perf/latency.py)") \
+    X(PB_SPLIT,          TRACE, "pb_split",        NULL,                       "=<file>: one CSV line per flip, where the executor's busy time goes (BO-282.12): method headers and words by class with a sampled quarter of them timed, vk_on_draw's parts timed on a sampled quarter of the draws, texture rehashes, uploads (count, bytes), render-target ownership hashes and cube copies; =<file>:<n> times 1 in n instead of 1 in 4") \
     X(PB_SLOW,           TRACE, "pb_slow",         NULL,                       "=ms: a [PB] line for every pushbuffer method the executor spends that long in (default 5): which command a frame stood in; two clock reads a method header") \
     X(GLASS_TRACE,       TRACE, "glass",           NULL,                       "=file: one CSV line per presented frame: flip, emulated vblank, present target, commit, on-glass time, interval in ms and refreshes, steps (tools/perf/glass.py)") \
     X(KWAIT_TRACE,       TRACE, "kwait",           NULL,                       "=file: wall time of every kernel call by thread, ordinal and guest call site, a block a second; calls of 20 ms or more one line each with their arguments") \

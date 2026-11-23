@@ -16,6 +16,7 @@ add_executable(enhance_cfg_test
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
     ${XR_SRC}/kernel/nv2a_backend_common.c
+    ${XR_SRC}/platform/host_time.c
     ${XR_SRC}/platform/recomp_env.c
     ${XR_SRC}/platform/recomp_exe_dir.c)
 target_include_directories(enhance_cfg_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform

@@ -1,0 +1,48 @@
+// AMD FidelityFX Super Resolution 1.0.2, RCAS (sharpening, with its noise
+// guard), on the 2x luma EASU made (BO-136). AMD's filter (MIT, Copyright
+// (c) 2021 Advanced Micro Devices, Inc.), as agyild's mpv port runs it on
+// one plane (MIT), sharpness 0.2 stops; a compute pass here. size: the 2x
+// image's.
+#include "common.glsl"
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D luma2x;
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D destination;
+
+#define SHARPNESS 0.2
+#define FSR_RCAS_LIMIT (0.25 - (1.0 / 16.0))
+
+float APrxMedRcpF1(float a)
+{
+    float b = uintBitsToFloat(uint(0x7ef19fff) - floatBitsToUint(a));
+    return b * (-b * a + 2.0);
+}
+float AMax3F1(float x, float y, float z) { return max(x, max(y, z)); }
+float AMin3F1(float x, float y, float z) { return min(x, min(y, z)); }
+
+float T(ivec2 p) { return imageLoad(luma2x, edge(p, pc.size)).x; }
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size)))
+        return;
+    //    b
+    //  d e f
+    //    h
+    float b = T(p + ivec2(0, -1)), d = T(p + ivec2(-1, 0)), e = T(p);
+    float f = T(p + ivec2(1, 0)), h = T(p + ivec2(0, 1));
+    float mn1L = min(AMin3F1(b, d, f), h);
+    float mx1L = max(AMax3F1(b, d, f), h);
+    vec2 peakC = vec2(1.0, -1.0 * 4.0);
+    float hitMinL = min(mn1L, e) / (4.0 * mx1L);
+    float hitMaxL = (peakC.x - max(mx1L, e)) / (4.0 * mn1L + peakC.y);
+    float lobeL = max(-hitMinL, hitMaxL);
+    float lobe = max(-FSR_RCAS_LIMIT, min(lobeL, 0.0)) * exp2(-clamp(SHARPNESS, 0.0, 2.0));
+    float nz = 0.25 * b + 0.25 * d + 0.25 * f + 0.25 * h - e;
+    nz = clamp(abs(nz) * APrxMedRcpF1(AMax3F1(AMax3F1(b, d, e), f, h)
+                                      - AMin3F1(AMin3F1(b, d, e), f, h)), 0.0, 1.0);
+    nz = -0.5 * nz + 1.0;
+    lobe *= nz;
+    float rcpL = APrxMedRcpF1(4.0 * lobe + 1.0);
+    float y = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
+    imageStore(destination, p, vec4(clamp(y, 0.0, 1.0), 0.0, 0.0, 1.0));
+}

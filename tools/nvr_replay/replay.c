@@ -410,6 +410,13 @@ static void swm_replay(uint32_t param)
     }
 }
 
+static void precache_progress(unsigned done, unsigned total, void *ctx)
+{
+    (void)ctx;
+    printf("[precache] %u/%u\n", done, total);
+    fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
     static uint8_t xbe[0x1000];
@@ -435,6 +442,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prof") && i + 1 < argc) prof = argv[++i];
         else if (!strcmp(argv[i], "--no-frames")) O.no_frames = 1;
+        else if (!strcmp(argv[i], "--precache") && i + 2 < argc) {
+            /* The install step alone: LIST XBE, then end (no capture). */
+            host_opts(1);
+            setenv("RECOMP_PB_BACKEND", "native", 1);
+            recomp_env_reload();
+            return nvr_precache_main(argv[i + 1], argv[i + 2], precache_progress, NULL);
+        }
         else if (!strcmp(argv[i], "--contig-high") && i + 1 < argc)
             contig_high = (uint32_t)strtoul(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--flips") && i + 1 < argc) {

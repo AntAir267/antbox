@@ -59,6 +59,15 @@ int usb_gamepad_configured(int pad);
 /* Lines of RECOMP_PAD_LIVE the pad has taken (scheduled) since start. */
 unsigned usb_gamepad_live_taken(void);
 
+/* An in-process driver (a test navigator): one line of the RECOMP_PAD_LIVE
+ * syntax, <button>[+<button>...][:<hold ms>], pressed as if appended to that
+ * file (logged as "PAD: live", counted by usb_gamepad_live_taken). Thread
+ * safe; up to 16 lines wait to be taken. 1 queued, 0 not (full, too long).
+ * usb_gamepad_live_enable, before the title's first pad read, makes the run
+ * a scripted one (the pads are the driver's) without a file. */
+void usb_gamepad_live_enable(void);
+int  usb_gamepad_live_push(const char *line);
+
 /* Whether a pad script (RECOMP_PAD_SCRIPT / RECOMP_PAD_LIVE) drives `pad`:
  * one is set for the run and no controller has taken the pad back. */
 int usb_gamepad_script_drives(int pad);

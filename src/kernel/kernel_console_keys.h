@@ -42,7 +42,7 @@ void xbox_ConsoleKeyDeriveSignature(const uint8_t cert_key[16], uint8_t out[16])
  * set, or not usable (the reason is in xbox_ConsoleKeyStatus). */
 int xbox_ConsoleKeyLoad(uint8_t hdkey[16]);
 
-/* The one-line state for the Advanced page and the log. */
+/* The one-line state for the System page and the log. */
 const char *xbox_ConsoleKeyStatus(void);
 
 #ifdef __cplusplus

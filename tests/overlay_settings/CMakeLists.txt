@@ -15,6 +15,7 @@ add_executable(overlay_settings_test
     ${XR_SRC}/enhance/recomp_cfg.c
     ${XR_SRC}/platform/recomp_env.c
     ${XR_SRC}/platform/recomp_save_dir.c
+    ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/xr_log.c)
 target_include_directories(overlay_settings_test PRIVATE ${XR_SRC}/overlay ${XR_SRC}/enhance
     ${XR_SRC}/platform ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/apu ${XR_SRC}/d3d ${XR_SRC})

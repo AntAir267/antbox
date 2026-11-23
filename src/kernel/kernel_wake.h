@@ -19,6 +19,9 @@
  * critical section), bounded by a few milliseconds. Only between guest
  * threads, only towards a higher guest priority (KeSetBasePriorityThread),
  * only for single-object waits. RECOMP_WAKE_HANDOFF=0 turns it off.
+ * On every host, Windows included (it was compiled out there until the
+ * audit of 2026-11-03: a Win32 event does not say which wait took it, so
+ * Windows reads that from the waiters' own wait counts instead).
  */
 #ifndef XBOX_KERNEL_WAKE_H
 #define XBOX_KERNEL_WAKE_H
@@ -36,8 +39,16 @@ void xbox_WakeBlockingCall(void);
 /* The calling thread waits on one object / is back from that wait. */
 void xbox_WakeWaitBegin(const void *object, uint32_t guest_ret);
 void xbox_WakeWaitEnd(void);
+/* The calling thread is about to signal the object (optional, before the
+ * SetEvent): who waits on it is noted now, so a woken thread that runs and
+ * blocks again before xbox_WakeSignalled looks is seen to have done so. */
+void xbox_WakeSignalBegin(const void *object);
+#define XBOX_HAVE_WAKE_SIGNAL_BEGIN 1
 /* The calling thread has just signalled the object. */
 void xbox_WakeSignalled(const void *object, uint32_t guest_ret);
+/* The calling thread lowered below DISPATCH_LEVEL and let the one-CPU gate
+ * go (kernel_hal.c): run the hand-offs it signalled while raised. */
+void xbox_WakeIrqlLowered(void);
 /* Is the kernel ordinal one that can block? */
 int  xbox_WakeOrdinalBlocks(uint32_t ordinal);
 /* Hand-offs done, and those that ran into the time bound. */
