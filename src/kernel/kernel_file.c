@@ -353,6 +353,34 @@ static void overwrite_settle(HANDLE h)
         truncate_to_zero(h);
 }
 
+/* The access a handle was granted (0 if it cannot be read), for failure
+ * reports: ERROR_ACCESS_DENIED on a handle says little without it. */
+static ULONG handle_granted_access(HANDLE h)
+{
+    typedef LONG (WINAPI *query_object_fn)(HANDLE, int, PVOID, ULONG, PULONG);
+    static query_object_fn query;
+    ULONG info[14];                 /* PUBLIC_OBJECT_BASIC_INFORMATION */
+    if (!query)
+        query = (query_object_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                                "NtQueryObject");
+    if (!query || query(h, 0 /* ObjectBasicInformation */, info, sizeof info, NULL) < 0)
+        return 0;
+    return info[1];                 /* GrantedAccess */
+}
+
+/* Setting a file's end or its allocation needs write access, on the Xbox as
+ * on NT: the I/O manager answers STATUS_ACCESS_DENIED for a handle opened
+ * without FILE_WRITE_DATA before the file system sees the call. XAPI's
+ * SetEndOfFile on a save a title opened only to read (one did that for every
+ * slot it loaded) used to reach the host call, fail with err=5 and print a
+ * warning each time. Unknown access (the query failed) is treated as
+ * writable, so the host call still decides. */
+static int handle_may_write(HANDLE h)
+{
+    ULONG granted = handle_granted_access(h);
+    return !granted || (granted & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL)) != 0;
+}
+
 /* The missing-file report's high/low split: a miss under a directory that
  * exists is a file the dump lacks; one under a directory that does not is
  * usually a title probing a loose-file layout it never shipped. Same answer
@@ -509,17 +537,20 @@ static NTSTATUS __stdcall xbox_NtCreateFile(
          * build that decision was invisible. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                  "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+        NTSTATUS st;
+        switch (err) {
+            case ERROR_FILE_NOT_FOUND: st = STATUS_OBJECT_NAME_NOT_FOUND; break;
+            case ERROR_PATH_NOT_FOUND: st = STATUS_OBJECT_PATH_NOT_FOUND; break;
+            case ERROR_ACCESS_DENIED:  st = STATUS_ACCESS_DENIED; break;
+            case ERROR_ALREADY_EXISTS: st = STATUS_OBJECT_NAME_COLLISION; break;
+            case ERROR_TOO_MANY_OPEN_FILES: st = STATUS_TOO_MANY_OPENED_FILES; break;
+            default:                   st = STATUS_UNSUCCESSFUL; break;
+        }
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
-        }
+        return st;
     }
 
     *FileHandle = h;
@@ -771,17 +802,28 @@ static NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             LARGE_INTEGER cur, zero = {0};
+            if (!handle_may_write(FileHandle)) {
+                XBOX_TRACE(XBOX_LOG_FILE, "SetEndOfFile on a read-only handle: access denied");
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             /* A pending overwrite ends here: SetEndOfFile to the new size
              * keeps the old bytes below it (see s_overwrite_pending). */
             overwrite_take(FileHandle);
             SetFilePointerEx(FileHandle, zero, &cur, FILE_CURRENT);
             SetFilePointerEx(FileHandle, info->EndOfFile, NULL, FILE_BEGIN);
             if (!SetEndOfFile(FileHandle)) {
+                DWORD err = GetLastError();
+                WCHAR p[MAX_PATH];
+                if (!GetFinalPathNameByHandleW(FileHandle, p, MAX_PATH, 0))
+                    wcscpy_s(p, MAX_PATH, L"?");
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                    "SetEndOfFile failed: size=%lld err=%u",
-                    (long long)info->EndOfFile.QuadPart, GetLastError());
+                    "SetEndOfFile failed: size=%lld err=%u access=0x%08X %S",
+                    (long long)info->EndOfFile.QuadPart, err,
+                    (unsigned)handle_granted_access(FileHandle), p);
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
-                return STATUS_UNSUCCESSFUL;
+                return err == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+                                                  : STATUS_UNSUCCESSFUL;
             }
             if (cur.QuadPart <= info->EndOfFile.QuadPart)
                 SetFilePointerEx(FileHandle, cur, NULL, FILE_BEGIN);
@@ -802,6 +844,10 @@ static NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             FILE_ALLOCATION_INFO fai;
+            if (!handle_may_write(FileHandle)) {
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             overwrite_settle(FileHandle);
             fai.AllocationSize = info->EndOfFile;
             if (!SetFileInformationByHandle(FileHandle, FileAllocationInfo,
@@ -1304,6 +1350,8 @@ static NTSTATUS errno_to_status(int e)
         case EPERM:   return STATUS_ACCESS_DENIED;
         case EEXIST:  return STATUS_OBJECT_NAME_COLLISION;
         case ENOMEM:  return STATUS_NO_MEMORY;
+        case EMFILE:
+        case ENFILE:  return STATUS_TOO_MANY_OPENED_FILES;
         default:      return STATUS_UNSUCCESSFUL;
     }
 }
@@ -1442,10 +1490,21 @@ static NTSTATUS __stdcall xbox_NtCreateFile(
         g_xbox_last_file_error = no_dir ? 3u
                                : e == ENOENT ? 2u
                                : (e == EACCES || e == EPERM) ? 5u
-                               : e == EEXIST ? 80u : 0u;
+                               : e == EEXIST ? 80u
+                               : (e == EMFILE || e == ENFILE) ? 4u : 0u;
+        /* Not the title's fault, and easy to mistake for a missing file:
+         * on stderr, where a tester's log has it. */
+        if (e == EMFILE || e == ENFILE) {
+            static volatile LONG warned;
+            if (InterlockedExchange(&warned, 1) == 0) {
+                fprintf(stderr, "  [FILE] out of host file descriptors (%s): "
+                        "raise the open-file limit\n", host_path);
+                fflush(stderr);
+            }
+        }
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
         return st;
@@ -1729,6 +1788,12 @@ static NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             /* A pending overwrite ends here: ftruncate to the new size keeps
              * the old bytes below it (see s_overwrite_pending). */
+            /* Needs write access, as on the Xbox (see handle_may_write in
+             * the Win32 backend). */
+            if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             overwrite_take(fd);
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
@@ -1753,6 +1818,10 @@ static NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_END_OF_FILE_INFORMATION info =
                 (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             struct stat st;
+            if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                return STATUS_ACCESS_DENIED;
+            }
             overwrite_settle(fd);
             if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size
                     && ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)

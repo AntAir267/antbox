@@ -28,10 +28,18 @@ from .flag_fallbacks import FlagFallbacks
 from .mmio_lower import lower_stmts as lower_mmio_stmts
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
-                     detect_setjmp_helpers, _func_ident, _operand_width)
+                     detect_setjmp_helpers, _func_ident, _operand_width,
+                     publish_flags)
 
 
 _FLOAT_COMPARES = ("comiss", "comisd", "ucomiss", "ucomisd")
+# The fcomi family stores its ordering in g_fp_cmp, and every condition
+# _make_condition builds for it reads only that, so a join of any two of them
+# is one state whatever the operands were (upstream fc54a432).
+_FPU_COMPARES = frozenset({"fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"})
+# String compares set every flag; behind a rep prefix (another mnemonic) a
+# zero count sets none.
+_STRING_COMPARES = frozenset({"cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd"})
 
 
 def _merge_flag_states(states):
@@ -41,6 +49,11 @@ def _merge_flag_states(states):
     runtime. A shared consumer can use whichever predecessor executed. Keep
     operation and width equal because sign/parity handling depends on them;
     arithmetic states still reconstruct operands and cannot use this merge.
+
+    Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
+    after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
+    -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
+    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
@@ -57,6 +70,8 @@ def _merge_flag_states(states):
     # exactly such a jbe and returned 0 for every deflection, so the analog
     # sticks did nothing.
     if all(s[0] in _FLOAT_COMPARES for s in states):
+        return first
+    if all(s[0] in _FPU_COMPARES for s in states):
         return first
     if any(s[0] == "cmp_mixed" for s in states):
         # A mixed join flowing on (a loop head, a second join): still cmp
@@ -114,17 +129,88 @@ def _merge_zero_flag(states):
     return ("__zf_from_dest", [states[0][1][0]])
 
 
-def _incoming_flag_state(sources, known, is_entry):
+def _incoming_flag_state(sources, known, is_entry, caller_flags=False):
     """The flag state a block inherits, or None when it cannot be known.
 
     A predecessor with no computed state yet makes the result unknown rather
     than guessed: that costs a fallback condition and never a wrong one.
+    An entry that reads its caller's flags (caller_flags) starts from
+    g_eflags, which the caller published (upstream fdebc22b): AntBox's
+    "popfd" state, which reads every condition from g_eflags.
     """
+    if is_entry and caller_flags:
+        return _merge_flag_states([("popfd", []),
+                                   *(known[p] for p in sources if p in known)])
     if is_entry or not sources:
         return None
     if not all(p in known for p in sources):
         return None
     return _merge_flag_states([known[p] for p in sources])
+
+
+_REG_TOKEN = None
+
+
+def _edge_flag_plan(bb, sources, known):
+    """Evaluate a join's flag condition on each incoming edge instead.
+
+    When the predecessors reach a join with states that do not merge -- a
+    `test eax, eax` on one edge and a `cmp eax, 1` on the other -- no single
+    condition at the join is right, and the jcc there lifted to the _flags
+    fallback, which nothing assigns: the branch was never taken. But each
+    predecessor knows its own state, so each can compute the join's
+    condition itself just before it transfers control, into a variable the
+    join then tests.
+
+    Returns (consumer mnemonic, {predecessor: condition}) or None. Only the
+    first flag reader of the join counts, and only when every predecessor's
+    condition is known. Instructions between the join's label and that reader
+    must leave the flags alone, and when there are any, a condition that reads
+    a live register (rather than a compare snapshot) is refused, because those
+    instructions may have changed it.
+    """
+    import re
+    from .lifter import (_EFLAGS_PRESERVE, _make_condition, _make_setcc_value,
+                         _make_cmovcc_cond)
+    global _REG_TOKEN
+    if _REG_TOKEN is None:
+        _REG_TOKEN = re.compile(
+            r"\b(e?[abcd]x|[abcd][lh]|e?[sd]il?|e?[sb]pl?|xmm\d|MEM\w*|LO8|HI8)\b")
+    if not sources or not all(known.get(p) for p in sources):
+        return None
+    consumer, before = None, 0
+    for insn in bb.instructions:
+        m = insn.mnemonic
+        if insn.is_cond_jump:
+            if m in ("jecxz", "jcxz", "loop", "loope", "loopne", "loopz", "loopnz"):
+                return None
+            consumer = insn
+            break
+        if m.startswith("set") or m.startswith("cmov"):
+            consumer = insn
+            break
+        if (m in _EFLAGS_PRESERVE and not insn.is_branch and not insn.is_call
+                and not insn.is_ret):
+            before += 1
+            continue
+        return None
+    if consumer is None:
+        return None
+    m = consumer.mnemonic
+    conds = {}
+    for p in sources:
+        setter, ops = known[p]
+        if consumer.is_cond_jump:
+            r = _make_condition(m, setter, ops)
+            c = r[0] if r else None
+        elif m.startswith("set"):
+            c = _make_setcc_value(m, setter, ops)
+        else:
+            c = _make_cmovcc_cond(m, setter, ops)
+        if not c or (before and _REG_TOKEN.search(c)):
+            return None
+        conds[p] = c
+    return m, conds
 
 
 def write_if_changed(path, text):
@@ -307,6 +393,86 @@ def _reg_writes(code):
         out.update(rx.findall(code))
     if _ICALL_RE.search(code):
         out.update(("eax", "esp"))
+    return out
+
+
+# g_ebp and g_seh_ebp publishes (8aadd8e7 publishes both around every call and
+# return of a function that uses ebp), narrowed like the register write-backs:
+# dropped where the global still equals the local. That rests on a call
+# leaving both as it found them: a function that uses ebp publishes both again
+# on return (with ebp restored), the interrupt path restores both, and
+# bridge_run_thread_inline puts g_seh_ebp back after its callback. The one
+# deliberate exception, the SEH helpers handing their caller a frame in
+# g_seh_ebp, is always followed by `ebp = g_seh_ebp`, which is where the two
+# are equal again.
+_EBP_EVENT_RE = re.compile(
+    r"(?P<pub>\bg_ebp = ebp;)"
+    r"|(?P<pubseh>\bg_seh_ebp = ebp;)"
+    r"|(?P<back>(?<![\w.])ebp = g_ebp;)"
+    r"|(?P<backseh>(?<![\w.])ebp = g_seh_ebp;)"
+    r"|(?P<write>(?<![\w.])ebp\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)"
+    r"|\bPOP32\(esp,\s*ebp\b|\bSET_(?:LO8|HI8|LO16)\(ebp\b"
+    r"|(?:\+\+|--)\s*ebp\b|(?<![\w.])ebp\s*(?:\+\+|--))"
+    r"|(?P<call>\bRECOMP_ABI_CALL(?:_RAW)?\(|\bRECOMP_ICALL|\bRECOMP_ITAIL"
+    r"|\b[A-Za-z_]\w*\(\);)")
+_EBP_NOT_CALLS = _REG_SYNC_NOT_CALLS
+
+
+def _narrow_ebp_publishes(lines, verify=False):
+    """Drop each `g_ebp = ebp;` and `g_seh_ebp = ebp;` where that global is
+    known to equal the local: since its last publish, the last read-back from
+    it, or the last unconditional call. A write to ebp, a jumped-to label, a
+    setjmp landing, or a line with a condition in it counts as changed; a
+    conditional line is left alone. --reg-verify checks each one dropped."""
+    body = "\n".join(_COMMENT_RE.sub("", l) for l in lines)
+    if "g_ebp = ebp;" not in body and "g_seh_ebp = ebp;" not in body:
+        return lines
+    labels = set(re.findall(r"^\s*(loc_[0-9A-Fa-f]+):", body, re.M))
+    jumped = {lbl for lbl in labels if len(re.findall(r"\b" + lbl + r"\b", body)) > 1}
+    stale = {"pub": True, "pubseh": True}      # g_ebp / g_seh_ebp may differ
+    check = {"pub": "RECOMP_REGS_SKIPPED(ebp);", "pubseh": "RECOMP_SEH_SKIPPED();"}
+    out, in_define = [], False
+    for line in lines:
+        stripped = line.lstrip()
+        if in_define or stripped.startswith("#"):
+            in_define = line.rstrip().endswith("\\")
+            out.append(line)
+            continue
+        code = _COMMENT_RE.sub("", line)
+        m = re.match(r"\s*(loc_[0-9A-Fa-f]+):", code)
+        if m and m.group(1) in jumped:
+            stale = {"pub": True, "pubseh": True}
+        if "if (" in code or "_sjv" in code:
+            # Conditional: publishes and calls may not run; leave the line
+            # as it is, and count any write in it as a change.
+            if any(mm.lastgroup in ("write", "back", "backseh")
+                   for mm in _EBP_EVENT_RE.finditer(code)):
+                stale = {"pub": True, "pubseh": True}
+            out.append(line)
+            continue
+        pieces, pos = [], 0
+        for mm in _EBP_EVENT_RE.finditer(line):
+            kind = mm.lastgroup
+            if kind == "call":
+                name = re.match(r"([A-Za-z_]\w*)\(\);", mm.group(0))
+                if name and name.group(1) in _EBP_NOT_CALLS:
+                    continue
+                stale = {"pub": False, "pubseh": False}
+            elif kind == "back":
+                stale = {"pub": False, "pubseh": True}
+            elif kind == "backseh":
+                stale = {"pub": True, "pubseh": False}
+            elif kind == "write":
+                stale = {"pub": True, "pubseh": True}
+            elif kind in ("pub", "pubseh"):
+                if stale[kind]:
+                    stale[kind] = False
+                else:
+                    pieces.append(line[pos:mm.start()])
+                    pieces.append(check[kind] if verify else "(void)0;")
+                    pos = mm.end()
+        pieces.append(line[pos:])
+        out.append("".join(pieces))
     return out
 
 
@@ -545,6 +711,42 @@ _FLAG_WRITERS = frozenset({
     "ucomiss", "comisd", "ucomisd", "fcomi", "fcomip", "fucomi", "fucomip",
 })
 
+# The flags a call boundary hands over, in two parts: CF, which stc and clc
+# set alone, and the rest, which inc and dec set without touching CF
+# (upstream fdebc22b).
+_CARRY = frozenset({"cf"})
+_OTHER_FLAGS = frozenset({"zf"})
+_ALL_FLAGS = _CARRY | _OTHER_FLAGS
+_CARRY_CONDITIONS = {
+    "b": _CARRY, "nae": _CARRY, "c": _CARRY,
+    "ae": _CARRY, "nb": _CARRY, "nc": _CARRY,
+    "be": _ALL_FLAGS, "na": _ALL_FLAGS, "a": _ALL_FLAGS, "nbe": _ALL_FLAGS,
+}
+
+
+def _flags_read(insn):
+    """The parts of _ALL_FLAGS an instruction reads."""
+    m = insn.mnemonic
+    if m in ("adc", "sbb", "rcl", "rcr", "cmc", "salc"):
+        return _CARRY
+    if m in ("pushf", "pushfd", "lahf"):
+        return _ALL_FLAGS
+    if m == "into":
+        return _OTHER_FLAGS
+    if insn.is_cond_jump:
+        if m in ("loop", "jecxz", "jcxz"):
+            return frozenset()
+        cc = m[4:] if m.startswith("loop") else m[1:]
+    elif m.startswith("fcmov"):
+        cc = m[5:]
+    elif m.startswith("cmov"):
+        cc = m[4:]
+    elif m.startswith("set"):
+        cc = m[3:]
+    else:
+        return frozenset()
+    return _CARRY_CONDITIONS.get(cc, _OTHER_FLAGS)
+
 
 
 def load_label_db(labels_json_path):
@@ -612,6 +814,9 @@ class FunctionTranslator:
         self.protected_function_starts = set()
         self.jump_table_entry_starts = set()
         self._recovered_cfg = {}
+        # _flag_boundaries, computed once the function list is final; any
+        # change to the function list drops it.
+        self._flag_plan = None
         self._ownership_ready = False
         # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
         # does not run and the output is unchanged).
@@ -630,6 +835,7 @@ class FunctionTranslator:
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
+        self._flag_plan = None
         original_starts = sorted(self.func_db)
         recovered_callers = {}
 
@@ -719,6 +925,7 @@ class FunctionTranslator:
         and a decoded CFG covering the requested extent without gaps. Reject
         mismatches before changing any function metadata.
         """
+        self._flag_plan = None
         def reject(reason):
             raise ValueError(
                 f"Invalid recovery coalescence "
@@ -1037,6 +1244,7 @@ class FunctionTranslator:
 
     def discover_cfg_ownership(self):
         """Reassign weak seeds reached through a split computed-jump CFG."""
+        self._flag_plan = None
         if self._ownership_ready:
             return
         self._ownership_ready = True
@@ -1444,6 +1652,10 @@ class FunctionTranslator:
     _CARRY_CC = frozenset({
         "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
     })
+    # shl's OF is the result's sign XOR the carry out, so these read _cf too.
+    _OF_CC = frozenset({
+        "o", "no", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+    })
 
     @staticmethod
     def _function_needs_cf(instructions):
@@ -1478,6 +1690,8 @@ class FunctionTranslator:
                          or last_setter in BT_MODIFY
                          or last_setter == "rep-compare")):
                 return True
+            if cc in FunctionTranslator._OF_CC and last_setter in ("shl", "sal"):
+                return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
             elif _is_rep_compare(insn):
@@ -1489,6 +1703,228 @@ class FunctionTranslator:
                 # A carry test after popfd reads g_eflags, not _cf.
                 last_setter = None
         return False
+
+    def _flag_boundaries(self):
+        """Which calls, rets and tail jumps must carry the flags in g_eflags
+        (upstream fdebc22b).
+
+        A boundary carries them only when its far side reads them before
+        setting its own: a jcc after a call to a helper that answers in ZF
+        or CF, or an entry that reads its caller's flags. Compiled code has
+        a handful of such sites, and publishing at every boundary made
+        Wreckless's source a third larger, so one pass over every function
+        finds them and translation publishes only there.
+
+        Returns (reads_in, passes_in, ret_live, live_after): the functions
+        whose caller's flags reach a reader, those whose caller's flags may
+        reach their ret unchanged, those whose flags at ret are read (None
+        when an indirect call or jump makes that all of them), and the call
+        sites whose returned flags are read.
+        """
+        if self._flag_plan is not None:
+            return self._flag_plan
+        facts = []
+        for start, info in self.func_db.items():
+            recovered = self._recovered_cfg.get(start)
+            end = (recovered["end"] if recovered
+                   else info.get("end") or start + info.get("size", 0))
+            if end <= start:
+                continue
+            if recovered:
+                instructions = recovered["instructions"]
+            else:
+                raw = self._read_func_bytes(start, end)
+                instructions = (self.disasm.scan_function(raw, start, end)
+                                if raw else [])
+            if not instructions:
+                continue
+            by_address = {insn.address: insn for insn in instructions}
+            calls = [(insn.address, insn.call_target,
+                      self._flag_uses(by_address, insn.end_address, start, end))
+                     for insn in instructions if insn.is_call]
+            # Where this function's ret obligation goes: a tail jump's target
+            # returns to this function's caller.
+            tails = set()
+            for insn in instructions:
+                if insn.is_branch and insn.jump_target is None:
+                    if not self._is_switch_jump(insn):
+                        tails.add(None)
+                elif insn.is_branch and not start <= insn.jump_target < end:
+                    tails.add(insn.jump_target)
+            last = instructions[-1]
+            if (end in self.func_db and not last.is_terminator
+                    and last.mnemonic not in ("int3", "ud2", "hlt", "iret", "iretd")):
+                tails.add(end)
+            facts.append((start, self._flag_uses(by_address, start, start, end),
+                          calls, tails))
+
+        # First what each entry and each call's return point does with the
+        # flags it holds, whoever called: they reach a reader, or they may
+        # reach the function's ret unchanged. A callee or tail target that
+        # passes them on hands them to the point after it.
+        reads_in, passes_in, reads_after, passes_after = set(), set(), set(), set()
+
+        def reaches(uses):
+            reads = passes = False
+            for use in uses:
+                if use == "read":
+                    reads = True
+                elif use == "ret":
+                    passes = True
+                elif use[0] == "call" and use[1] is not None:
+                    _, target, site = use
+                    reads |= target in reads_in or (
+                        target in passes_in and site in reads_after)
+                    passes |= target in passes_in and site in passes_after
+                elif use[0] == "tail" and use[1] is not None:
+                    reads |= use[1] in reads_in
+                    passes |= use[1] in passes_in
+            return reads, passes
+
+        points = [(start, entry, reads_in, passes_in)
+                  for start, entry, _, _ in facts]
+        points += [(site, uses, reads_after, passes_after)
+                   for _, _, calls, _ in facts for site, _, uses in calls]
+        changed = True
+        while changed:
+            changed = False
+            for key, uses, read_set, pass_set in points:
+                reads, passes = reaches(uses)
+                if reads and key not in read_set:
+                    read_set.add(key)
+                    changed = True
+                if passes and key not in pass_set:
+                    pass_set.add(key)
+                    changed = True
+
+        # Then which rets are read: a call's returned flags are when they
+        # reach a reader, or pass to a ret that is read itself, and a tail
+        # jump's target returns to the jumping function's caller.
+        ret_live, live_after, every_ret = set(), set(reads_after), False
+        changed = True
+        while changed:
+            changed = False
+            for start, _, calls, tails in facts:
+                returns = every_ret or start in ret_live
+                for site, target, _ in calls:
+                    if returns and site in passes_after and site not in live_after:
+                        live_after.add(site)
+                        changed = True
+                    if site in live_after and target not in ret_live:
+                        ret_live.add(target)
+                        every_ret = every_ret or target is None
+                        changed = True
+                if returns:
+                    for target in tails - ret_live:
+                        ret_live.add(target)
+                        every_ret = every_ret or target is None
+                        changed = True
+        self._flag_plan = (frozenset(reads_in), frozenset(passes_in),
+                           None if every_ret else frozenset(ret_live),
+                           frozenset(live_after))
+        return self._flag_plan
+
+    @staticmethod
+    def _is_switch_jump(insn):
+        """jmp [table + reg*4]: an indexed jump that stays in its function."""
+        return "[" in insn.op_str and "*" in insn.op_str
+
+    def _flag_uses(self, by_address, address, start, end):
+        """What sees the flags at address before something sets them.
+
+        A set of "read", "ret", ("call", target, site) and ("tail", target).
+        CF is followed apart from the rest, since stc and clc set only CF and
+        inc and dec everything but; a shift whose count may be zero sets
+        nothing. A switch's arms are not followed, so its jump is a read.
+        """
+        from .lifter import FLAG_SETTERS, _EFLAGS_SETTERS, _FLAGS_UNDEFINED
+
+        def sets(insn):
+            m = insn.mnemonic
+            if m in ("inc", "dec"):
+                return _OTHER_FLAGS
+            if m in ("stc", "clc", "cmc"):
+                return _CARRY
+            if m in ("shl", "sal", "shr", "sar", "shld", "shrd",
+                     "rol", "ror", "rcl", "rcr"):
+                try:
+                    count = int(insn.op_str.rsplit(",", 1)[-1], 0)
+                except ValueError:  # by cl: may be zero
+                    return frozenset()
+                if not count & 31:
+                    return frozenset()
+                return _CARRY if m in ("rol", "ror", "rcl", "rcr") else _ALL_FLAGS
+            if (m in FLAG_SETTERS or m in _EFLAGS_SETTERS
+                    or m in _FLAGS_UNDEFINED or m in _FLAG_WRITERS
+                    or m in _FPU_COMPARES or m in _STRING_COMPARES):
+                return _ALL_FLAGS
+            return frozenset()
+
+        uses, pending, seen = set(), [(address, _ALL_FLAGS)], set()
+        while pending:
+            at, unset = pending.pop()
+            while (at, unset) not in seen:
+                seen.add((at, unset))
+                insn = by_address.get(at)
+                if insn is None:
+                    if at == end and end in self.func_db:
+                        uses.add(("tail", end))
+                    break
+                m = insn.mnemonic
+                if _flags_read(insn) & unset:
+                    uses.add("read")
+                    break
+                if insn.is_call:
+                    uses.add(("call", insn.call_target, insn.address))
+                    break
+                if insn.is_ret:
+                    uses.add("ret")
+                    break
+                unset -= sets(insn)
+                if not unset or m in ("int3", "ud2", "hlt", "iret", "iretd"):
+                    break
+                if insn.is_branch:
+                    target = insn.jump_target
+                    if target is None:
+                        uses.add("read" if self._is_switch_jump(insn) else ("tail", None))
+                        break
+                    if start <= target < end:
+                        pending.append((target, unset))
+                    else:
+                        uses.add(("tail", target))
+                    if insn.is_jump:
+                        break
+                at = insn.end_address
+        return uses
+
+    def _flag_sites(self, start, instructions, fallthrough_target):
+        """The addresses in this function that publish the flags, and
+        whether falling off its end into the next function must too."""
+        reads_in, passes_in, ret_live, live_after = self._flag_boundaries()
+        returns = ret_live is None or start in ret_live
+        sites = set()
+        for insn in instructions:
+            if insn.is_call:
+                # An indirect call's target is unknown here, and no compiler
+                # passes flags into or through a call, so it never publishes.
+                target = insn.call_target
+                carry = target in reads_in or (
+                    target in passes_in and insn.address in live_after)
+            elif insn.is_ret:
+                carry = returns
+            elif insn.is_branch and insn.jump_target is None:
+                carry = returns and not self._is_switch_jump(insn)
+            elif insn.is_branch:
+                target = insn.jump_target
+                carry = self.lifter._is_external_target(target) and (
+                    target in reads_in or (returns and target in passes_in))
+            else:
+                carry = False
+            if carry:
+                sites.add(insn.address)
+        falls = fallthrough_target in reads_in or (
+            returns and fallthrough_target in passes_in)
+        return frozenset(sites), falls
 
     def _func_has_prologue(self, instructions):
         """Check if function starts with push ebp; mov ebp, esp."""
@@ -2307,7 +2743,8 @@ class FunctionTranslator:
                 and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump or fallthrough_target is not None:
+        if (has_tail_jump or fallthrough_target is not None
+                or any(insn.mnemonic == "call" for insn in instructions)):
             used_regs.add("ebp")
 
 
@@ -2462,7 +2899,7 @@ class FunctionTranslator:
         # same way (the LOCK prefix is Instruction.locked, so "lock add" is
         # "add" here and matches _RESULT_SNAPSHOT_SETTERS on its own).
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "cmpxchg8b", "inc", "dec", "sahf")
+                                 "cmpxchg8b", "inc", "dec", "imul", "mul", "sahf")
                or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
@@ -2498,15 +2935,29 @@ class FunctionTranslator:
         # reads is the lifter's tracking rule, mirrored here so only the
         # functions that consume CF declare it: computing it beside every add
         # in the image would be a line per add in 48,000 functions.
-        has_carry = self._function_needs_cf(instructions)
+        # A function that hands its flags across a call boundary produces CF
+        # for the reader on the far side, and one that reads its caller's
+        # flags starts from the carry the caller published (upstream
+        # fdebc22b, _flag_boundaries).
+        reads_in, _, _, live_after = self._flag_boundaries()
+        caller_flags = start in reads_in
+        publish_sites, publish_tail = self._flag_sites(
+            start, instructions, fallthrough_target)
+        self.lifter.flag_publish_sites = publish_sites
+        self.lifter.flag_live_returns = live_after
+        has_carry = (self._function_needs_cf(instructions)
+                     or bool(publish_sites) or publish_tail)
         if has_carry:
-            lines.append(f"    int _cf = 0; /* carry flag */")
+            carry_in = "g_eflags & 1u" if caller_flags else "0"
+            lines.append(f"    int _cf = {carry_in}; /* carry flag */")
         # Only functions that consume CF pay for producing it: an adc/sbb
         # reading a never-written _cf silently drops every carry, which
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
-        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
+        # EBP is also a general register in frame-pointer-omitted code, so any
+        # function that uses it or calls out publishes it, not only frame owners.
+        self.lifter.publishes_ebp = "ebp" in used_regs
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either
@@ -2617,7 +3068,8 @@ class FunctionTranslator:
                 changed = False
                 for bb in blocks:
                     incoming = _incoming_flag_state(
-                        preds[bb.start], out_state, bb.start == start)
+                        preds[bb.start], out_state, bb.start == start,
+                        caller_flags)
                     _, new_out = lift_basic_block(
                         self.lifter, bb, flag_state=incoming)
                     if out_state.get(bb.start) != new_out:
@@ -2629,6 +3081,12 @@ class FunctionTranslator:
             self.lifter.unimplemented.update(saved_unimplemented)
             settled_state = out_state
             out_state = {}
+
+        unseen_entries = set(self.lifter.imm_code_refs)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
+        edge_vars, edge_sets, block_lines, edge_inits = [], [], {}, {}
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -2646,13 +3104,47 @@ class FunctionTranslator:
             # predecessor is known here even though it sits later in address
             # order.
             incoming = _incoming_flag_state(preds[bb.start], settled_state,
-                                            bb.start == start)
+                                            bb.start == start, caller_flags)
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+            # A join whose predecessors disagree: let each edge evaluate the
+            # condition (see _edge_flag_plan). Blocks that may be entered
+            # from somewhere the edge list does not know -- a switch table, a
+            # code address taken as an immediate, the function entry -- keep
+            # the fallback, since an unseen edge would leave the variable
+            # holding another edge's answer.
+            # Also where the edges did merge but the merged state cannot answer
+            # this block's consumer: AntBox merges mixed-width compares
+            # (cmp_mixed) for ZF readers, which leaves a js or jl after them
+            # on _flags (upstream 6611292e's DOA3 case, which upstream's
+            # stricter merge sends here anyway).
+            # An entry that reads its caller's flags knows that edge too: it
+            # arrives with g_eflags, so the variable starts with that edge's
+            # answer (upstream fdebc22b).
+            entry = bb.start == start
+            if ((incoming is None or any("_flags /*" in st for st in stmts))
+                    and bb.start not in unseen_entries
+                    and (not entry or caller_flags)):
+                plan = _edge_flag_plan(
+                    bb, [*preds[bb.start], None] if entry else preds[bb.start],
+                    {**settled_state, None: ("popfd", [])} if entry else settled_state)
+                if plan:
+                    m, conds = plan
+                    var = f"_jf_{bb.start:08X}"
+                    for k, stmt in enumerate(stmts):
+                        if f"_flags /* {m}" in stmt:
+                            stmts[k] = stmt.replace(f"_flags /* {m}", f"{var} /* {m}", 1)
+                            edge_vars.append(var)
+                            edge_sets.extend((p, var, c) for p, c in conds.items())
+                            if entry:
+                                edge_inits[var] = conds[None]
+                            break
+
             self.flag_fallbacks.note_block(
                 start, name, bb, stmts, preds[bb.start], settled_state,
                 bb.start == start, incoming)
+
             if self.spin_waits is not None:
                 stmts = self.spin_waits.consider(start, bb, stmts)
             if self.lifter.mem_order is not None:
@@ -2662,8 +3154,12 @@ class FunctionTranslator:
             # statements as lifted.
             stmts, n_mmio = lower_mmio_stmts(stmts)
             self.mmio_lowered += n_mmio
+            first = len(lines)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            last = bb.instructions[-1] if bb.instructions else None
+            block_lines[bb.start] = (first, len(lines),
+                                     bool(last and (last.is_branch or last.is_ret)))
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
@@ -2676,12 +3172,34 @@ class FunctionTranslator:
 
             lines.append(f"")
 
+        # Each predecessor of such a join sets the join's variable as its last
+        # act before the jump (or at its end when it falls through). Inserted
+        # back to front so the recorded line numbers stay valid.
+        inserts = []
+        for p, var, cond in edge_sets:
+            first, stop, transfers = block_lines.get(p, (0, 0, False))
+            if stop > first:
+                inserts.append((stop - 1 if transfers else stop,
+                                f"    {var} = ({cond}) ? 1 : 0; /* flags of this edge */"))
+        for at, text in sorted(inserts, key=lambda t: -t[0]):
+            lines.insert(at, text)
+        if edge_vars:
+            decl = next((k for k, ln in enumerate(lines) if "fallback flag var" in ln), None)
+            if decl is not None:
+                lines.insert(decl + 1, "    int " + ", ".join(
+                    f"{v} = ({edge_inits[v]}) ? 1 : 0" if v in edge_inits else f"{v} = 0"
+                    for v in edge_vars)
+                             + "; /* per-edge flags of joins */")
+
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
+            if publish_tail:
+                for stmt in publish_flags(out_state.get(blocks[-1].start)):
+                    lines.append(f"    {stmt}")
             if fallthrough_target in debug_slide_bypasses.values():
                 lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)
-            lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
+            lines.append(f"    {self.lifter._tail_pub()}{ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 
@@ -2731,6 +3249,7 @@ class FunctionTranslator:
 
         if self.reg_locals:
             lines = _localize_registers(lines, verify=self.reg_verify)
+            lines = _narrow_ebp_publishes(lines, verify=self.reg_verify)
 
         # Undefine FPU macros
         if has_fpu:

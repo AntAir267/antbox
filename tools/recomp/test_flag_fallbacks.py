@@ -22,25 +22,28 @@ def translator_for(image, starts):
     return FunctionTranslator(image, db), db
 
 
-def test_an_unmerged_join_is_reported_with_both_kinds():
+def test_an_unmerged_join_is_evaluated_per_edge_not_reported():
+    # A compare on one edge and dec on the other: no merge answers it, and it
+    # used to fall back to `_flags` (reported as "join: cmp32z + dec:eax").
+    # Each edge now sets the join's variable (upstream 57f47ff6), so there is
+    # no fallback to report.
     ft, db = translator_for(STAGE1_JOIN, [BASE])
     code = ft.translate_function(BASE, db[BASE])
-    assert '_flags /* je' in code, code
-    site = ft.flag_fallbacks.sites[(JOIN_JE, 'je')]
-    assert site['reason'] == 'join: cmp32z + dec:eax', site
-    assert ft.flag_fallbacks.summary()['joins'] == 1
+    assert '_flags /* je' not in code, code
+    assert f'_jf_{JOIN_JE:08X} /* je' in code, code
+    assert ft.flag_fallbacks.summary()['unique_sites'] == 0
 
 
-def test_an_alias_body_counts_the_site_once_and_keeps_the_owner_reason():
+def test_an_alias_body_reads_its_callers_flags():
+    # An alias entering at the je reads flags its caller set (the owner's
+    # test or dec, before the jump into it): the caller publishes them to
+    # g_eflags and the alias reads them there (upstream fdebc22b), so no
+    # fallback is left in either body.
     ft, db = translator_for(STAGE1_JOIN, [BASE, JOIN_JE])
-    ft.translate_function(JOIN_JE, db[JOIN_JE])     # alias: enters at the je
+    alias = ft.translate_function(JOIN_JE, db[JOIN_JE])     # enters at the je
     ft.translate_function(BASE, db[BASE])
-    summary = ft.flag_fallbacks.summary()
-    assert summary['unique_sites'] == 1, ft.flag_fallbacks.sites
-    assert summary['emitted'] == 2
-    site = ft.flag_fallbacks.sites[(JOIN_JE, 'je')]
-    assert site['bodies'] == 2
-    assert site['reason'] == 'join: cmp32z + dec:eax'
+    assert "(g_eflags & 0x040u) /* popfd */" in alias, alias
+    assert ft.flag_fallbacks.summary()['unique_sites'] == 0, ft.flag_fallbacks.sites
 
 
 def test_an_in_block_clobber_is_reported_as_such():
@@ -48,12 +51,14 @@ def test_an_in_block_clobber_is_reported_as_such():
     ft, db = translator_for(bytes.fromhex('f7e1' '7401' '90' 'c3'), [BASE])
     ft.translate_function(BASE, db[BASE])
     site = ft.flag_fallbacks.sites[(BASE + 2, 'je')]
-    assert site['reason'] == 'in-block undefined after mul'
+    # mul sets CF and OF (in _fa, upstream 47ea2b63) and leaves ZF undefined.
+    assert site['reason'] == 'in-block mul cannot answer je'
 
 
 def test_observed_seeds_name_their_functions():
-    ft, db = translator_for(STAGE1_JOIN, [BASE])
+    # mul ecx; je out: a site that still falls back (the join no longer does).
+    ft, db = translator_for(bytes.fromhex('f7e1' '7401' '90' 'c3'), [BASE])
     ft.translate_function(BASE, db[BASE])
     assert ft.flag_fallbacks.summary({BASE})['observed_functions'] == [
-        ft.flag_fallbacks.sites[(JOIN_JE, 'je')]['function']]
+        ft.flag_fallbacks.sites[(BASE + 2, 'je')]['function']]
     assert ft.flag_fallbacks.summary(set())['observed_functions'] == []

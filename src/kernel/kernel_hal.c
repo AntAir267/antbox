@@ -432,6 +432,7 @@ extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
 extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
 extern RECOMP_TLS double g_fp_stack[8];
 extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
+extern RECOMP_TLS uint32_t g_mxcsr;
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
@@ -442,6 +443,7 @@ typedef struct {
     int df, fp_top, fp_cmp;
     double fp[8];
     uint16_t fp_cw, fp_cc;
+    uint32_t mxcsr;
     RecompXmm xmm[8];
     RecompMmx mm[8];
 } IrqRegs;
@@ -453,7 +455,7 @@ static void irq_regs_save(IrqRegs *r)
     r->seh_ebp = g_seh_ebp; r->eflags = g_eflags; r->df = g_df;
     r->fp_top = g_fp_top; r->fp_cmp = g_fp_cmp;
     memcpy(r->fp, g_fp_stack, sizeof r->fp);
-    r->fp_cw = g_fp_control_word; r->fp_cc = g_fp_cc;
+    r->fp_cw = g_fp_control_word; r->fp_cc = g_fp_cc; r->mxcsr = g_mxcsr;
     r->xmm[0] = g_xmm0; r->xmm[1] = g_xmm1; r->xmm[2] = g_xmm2; r->xmm[3] = g_xmm3;
     r->xmm[4] = g_xmm4; r->xmm[5] = g_xmm5; r->xmm[6] = g_xmm6; r->xmm[7] = g_xmm7;
     r->mm[0] = g_mm0; r->mm[1] = g_mm1; r->mm[2] = g_mm2; r->mm[3] = g_mm3;
@@ -467,7 +469,7 @@ static void irq_regs_restore(const IrqRegs *r)
     g_seh_ebp = r->seh_ebp; g_eflags = r->eflags; g_df = r->df;
     g_fp_top = r->fp_top; g_fp_cmp = r->fp_cmp;
     memcpy(g_fp_stack, r->fp, sizeof r->fp);
-    g_fp_control_word = r->fp_cw; g_fp_cc = r->fp_cc;
+    g_fp_control_word = r->fp_cw; g_fp_cc = r->fp_cc; g_mxcsr = r->mxcsr;
     g_xmm0 = r->xmm[0]; g_xmm1 = r->xmm[1]; g_xmm2 = r->xmm[2]; g_xmm3 = r->xmm[3];
     g_xmm4 = r->xmm[4]; g_xmm5 = r->xmm[5]; g_xmm6 = r->xmm[6]; g_xmm7 = r->xmm[7];
     g_mm0 = r->mm[0]; g_mm1 = r->mm[1]; g_mm2 = r->mm[2]; g_mm3 = r->mm[3];

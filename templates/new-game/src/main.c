@@ -71,6 +71,7 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 extern RECOMP_TLS double g_fp_stack[8];
 extern RECOMP_TLS int g_fp_top;
 extern RECOMP_TLS uint16_t g_fp_control_word;
+extern RECOMP_TLS uint32_t g_mxcsr;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;

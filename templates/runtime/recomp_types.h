@@ -221,6 +221,8 @@ void recomp_regs_mismatch(const char *reg, const char *func, int line,
                           uint32_t local, uint32_t global);
 #define RECOMP_REGS_SKIPPED(r) \
     ((g_##r != (r)) ? recomp_regs_mismatch(#r, __func__, __LINE__, (r), g_##r) : (void)0)
+#define RECOMP_SEH_SKIPPED() \
+    ((g_seh_ebp != ebp) ? recomp_regs_mismatch("seh_ebp", __func__, __LINE__, ebp, g_seh_ebp) : (void)0)
 #else
 #define RECOMP_REGS_OUT() ((void)0)
 #define RECOMP_REGS_IN() ((void)0)
@@ -401,6 +403,13 @@ void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+/* SSE control and status (MXCSR), reset value 0x1F80: every exception
+ * masked, rounding to nearest. Like the x87 control word it is guest state
+ * that STMXCSR stores and LDMXCSR loads; the host's MXCSR is never changed.
+ * The rounding-control bits (13-14) steer CVTSS2SI/CVTSD2SI. The exception
+ * flags (bits 0-5) are not modelled and read as clear, as the x87 status
+ * word's exception byte is not. */
+extern RECOMP_TLS uint32_t g_mxcsr;
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that
@@ -580,6 +589,19 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
     if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
         return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
     return (int64_t)rounded;
+}
+
+/* CVTSS2SI/CVTSD2SI (and the truncating CVTT forms) to a 32-bit integer.
+ * The non-truncating forms round under MXCSR.RC (bits 13-14), which uses the
+ * x87 RC encoding, so recomp_frndint does the rounding. A C cast would always
+ * truncate, and is undefined out of range; the hardware answers NaN, the
+ * infinities and out-of-range values with the integer indefinite. */
+static inline int32_t recomp_cvt_si32(double value, uint32_t mxcsr, int truncate) {
+    double rounded = truncate ? (isfinite(value) ? trunc(value) : value)
+                              : recomp_frndint(value, (uint16_t)(((mxcsr >> 13) & 3u) << 10));
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return (int32_t)0x80000000u;
+    return (int32_t)rounded;
 }
 
 /* ================================================================
@@ -865,6 +887,44 @@ void     xbox_MmioStore(uint32_t va, uint32_t v, int size);
 #define MMIO_WR8(addr, v)   xbox_MmioStore((uint32_t)(addr), (uint8_t)(v), 1)
 #define MMIO_WR16(addr, v)  xbox_MmioStore((uint32_t)(addr), (uint16_t)(v), 2)
 #define MMIO_WR32(addr, v)  xbox_MmioStore((uint32_t)(addr), (uint32_t)(v), 4)
+
+/* FSAVE/FNSAVE's image and FRSTOR (upstream 47ea2b63, on AntBox's
+ * recomp_f80_load/store). The 32-bit form is 28 bytes of environment (each
+ * field a dword) and the 16-bit form, with a 66 prefix, 14 (each a word);
+ * st(0)..st(7) follow as 80-bit reals. Only the state the double-stack model
+ * holds goes in and out: CW, TOP, C3..C0 and the eight registers. Tags,
+ * exception bits and the instruction and data pointers are written as zero
+ * and ignored on the way back. FNSAVE then initialises the unit, as FNINIT. */
+static inline void recomp_fnsave(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    for (i = 0; i < env; ++i) MEM8(address + i) = 0;
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + stride) = (uint16_t)(((g_fp_top & 7u) << 11) | g_fp_cc);
+    for (i = 0; i < 8; ++i)
+        recomp_f80_store(address + env + 10u * i, g_fp_stack[(g_fp_top + i) & 7u]);
+    g_fp_control_word = 0x037fu;
+    g_fp_top = 0;
+    g_fp_cc = 0;
+    g_fp_cmp = 0;
+}
+
+static inline void recomp_frstor(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    uint16_t status = MEM16(address + stride);
+    g_fp_control_word = MEM16(address);
+    g_fp_top = (status >> 11) & 7u;
+    g_fp_cc = status & 0x4700u;
+    /* The last compare, as fnstsw would read it back: C2 unordered, C3
+     * equal, C0 less, else greater. */
+    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
+        : (g_fp_cc & 0x0100u) ? -1 : 1;
+    for (i = 0; i < 8; ++i)
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_f80_load(address + env + 10u * i);
+}
 
 /* ================================================================
  * SSE / XMM register state
@@ -1251,10 +1311,18 @@ static inline int recomp_parity8(uint32_t x) {
 }
 #define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
 
-/** Pop a 32-bit value from the simulated stack. */
+/**
+ * Pop a 32-bit value from the simulated stack.
+ * Writes dst AFTER incrementing sp: for `pop esp` (dst == sp) x86 leaves ESP
+ * equal to the popped value, not popped value + 4 (Intel SDM, POP). The old
+ * read-then-increment order left every lifted `pop esp` 4 bytes high, so the
+ * round-to-int idiom `push esp; push eax; ...; pop eax; pop esp` drifted the
+ * stack and later pops read the wrong slots.
+ */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pv = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pv; \
 } while(0)
 
 /* ================================================================

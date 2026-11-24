@@ -58,6 +58,15 @@ static const path_rule s_rules[] = {
      * the save dir (partition images, caches). */
     { "\\Device\\Harddisk0\\Partition1\\UDATA", 2, "\\UDATA",  "/UDATA"      },
     { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TDATA",  "/TDATA"      },
+    /* E:\CACHE is the title's own scratch, and it writes there: Burnout 3
+     * opens CACHE\LocalCache00.bin with FILE_OPEN_IF, so every run wrote into
+     * the extracted game files and every save dir shared one cache (upstream
+     * c18d741b). It goes beside UDATA and TDATA instead. Not "Cache": Z: and
+     * Partition3-5 already map to <save_dir>/Cache, and on a case-insensitive
+     * host the two names are one folder. The rest of Partition1 stays in the
+     * game dir: a title may read its assets through it (Wreckless links Z: to
+     * Partition1\). */
+    { "\\Device\\Harddisk0\\Partition1\\CACHE", 2, "\\TitleCache", "/TitleCache" },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -95,6 +104,20 @@ static const path_rule s_rules[] = {
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+
+/* Match a rule. The UDATA, TDATA and CACHE rules carry no trailing
+ * separator, since a title opens the bare directories too, so they stop at
+ * one: otherwise Partition1\UDATAx would be taken for Partition1\UDATA\x,
+ * and an asset such as Partition1\cached.dat would move to the cache
+ * (upstream c18d741b). */
+static int rule_match(const char* path, const path_rule* r)
+{
+    int skip = match_prefix(path, r->prefix);
+    if (skip && r->to_save == 2 && path[skip] && path[skip] != '\\')
+        return 0;
+    return skip;
+}
+
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -496,6 +519,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         } else {
             wcscpy_s(s_user_dir, MAX_PATH, s_save_dir);
         }
+        /* The title opens files straight under E:\CACHE. */
+        {
+            WCHAR dir[MAX_PATH];
+            swprintf_s(dir, MAX_PATH, L"%s\\TitleCache", s_user_dir);
+            SHCreateDirectoryExW(NULL, dir, NULL);
+        }
     }
 
     s_initialized = TRUE;
@@ -550,7 +579,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = rule_match(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save == 2 ? (s_user_alt[0] ? s_user_alt : s_user_dir)
@@ -868,6 +897,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         } else {
             snprintf(s_user_dir, sizeof(s_user_dir), "%s", s_save_dir);
         }
+        /* The title opens files straight under E:\CACHE. */
+        {
+            char dir[MAX_PATH];
+            snprintf(dir, sizeof(dir), "%s/TitleCache", s_user_dir);
+            mkdir_p(dir);
+        }
     }
 
     s_initialized = TRUE;
@@ -912,7 +947,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = rule_match(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save == 2 ? (s_user_alt[0] ? s_user_alt : s_user_dir)

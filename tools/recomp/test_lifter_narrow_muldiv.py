@@ -33,8 +33,9 @@ class NarrowMulDivTest(unittest.TestCase):
                 self.assertIn("eax", out)
 
     def test_8bit_imul_is_signed_on_al(self):
+        # upstream 47ea2b63's product: (int8_t)eax is AL, as LO8(eax) was.
         out = _emit("imul", "bl")
-        self.assertIn("(int8_t)LO8(eax)", out)
+        self.assertIn("(int64_t)(int8_t)eax * (int64_t)(int8_t)(LO8(ebx))", out)
         self.assertIn("SET_LO16(eax", out)
 
     def test_16bit_forms_use_dx_ax(self):
@@ -45,8 +46,12 @@ class NarrowMulDivTest(unittest.TestCase):
                 self.assertNotIn("edx = (uint32_t)", out)
 
     def test_32bit_forms_unchanged(self):
-        self.assertIn("edx = (uint32_t)(_r >> 32)", _emit("imul", "ebx"))
-        self.assertIn("edx = (uint32_t)(_r >> 32)", _emit("mul", "ebx"))
+        # The same high word, spelt through the unsigned type; the product
+        # also records CF = OF ("did not fit") in _fa now.
+        for m in ("imul", "mul"):
+            out = _emit(m, "ebx")
+            self.assertIn("edx = (uint32_t)((uint64_t)_r >> 32)", out)
+            self.assertIn("_fa = (", out)
 
 
 if __name__ == "__main__":

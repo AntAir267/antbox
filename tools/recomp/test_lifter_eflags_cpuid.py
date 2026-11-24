@@ -180,9 +180,14 @@ class TextTest(unittest.TestCase):
         self.assertIn("if (_cf)", out)
 
     def test_pushfd_marks_flags_its_setter_cannot_rebuild(self):
+        # add's PF and OF are rebuilt now (upstream 00e95184), so it no
+        # longer marks; rol's flags still aren't.
         add = _insn("add", [_reg("eax"), _reg("ebx")])
         lifter, out, _ = _lift_block([add, _insn("pushfd")], needs_cf=True)
-        self.assertIn('RECOMP_UNIMPL("pushfd: PF,OF not rebuilt from add, '
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        rol = _insn("rol", [_reg("eax"), Operand(type="imm", imm=1)])
+        lifter, out, _ = _lift_block([rol, _insn("pushfd")], needs_cf=True)
+        self.assertIn('RECOMP_UNIMPL("pushfd: CF,PF,ZF,SF,OF not rebuilt from rol, '
                       'read as 0"', out)
         cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
         lifter, out, _ = _lift_block([cmp_, _insn("pushfd")])

@@ -176,6 +176,8 @@ class Disassembler:
 
     def __init__(self):
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
+        # Mnemonics and operand text only, for scan_function.
+        self._lite = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         _init_reg_names(self._cs)
 
@@ -219,6 +221,30 @@ class Disassembler:
                     insn.memory_refs.append(cs_op.mem.disp & 0xFFFFFFFF)
 
         return insn
+
+    def scan_function(self, raw_bytes, start_va, end_va):
+        """A linear decode with mnemonics, operand text and direct targets
+        only: several times faster than disassemble_function, for a pass
+        over every function that needs no operand detail (upstream
+        fdebc22b; the translator's _flag_boundaries). The LOCK prefix comes
+        off the mnemonic, as disassemble_function takes it off."""
+        size = end_va - start_va
+        if size <= 0 or size > len(raw_bytes):
+            return []
+        out = []
+        for address, length, mnemonic, op_str in self._lite.disasm_lite(
+                raw_bytes[:size], start_va):
+            if mnemonic.startswith("lock "):
+                mnemonic = mnemonic[5:]
+            insn = Instruction(address=address, size=length, mnemonic=mnemonic,
+                               op_str=op_str, bytes_hex="")
+            if (insn.is_call or insn.is_branch) and op_str.startswith("0x"):
+                if insn.is_call:
+                    insn.call_target = int(op_str, 16)
+                else:
+                    insn.jump_target = int(op_str, 16)
+            out.append(insn)
+        return out
 
     def disassemble_function(self, raw_bytes, start_va, end_va, resync=None):
         """

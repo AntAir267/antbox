@@ -844,12 +844,18 @@ uint32_t xbox_ThreadObjectForTib(void)
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                      uint32_t ctx2)
 {
+    /* g_seh_ebp is put back too: generated code may skip republishing it
+     * after a call, on the rule that a call leaves it as it found it
+     * (translator.py, _narrow_ebp_publishes). */
+    uint32_t seh = g_seh_ebp;
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
     fn();
     g_esp += 12;
+    g_seh_ebp = seh;
 }
 
 static DWORD WINAPI bridge_thread_main(LPVOID param)
@@ -2339,6 +2345,30 @@ static void bridge_MmQueryAddressProtect(void)
  * Halo's cache_files_windows completion relies on that -- it reads its own
  * field at lpOverlapped+0x10 and sets the flag the setup loop polls.
  */
+/* Guest code a kernel call runs on the caller's own thread (an APC, an
+ * inline DPC, a synchronize routine) writes the register globals the guest
+ * function that made the call is still using. A callee that keeps the ABI
+ * leaves ebx/esi/edi alone and pops its own arguments, but nothing checks
+ * that, and the failure is intermittent: Darkwatch's loader resumed with an
+ * APC's RDTSC value in esi and faulted (@ranzo312-cyber, #127). So each
+ * such site puts them back, eax too unless the routine's result is the
+ * call's own. */
+typedef struct { uint32_t eax, ecx, edx, ebx, esi, edi, esp; } CallbackRegs;
+
+static void callback_regs_save(CallbackRegs *r)
+{
+    r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx;
+    r->ebx = g_ebx; r->esi = g_esi; r->edi = g_edi; r->esp = g_esp;
+}
+
+static void callback_regs_restore(const CallbackRegs *r, int keep_eax)
+{
+    if (!keep_eax)
+        g_eax = r->eax;
+    g_ecx = r->ecx; g_edx = r->edx;
+    g_ebx = r->ebx; g_esi = r->esi; g_edi = r->edi; g_esp = r->esp;
+}
+
 static void bridge_NtUserIoApcDispatcher(void)
 {
     uint32_t apc_context = STACK_ARG(0);
@@ -2359,11 +2389,14 @@ static void bridge_NtUserIoApcDispatcher(void)
 
     /* __stdcall, right-to-left. The callee's `ret 12` consumes the dummy
      * return address and all three arguments, so g_esp needs no fixup here. */
+    CallbackRegs saved;
+    callback_regs_save(&saved);
     g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     fn();
+    callback_regs_restore(&saved, 0);
 
     g_eax = 0;
 }
@@ -2602,6 +2635,8 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
+    CallbackRegs saved;
+    callback_regs_save(&saved);
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
@@ -2628,6 +2663,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
             if (active) *active = was;
             xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
             xbox_IrqlLeaveInterrupt(_irql);
+            callback_regs_restore(&saved, 0);
             return 1;
         }
         {
@@ -2638,6 +2674,10 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
             xbox_IrqlLeaveInterrupt(_irql);
         }
     }
+    /* The caller gets its registers back, esp included: the routine is
+     * stdcall and pops its own arguments, and what it leaves in eax, ecx and
+     * edx is not the caller's (upstream 117a6498). */
+    callback_regs_restore(&saved, 0);
     return 1;
 }
 
@@ -2820,6 +2860,8 @@ static void bridge_KeSynchronizeExecution(void)
 
     /* BOOLEAN SynchronizeRoutine(PVOID Context), __stdcall. Its `ret 4` takes
      * the dummy return address and the argument, so g_esp needs no fixup. */
+    CallbackRegs saved;
+    callback_regs_save(&saved);
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     /* The ISR's exclusion: the APU and OHCI models and the vblank deliver
@@ -2842,6 +2884,7 @@ static void bridge_KeSynchronizeExecution(void)
     fn();
     xbox_DispatchGateLeave();
     /* g_eax is whatever the routine returned, which is this call's result. */
+    callback_regs_restore(&saved, 1);
 }
 
 /* -- KeRemoveQueueDpc (ordinal 137) ------------------------
@@ -4894,13 +4937,22 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
     if (!fn) fn = recomp_lookup_manual(apc_routine);
     if (!fn) fn = recomp_lookup_kernel(apc_routine);
     if (fn) {
-        /* VOID ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG) */
+        /* VOID NTAPI ApcRoutine(PVOID ApcContext, PIO_STATUS_BLOCK, ULONG)
+         *
+         * Restore esp from before the frame rather than adding a fixed amount
+         * back. The routine is stdcall and pops its own 16 bytes (a kernel
+         * thunk does the same), so the old `g_esp += 12` left the caller 12
+         * bytes high. Callers ending in `leave` never noticed; FBoS's wait
+         * wrapper sub_000907CB does `pop esi` first and came back with a
+         * stack address in its caller's esi. */
+        CallbackRegs saved;
+        callback_regs_save(&saved);
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
         fn();
-        g_esp += 12;
+        callback_regs_restore(&saved, 0);
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {

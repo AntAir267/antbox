@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(kernel_path_cache_test C)
+# POSIX: where E:\CACHE and the user-data rules translate to (kernel_path.c).
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(kernel_path_cache_test test_main.c)
+target_include_directories(kernel_path_cache_test PRIVATE ../../src/kernel)
+target_link_libraries(kernel_path_cache_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME kernel_path_cache_test COMMAND kernel_path_cache_test)

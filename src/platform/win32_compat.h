@@ -138,6 +138,8 @@ void        w32_handle_set_path(HANDLE h, const char *host_path);
 int         w32_handle_check(HANDLE h, const char *where);
 void        w32_fd_note_foreign(int fd, const char *who);
 int         w32_fd_trace_on(void);
+/* Raise the soft RLIMIT_NOFILE as far as the host allows; see the .c. */
+int         w32_raise_fd_limit(unsigned long long *before, unsigned long long *after);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);

@@ -211,3 +211,66 @@ class RegLocalsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EbpPublishNarrowingTest(unittest.TestCase):
+    """g_ebp = ebp is dropped only where g_ebp is known to equal the local."""
+
+    def _run(self, body, verify=False):
+        from .translator import _narrow_ebp_publishes
+        return _narrow_ebp_publishes(body, verify=verify)
+
+    def test_rules(self):
+        lines = [
+            "    ebp = g_ebp;  /* frameless */",                      # equal now
+            "    g_ebp = ebp; /* frame stays current across calls */",   # 1: dropped
+            "    PUSH32(esp, 0x10u); RECOMP_ABI_CALL_RAW(0x10u, sub_A);",
+            "    g_ebp = ebp; /* frame stays current across calls */",   # 3: dropped (after a call)
+            "    PUSH32(esp, 0x14u); RECOMP_ABI_CALL_RAW(0x14u, sub_B);",
+            "    ebp = eax;",                                            # written
+            "    g_ebp = ebp; g_seh_ebp = ebp; esp += 4; { return; }",   # 6: kept
+            "loc_00010020: ;",
+            "    g_ebp = ebp; /* frame stays current across calls */",   # 8: dropped (fallthrough, not jumped)
+            "    if (_flags) { g_ebp = ebp; g_seh_ebp = ebp; return; }", # 9: conditional, kept
+        ]
+        out = self._run(lines)
+        self.assertTrue(out[1].lstrip().startswith("(void)0;"), out[1])
+        self.assertTrue(out[3].lstrip().startswith("(void)0;"), out[3])
+        self.assertIn("g_ebp = ebp; g_seh_ebp = ebp;", out[6])
+        self.assertTrue(out[8].lstrip().startswith("(void)0;"), out[8])
+        self.assertEqual(lines[9], out[9])
+        # Line 6's g_seh_ebp follows a write to ebp: kept. Line 9 is conditional.
+        self.assertEqual(sum(l.count("g_seh_ebp = ebp;") for l in out),
+                         sum(l.count("g_seh_ebp = ebp;") for l in lines))
+
+    def test_seh_rules(self):
+        lines = [
+            "    ebp = g_ebp;",                                          # g_ebp equal, g_seh_ebp not
+            "    g_seh_ebp = ebp; /* publish frame to SEH helper */",    # 1: kept (stale)
+            "    PUSH32(esp, 0x10u); RECOMP_ABI_CALL_RAW(0x10u, __SEH_prolog);",
+            "    ebp = g_seh_ebp; /* read back frame from SEH helper */",  # g_seh_ebp equal, g_ebp not
+            "    g_seh_ebp = ebp;",                                      # 4: dropped
+            "    g_ebp = ebp; /* frame stays current across calls */",   # 5: kept (stale)
+            "    g_seh_ebp = ebp; sub_00011040(); return; /* tail */",   # 6: dropped
+        ]
+        out = self._run(lines)
+        self.assertEqual(lines[1], out[1])
+        self.assertTrue(out[4].lstrip().startswith("(void)0;"), out[4])
+        self.assertEqual(lines[5], out[5])
+        self.assertTrue(out[6].lstrip().startswith("(void)0; sub_00011040();"), out[6])
+        verify = self._run(lines, verify=True)
+        self.assertIn("RECOMP_SEH_SKIPPED();", verify[4])
+
+    def test_a_jumped_label_counts_as_changed(self):
+        lines = [
+            "    ebp = g_ebp;",
+            "loc_00010020: ;",
+            "    g_ebp = ebp;",                                          # kept: a jump lands here
+            "    goto loc_00010020;",
+        ]
+        out = self._run(lines)
+        self.assertEqual(lines[2], out[2])
+
+    def test_verify_checks_what_it_drops(self):
+        out = self._run(["    ebp = g_ebp;", "    g_ebp = ebp;"], verify=True)
+        self.assertIn("RECOMP_REGS_SKIPPED(ebp);", out[1])
