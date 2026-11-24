@@ -5127,6 +5127,14 @@ static void heap_split_after(int i, uint32_t keep)
     uint32_t rest = g_heap_blocks[i].size - keep;
     int j = i + 1;
 
+    if (keep >= g_heap_blocks[i].size) {             /* nothing to split off: a caller bug */
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [HEAP] split refused: block 0x%08X of %u bytes, keep %u\n",
+                    g_heap_blocks[i].addr, g_heap_blocks[i].size, keep);
+        return;
+    }
+
     if (j < g_heap_block_count && g_heap_blocks[j].free && g_heap_blocks[j].size
             && g_heap_blocks[j].addr == rest_addr + rest) {
         g_heap_blocks[j].addr = rest_addr;           /* grow the free neighbour down */
@@ -5187,10 +5195,11 @@ static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
          * Wreckless's attract demo dies at flip ~880 on a divide by zero in
          * DSOUND (sub_0012C86C, `div esi` with esi = [this+0x64], 0), just
          * after loading data/car01/car.mps, every run; off, it plays on
-         * (2026-11-23). The split leaves the rest of a reused block as a
-         * free block of its own, and the next allocation there is zeroed;
-         * handed out whole, those bytes kept what they held. Why DSOUND
-         * reads them is not known yet [guess: stale memory it still uses]. */
+         * (2026-11-23). That was this split's own bug (fixed below): a
+         * request rounding up past a reused block underflowed the size test
+         * and the "remainder" was the next live block, so a 224-byte DSOUND
+         * object was laid over a live 284-byte one (Wreckless's heap trace).
+         * Still opt-in: no title of ours needs it. */
         {
             static int split = -1;
             uint32_t want = (size + 15u) & ~15u;
@@ -5198,7 +5207,13 @@ static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
                 const char *e = recomp_env(RENV_HEAP_SPLIT);
                 split = e && e[0] == '1';
             }
-            if (split && g_heap_blocks[i].size - want >= 0x10000u)
+            /* Compared without the subtraction: a block reused by a request
+             * that rounds up past it (292 bytes for 289-292) made
+             * `size - want` underflow, passed the test, and split off a
+             * "free" remainder that was the next live block -- handed out
+             * again to the next small request (Wreckless's DSOUND crash). */
+            if (split && g_heap_blocks[i].size >= want
+                    && g_heap_blocks[i].size - want >= 0x10000u)
                 heap_split_after(i, want);
         }
         memset((void *)((uintptr_t)result + g_memory_offset), 0, size);

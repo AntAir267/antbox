@@ -136,6 +136,9 @@ int main(int argc, char **argv)
      * MCPX aperture is left PROT_NONE for the trap. This test checks plain
      * mappings, so it runs without it. */
     recomp_env_set(RENV_AC97_READY, NULL);
+    /* Check 3c tests the heap split; its switch is read once, at the first
+     * reuse, so it is set before anything allocates. */
+    recomp_env_set(RENV_HEAP_SPLIT, "1");
 
     const char *path = argc > 1 ? argv[1] : "tools/conformance/test.xbe";
     size_t n = 0;
@@ -232,6 +235,35 @@ int main(int argc, char **argv)
             check(p[va + alias] == 0x3C, "the alias reads the heap page's bytes",
                   "the first mirror does not show the heap page");
         }
+    }
+
+    /* 3c. The heap split (RECOMP_HEAP_SPLIT=1) never hands out a live block.
+     *     A freed 292-byte block reused by a 290-byte request rounds up to
+     *     304: `size - want` underflowed, passed the 64 KB test, and the
+     *     split's "free remainder" began on the next live block, which the
+     *     next small request then got (Wreckless's DSOUND crash, 2026-11-23).
+     *     And a block with real room to spare is still split. */
+    {
+        char detail[160];
+        uint32_t a = xbox_HeapAlloc(292, 16), b = xbox_HeapAlloc(292, 16), c, d;
+        snprintf(detail, sizeof detail, "a 0x%08X b 0x%08X", a, b);
+        check(a && b && b > a, "two small heap blocks", detail);
+        xbox_HeapFree(a);
+        c = xbox_HeapAlloc(290, 16);
+        d = xbox_HeapAlloc(224, 16);
+        snprintf(detail, sizeof detail, "a 0x%08X b 0x%08X (live) c 0x%08X d 0x%08X",
+                 a, b, c, d);
+        check(c == a, "a freed block is reused by a request that fits it", detail);
+        check(d && !(d < b + 292 && b < d + 224),
+              "the next request does not get the live block after it", detail);
+        uint32_t e = xbox_HeapAlloc(0x30000, 16), f, g;
+        xbox_HeapFree(e);
+        f = xbox_HeapAlloc(0x100, 16);
+        g = xbox_HeapAlloc(0x100, 16);
+        snprintf(detail, sizeof detail, "e 0x%08X f 0x%08X g 0x%08X", e, f, g);
+        check(f == e && g == e + 0x100, "a block with 64 KB to spare is split", detail);
+        xbox_HeapFree(b); xbox_HeapFree(c); xbox_HeapFree(d);
+        xbox_HeapFree(f); xbox_HeapFree(g);
     }
 
     /* 4. Teardown has to give the addresses back, or nothing can re-init. */
